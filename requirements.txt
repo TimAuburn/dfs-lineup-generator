@@ -1,0 +1,4 @@
+streamlit
+pydfs-lineup-optimizer
+pandas
+python-dotenv
