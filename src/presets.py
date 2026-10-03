@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .optimizer import BaseNFLOptimizer
@@ -163,6 +163,118 @@ def presets_for_format(contest_format: ContestFormat) -> Tuple[ContestPreset, ..
 
 def get_preset_config(preset: ContestPreset) -> PresetConfig:
     return PRESET_CONFIGS[preset]
+
+
+def _fmt_pct_band(band: Optional[Tuple[float, float]]) -> str:
+    if band is None:
+        return "None"
+    lo, hi = float(band[0]), float(band[1])
+    if lo == 0.0 and hi == 0.0:
+        return "None (deterministic)"
+    if lo == hi:
+        return f"{lo * 100:.0f}%"
+    return f"{lo * 100:.0f}–{hi * 100:.0f}%"
+
+
+def format_preset_summary(config: PresetConfig) -> List[Tuple[str, str]]:
+    """
+    Build readable (setting, value) rows for UI display from a PresetConfig.
+
+    Single source of truth: derive labels from the config fields / description,
+    do not hardcode per-preset copy beyond PresetConfig itself.
+    """
+    lo, hi = config.lineup_count_range
+    rows: List[Tuple[str, str]] = [
+        (
+            "Lineup count",
+            f"{config.default_lineup_count} (allowed {lo}–{hi})",
+        ),
+    ]
+
+    if config.position_jitter_sds:
+        band = _fmt_pct_band(config.jitter_pct)
+        rows.append(
+            (
+                "Projection jitter",
+                f"Position SDs (~{band} relative)",
+            )
+        )
+    else:
+        rows.append(("Projection jitter", _fmt_pct_band(config.jitter_pct)))
+
+    if config.format is ContestFormat.CLASSIC:
+        if config.enable_qb_stack:
+            stack = f"QB + {config.stack_pass_catchers} WR/TE"
+            if config.enable_bring_back:
+                stack += f" + {config.bring_back_position} bring-back"
+            rows.append(("Stacks", stack))
+        else:
+            rows.append(("Stacks", "None"))
+        rows.append(("Exclude vs DST", "Yes" if config.exclude_vs_dst else "No"))
+    else:
+        min_sal = config.min_salary_cap
+        max_sal = config.max_salary_cap
+        if min_sal is not None and max_sal is not None:
+            rows.append(("Salary window", f"${min_sal:,}–${max_sal:,}"))
+        elif min_sal is not None:
+            rows.append(("Salary window", f"min ${min_sal:,}"))
+        elif max_sal is not None:
+            rows.append(("Salary window", f"max ${max_sal:,}"))
+        else:
+            rows.append(("Salary window", "Full cap"))
+
+        rows.append(
+            (
+                "Min teams",
+                str(config.min_teams) if config.min_teams is not None else "No minimum",
+            )
+        )
+        rows.append(
+            (
+                "Game-script correlation",
+                "Yes" if config.game_script_correlation else "No",
+            )
+        )
+        if config.game_script_correlation:
+            rows.append(
+                ("CPT QB pass-catchers", str(config.cpt_qb_pass_catchers))
+            )
+        rows.append(
+            (
+                "Max K+DST combined",
+                (
+                    str(config.max_k_dst_combined)
+                    if config.max_k_dst_combined is not None
+                    else "No limit"
+                ),
+            )
+        )
+
+    rows.append(
+        (
+            "Max repeating players",
+            (
+                str(config.max_repeating_players)
+                if config.max_repeating_players is not None
+                else "No limit"
+            ),
+        )
+    )
+
+    if config.max_cumulative_ownership is not None:
+        rows.append(
+            (
+                "Ownership cap",
+                f"{config.max_cumulative_ownership * 100:.0f}% cumulative",
+            )
+        )
+    else:
+        rows.append(("Ownership cap", "None"))
+
+    if config.description:
+        rows.append(("Strategy notes", config.description))
+
+    return rows
 
 
 def apply_preset(
