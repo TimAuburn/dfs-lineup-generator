@@ -16,10 +16,13 @@ from src.exporter import (
 )
 from src.optimizer import (
     DK_SALARY_CAP,
+    STANDARD_TIER_FLOOR,
     NFLClassicOptimizer,
     NFLShowdownOptimizer,
     apply_projection_jitter,
     get_nfl_optimizer,
+    optimize_tiered_salaries,
+    tiered_lineup_counts,
 )
 from src.parser import DKCSVValidationError, detect_contest_format, parse_dk_csv
 from src.presets import ContestFormat, ContestPreset, apply_preset, get_preset_config
@@ -224,6 +227,70 @@ def test_preset_format_mismatch_raises():
     optimizer = NFLClassicOptimizer()
     with pytest.raises(ValueError):
         apply_preset(optimizer, ContestPreset.SHOWDOWN_GPP)
+
+
+def test_tiered_lineup_counts_split():
+    assert tiered_lineup_counts(5, 0.4) == (3, 2)
+    assert tiered_lineup_counts(2, 0.4) == (1, 1)
+    assert tiered_lineup_counts(1, 0.0) == (1, 0)
+    assert tiered_lineup_counts(1, 1.0) == (0, 1)
+
+
+def test_optimize_tiered_salaries_uses_both_windows():
+    class _FakeOptimizer:
+        def __init__(self) -> None:
+            self.min_salary_cap = 11
+            self.max_salary_cap = 22
+            self.calls: list = []
+
+        def set_min_salary_cap(self, value):
+            self.min_salary_cap = value
+            self.calls.append(("min", value))
+
+        def set_max_salary_cap(self, value):
+            self.max_salary_cap = value
+            self.calls.append(("max", value))
+
+        def generate_lineups(self, n):
+            self.calls.append(("gen", n, self.min_salary_cap, self.max_salary_cap))
+            return [f"{self.max_salary_cap}-{i}" for i in range(n)]
+
+    fake = _FakeOptimizer()
+    result = optimize_tiered_salaries(
+        fake,
+        5,
+        leave_money_ratio=0.4,
+        standard_cap=50_000,
+        discount_cap=49_500,
+        discount_floor=48_000,
+    )
+    assert result == ["50000-0", "50000-1", "50000-2", "49500-0", "49500-1"]
+    generations = [call for call in fake.calls if call[0] == "gen"]
+    assert generations == [
+        ("gen", 3, STANDARD_TIER_FLOOR, 50_000),
+        ("gen", 2, 48_000, 49_500),
+    ]
+    discount_calls = fake.calls[fake.calls.index(("gen", 3, STANDARD_TIER_FLOOR, 50_000)) + 1 :]
+    assert discount_calls[0] == ("max", 49_500)
+    assert discount_calls[1] == ("min", 48_000)
+    assert fake.min_salary_cap == 11
+    assert fake.max_salary_cap == 22
+
+
+def test_optimize_tiered_salaries_respects_salary_bands():
+    optimizer = NFLClassicOptimizer()
+    optimizer.load_from_csv(MOCK_CSV)
+    optimizer.set_qb_stack(enabled=False)
+    optimizer.set_max_repeating_players(None)
+    lineups = optimize_tiered_salaries(optimizer, total_n=4, leave_money_ratio=0.5)
+    assert len(lineups) == 4
+    salaries = [int(lu.attrs["salary"]) for lu in lineups]
+    assert all(STANDARD_TIER_FLOOR <= s <= DK_SALARY_CAP for s in salaries[:2])
+    assert all(48_000 <= s <= 49_500 for s in salaries[2:])
+    for lineup in lineups:
+        assert int(lineup.attrs["salary_remaining"]) == DK_SALARY_CAP - int(lineup.attrs["salary"])
+    assert optimizer.min_salary_cap is None
+    assert optimizer.max_salary_cap is None
 
 
 def test_get_preset_config_labels():

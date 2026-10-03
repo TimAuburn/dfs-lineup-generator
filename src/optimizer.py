@@ -15,6 +15,8 @@ from .parser import parse_dk_csv
 from .presets import ContestFormat
 
 DK_SALARY_CAP = 50_000
+# Full-cap tier in portfolio salary diversification (leave at most $200).
+STANDARD_TIER_FLOOR = 49_800
 CLASSIC_ROSTER_SLOTS = ("QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "DST")
 SHOWDOWN_ROSTER_SLOTS = ("CPT", "FLEX", "FLEX", "FLEX", "FLEX", "FLEX")
 # Backward-compatible alias used by the UI / older imports.
@@ -234,6 +236,8 @@ class BaseNFLOptimizer:
         self.jitter_pct: Optional[Tuple[float, float]] = None
         self.position_jitter_sds: Optional[Dict[str, float]] = None
         self.jitter_seed: Optional[int] = DEFAULT_JITTER_SEED
+        self.min_salary_cap: Optional[int] = None
+        self.max_salary_cap: Optional[int] = None
 
     def load_from_csv(self, path: Union[str, Path]) -> pd.DataFrame:
         df = parse_dk_csv(path, contest_format=ContestFormat(self.contest_format))
@@ -279,6 +283,33 @@ class BaseNFLOptimizer:
         if n is not None and n < 0:
             raise ValueError("max_repeating_players must be >= 0")
         self.max_repeating_players = n
+
+    def set_min_salary_cap(self, min_salary: Optional[int]) -> None:
+        """Minimum roster salary. ``None`` removes the floor."""
+        if min_salary is None:
+            self.min_salary_cap = None
+            return
+        value = int(min_salary)
+        if value < 0:
+            raise ValueError("min salary cap must be >= 0")
+        self.min_salary_cap = value
+
+    def set_max_salary_cap(self, max_salary: Optional[int]) -> None:
+        """Maximum roster salary (solver budget). ``None`` uses the site cap."""
+        if max_salary is None:
+            self.max_salary_cap = None
+            return
+        value = int(max_salary)
+        if value <= 0:
+            raise ValueError("max salary cap must be positive")
+        self.max_salary_cap = value
+
+    def _apply_salary_caps(self, pydfs_optimizer) -> None:
+        """Push the current salary window onto a pydfs optimizer."""
+        if self.max_salary_cap is not None:
+            pydfs_optimizer.settings.budget = int(self.max_salary_cap)
+        if self.min_salary_cap is not None:
+            pydfs_optimizer.set_min_salary_cap(float(self.min_salary_cap))
 
     def _players_for_optimize(self) -> List[Player]:
         if self._player_df is None or not self._players:
@@ -341,8 +372,10 @@ class BaseNFLOptimizer:
                 }
             )
         df = pd.DataFrame(rows)
-        df.attrs["salary"] = int(lineup.salary_costs)
+        spent = int(lineup.salary_costs)
+        df.attrs["salary"] = spent
         df.attrs["projection"] = float(lineup.fantasy_points_projection)
+        df.attrs["salary_remaining"] = int(self.salary_cap) - spent
         return df
 
     def generate_lineups_table(self, n: Optional[int] = None) -> pd.DataFrame:
@@ -402,6 +435,7 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
 
     def _build_optimizer(self, players: List[Player]):
         optimizer = get_optimizer(self.site, self.sport)
+        self._apply_salary_caps(optimizer)
         optimizer.player_pool.load_players(players)
         if self.max_repeating_players is not None:
             optimizer.set_max_repeating_players(self.max_repeating_players)
@@ -533,12 +567,9 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
 
     def _build_optimizer(self, players: List[Player]):
         optimizer = get_optimizer(self.site, self.sport)
-        # Anti-duplication: leave $200–$1000 on the table via an upper ceiling.
-        if self.max_salary_cap is not None:
-            optimizer.settings.budget = int(self.max_salary_cap)
+        # Optional window. Showdown presets leave $200–$2,000 under the DK cap.
+        self._apply_salary_caps(optimizer)
         optimizer.player_pool.load_players(players)
-        if self.min_salary_cap is not None:
-            optimizer.set_min_salary_cap(float(self.min_salary_cap))
         if self.min_teams is not None:
             optimizer.set_total_teams(min_teams=int(self.min_teams))
         if self.max_repeating_players is not None:
@@ -560,6 +591,64 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             )
         )
         return [self.format_lineup(lineup) for lineup in raw_lineups]
+
+
+def tiered_lineup_counts(total_n: int, leave_money_ratio: float) -> Tuple[int, int]:
+    """Split ``total_n`` into ``(full-cap count, leave-money count)``."""
+    total_n = int(total_n)
+    ratio = float(leave_money_ratio)
+    if total_n < 1:
+        raise ValueError("total_n must be at least 1")
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError("leave_money_ratio must be between 0 and 1")
+    standard_n = int(round((1.0 - ratio) * total_n))
+    standard_n = max(0, min(total_n, standard_n))
+    return standard_n, total_n - standard_n
+
+
+def optimize_tiered_salaries(
+    optimizer: BaseNFLOptimizer,
+    total_n: int,
+    leave_money_ratio: float = 0.4,
+    standard_cap: int = DK_SALARY_CAP,
+    discount_cap: int = 49_500,
+    discount_floor: int = 48_000,
+) -> List[pd.DataFrame]:
+    """
+    Build a portfolio where only ``leave_money_ratio`` of lineups spend under the cap.
+
+    The first batch uses salary bounds of $49,800–``standard_cap`` and contains
+    ``(1 - leave_money_ratio) * total_n`` lineups. The rest are solved after
+    ``set_max_salary_cap(discount_cap)`` and ``set_min_salary_cap(discount_floor)``.
+    Salary settings on ``optimizer`` are restored when the call finishes.
+    """
+    standard_n, discount_n = tiered_lineup_counts(total_n, leave_money_ratio)
+    standard_cap = int(standard_cap)
+    discount_cap = int(discount_cap)
+    discount_floor = int(discount_floor)
+    if STANDARD_TIER_FLOOR > standard_cap:
+        raise ValueError(
+            f"standard_cap must be at least ${STANDARD_TIER_FLOOR:,}"
+        )
+    if discount_floor > discount_cap:
+        raise ValueError("discount_floor cannot exceed discount_cap")
+
+    previous_min = optimizer.min_salary_cap
+    previous_max = optimizer.max_salary_cap
+    lineups: List[pd.DataFrame] = []
+    try:
+        if standard_n:
+            optimizer.set_max_salary_cap(standard_cap)
+            optimizer.set_min_salary_cap(STANDARD_TIER_FLOOR)
+            lineups.extend(optimizer.generate_lineups(standard_n))
+        if discount_n:
+            optimizer.set_max_salary_cap(discount_cap)
+            optimizer.set_min_salary_cap(discount_floor)
+            lineups.extend(optimizer.generate_lineups(discount_n))
+    finally:
+        optimizer.set_min_salary_cap(previous_min)
+        optimizer.set_max_salary_cap(previous_max)
+    return lineups
 
 
 def get_nfl_optimizer(contest_format: ContestFormat | str) -> BaseNFLOptimizer:

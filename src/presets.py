@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from enum import Enum
-from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .optimizer import BaseNFLOptimizer
@@ -165,6 +165,30 @@ def get_preset_config(preset: ContestPreset) -> PresetConfig:
     return PRESET_CONFIGS[preset]
 
 
+# Identity fields stay on the preset. Lineup count is applied separately.
+_LOCKED_OVERRIDE_FIELDS = frozenset(
+    {"format", "label", "description", "lineup_count_range", "default_lineup_count"}
+)
+
+
+def config_with_overrides(
+    config: PresetConfig,
+    *,
+    lineup_count: int,
+    overrides: Dict[str, Any],
+) -> PresetConfig:
+    """
+    Copy ``config`` with solver fields replaced by UI overrides.
+
+    Unknown keys are ignored. ``lineup_count`` becomes the count shown as the
+    actual lineup count (the allowed range stays the preset's).
+    """
+    allowed = {f.name for f in fields(PresetConfig)} - _LOCKED_OVERRIDE_FIELDS
+    updates = {key: overrides[key] for key in allowed if key in overrides}
+    updates["default_lineup_count"] = int(lineup_count)
+    return replace(config, **updates)
+
+
 def _fmt_pct_band(band: Optional[Tuple[float, float]]) -> str:
     if band is None:
         return "None"
@@ -274,6 +298,29 @@ def format_preset_summary(config: PresetConfig) -> List[Tuple[str, str]]:
     if config.description:
         rows.append(("Strategy notes", config.description))
 
+    return rows
+
+
+def format_settings_comparison(
+    preset: PresetConfig,
+    actual: PresetConfig,
+    extra_rows: Optional[List[Tuple[str, str, str]]] = None,
+) -> List[Tuple[str, str, str]]:
+    """
+    Align preset defaults with the settings that will actually be solved.
+
+    Each row is ``(setting, preset default, actual)``. Strategy notes stay on
+    the preset description, not in this comparison. ``extra_rows`` appends
+    UI-only settings (exposure, non-default jitter seed) in the same shape.
+    """
+    actual_map = dict(format_preset_summary(actual))
+    rows = [
+        (setting, default, actual_map.get(setting, "—"))
+        for setting, default in format_preset_summary(preset)
+        if setting != "Strategy notes"
+    ]
+    if extra_rows:
+        rows.extend(extra_rows)
     return rows
 
 
