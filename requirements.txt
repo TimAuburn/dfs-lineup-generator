@@ -1,4 +1,6 @@
 streamlit
 pydfs-lineup-optimizer
 pandas
+numpy
 python-dotenv
+pytest

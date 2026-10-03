@@ -1,12 +1,14 @@
-"""Parse and validate DraftKings NFL Classic player-pool CSV exports."""
+"""Parse and validate DraftKings NFL Classic / Showdown player-pool CSV exports."""
 
 from __future__ import annotations
 
 from io import StringIO
 from pathlib import Path
-from typing import BinaryIO, TextIO, Union
+from typing import BinaryIO, Optional, TextIO, Union
 
 import pandas as pd
+
+from .presets import ContestFormat
 
 REQUIRED_COLUMNS = (
     "ID",
@@ -30,7 +32,13 @@ _COLUMN_ALIASES = {
     "Team": "TeamAbbrev",
     "Avg Points Per Game": "AvgPointsPerGame",
     "FPPG": "AvgPointsPerGame",
+    "Projected Ownership": "Ownership",
+    "Own%": "Ownership",
+    "Own": "Ownership",
 }
+
+CLASSIC_POSITIONS = {"QB", "RB", "WR", "TE", "DST", "DEF", "K"}
+SHOWDOWN_SLOTS = {"CPT", "FLEX"}
 
 _IO = Union[str, Path, BinaryIO, TextIO]
 
@@ -49,14 +57,52 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _derive_position(roster_position: str) -> str:
+def detect_contest_format(df: pd.DataFrame) -> ContestFormat:
+    """Infer Classic vs Showdown from Roster Position values."""
+    if "Roster Position" not in df.columns:
+        return ContestFormat.CLASSIC
+    slots = (
+        df["Roster Position"]
+        .astype(str)
+        .str.split("/")
+        .str[0]
+        .str.strip()
+        .str.upper()
+    )
+    if slots.isin(SHOWDOWN_SLOTS).any():
+        return ContestFormat.SHOWDOWN
+    return ContestFormat.CLASSIC
+
+
+def _derive_classic_position(roster_position: str) -> str:
     """Map DK Roster Position (e.g. WR/FLEX) to a primary Position (WR)."""
     if not isinstance(roster_position, str) or not roster_position.strip():
         raise DKCSVValidationError(f"Invalid Roster Position: {roster_position!r}")
     primary = roster_position.split("/")[0].strip().upper()
-    if primary not in {"QB", "RB", "WR", "TE", "DST", "DEF"}:
+    if primary not in CLASSIC_POSITIONS:
         raise DKCSVValidationError(f"Unsupported roster position: {roster_position!r}")
     return "DST" if primary == "DEF" else primary
+
+
+def _derive_showdown_football_position(row: pd.Series) -> str:
+    """
+    Resolve the underlying football position for a Showdown CPT/FLEX row.
+
+    Prefers a true skill/DST/K label in ``Position``; falls back to other common
+    DK columns when ``Position`` only mirrors the CPT/FLEX slot.
+    """
+    candidates = []
+    for col in ("Position", "Pos", "Player Position", "FootballPosition"):
+        if col in row.index and pd.notna(row[col]):
+            candidates.append(str(row[col]).strip())
+    for raw in candidates:
+        primary = raw.split("/")[0].strip().upper()
+        if primary in CLASSIC_POSITIONS:
+            return "DST" if primary == "DEF" else primary
+        if primary in SHOWDOWN_SLOTS:
+            continue
+    # Last resort: keep a neutral label so the pool still loads.
+    return "UTIL"
 
 
 def _read_raw_text(source: _IO) -> str:
@@ -81,13 +127,20 @@ def _load_dataframe(source: _IO) -> pd.DataFrame:
     return pd.read_csv(StringIO("\n".join(lines[header_idx:])), skipinitialspace=True)
 
 
-def parse_dk_csv(source: _IO) -> pd.DataFrame:
+def parse_dk_csv(
+    source: _IO,
+    *,
+    contest_format: Optional[ContestFormat | str] = None,
+) -> pd.DataFrame:
     """
-    Load a DraftKings NFL Classic player-pool CSV and validate required fields.
+    Load a DraftKings NFL player-pool CSV and validate required fields.
 
-    Returns a DataFrame with normalized columns including ``Position`` (derived
-    from ``Roster Position`` when absent) and a ``Projection`` column defaulting
-    to ``AvgPointsPerGame``.
+    ``contest_format`` may be passed explicitly (``classic`` / ``showdown``).
+    When omitted, the format is inferred from ``Roster Position`` values.
+
+    Returns a DataFrame with normalized columns including ``Position`` (football
+    position) and a ``Projection`` column defaulting to ``AvgPointsPerGame``.
+    Showdown pools also include ``RosterSlot`` (CPT/FLEX).
     """
     df = _normalize_columns(_load_dataframe(source))
 
@@ -102,6 +155,21 @@ def parse_dk_csv(source: _IO) -> pd.DataFrame:
     if df.empty:
         raise DKCSVValidationError("Player pool is empty after validation.")
 
+    detected = detect_contest_format(df)
+    if contest_format is None:
+        fmt = detected
+    else:
+        fmt = ContestFormat(contest_format)
+        if detected is ContestFormat.SHOWDOWN and fmt is ContestFormat.CLASSIC:
+            raise DKCSVValidationError(
+                "CSV looks like a Showdown (CPT/FLEX) pool, but Classic format was selected."
+            )
+        if detected is ContestFormat.CLASSIC and fmt is ContestFormat.SHOWDOWN:
+            raise DKCSVValidationError(
+                "CSV looks like a Classic pool, but Showdown Captain Mode was selected. "
+                "Upload a DK Showdown DKSalaries.csv with CPT/FLEX roster rows."
+            )
+
     df["ID"] = df["ID"].astype(str).str.strip()
     df["Name"] = df["Name"].astype(str).str.strip()
     df["Name + ID"] = df["Name + ID"].astype(str).str.strip()
@@ -114,18 +182,30 @@ def parse_dk_csv(source: _IO) -> pd.DataFrame:
         raise DKCSVValidationError("One or more players have invalid Salary values.")
     df["AvgPointsPerGame"] = df["AvgPointsPerGame"].fillna(0.0)
 
-    if "Position" not in df.columns:
-        df["Position"] = df["Roster Position"].map(_derive_position)
+    if fmt is ContestFormat.SHOWDOWN:
+        slots = df["Roster Position"].str.split("/").str[0].str.strip().str.upper()
+        if not slots.isin(SHOWDOWN_SLOTS).all():
+            bad = sorted({s for s in slots.unique() if s not in SHOWDOWN_SLOTS})
+            raise DKCSVValidationError(
+                f"Showdown pools require CPT/FLEX roster rows; found: {', '.join(bad)}"
+            )
+        df["RosterSlot"] = slots
+        df["FootballPosition"] = df.apply(_derive_showdown_football_position, axis=1)
+        # ``Position`` is the football position used for game-script / jitter SDs.
+        df["Position"] = df["FootballPosition"]
     else:
-        df["Position"] = (
-            df["Position"]
-            .astype(str)
-            .str.split("/")
-            .str[0]
-            .str.strip()
-            .str.upper()
-            .replace({"DEF": "DST"})
-        )
+        if "Position" not in df.columns:
+            df["Position"] = df["Roster Position"].map(_derive_classic_position)
+        else:
+            df["Position"] = (
+                df["Position"]
+                .astype(str)
+                .str.split("/")
+                .str[0]
+                .str.strip()
+                .str.upper()
+                .replace({"DEF": "DST"})
+            )
 
     if "Game Info" not in df.columns:
         df["Game Info"] = ""
@@ -136,6 +216,9 @@ def parse_dk_csv(source: _IO) -> pd.DataFrame:
         df["Projection"] = pd.to_numeric(df["Projection"], errors="coerce").fillna(
             df["AvgPointsPerGame"]
         )
+
+    if "Ownership" in df.columns:
+        df["Ownership"] = df["Ownership"]
 
     ordered = [
         "ID",
@@ -149,5 +232,22 @@ def parse_dk_csv(source: _IO) -> pd.DataFrame:
         "AvgPointsPerGame",
         "Projection",
     ]
+    if fmt is ContestFormat.SHOWDOWN:
+        ordered = [
+            "ID",
+            "Name + ID",
+            "Name",
+            "Position",
+            "FootballPosition",
+            "RosterSlot",
+            "Roster Position",
+            "Salary",
+            "TeamAbbrev",
+            "Game Info",
+            "AvgPointsPerGame",
+            "Projection",
+        ]
+    if "Ownership" in df.columns and "Ownership" not in ordered:
+        ordered.append("Ownership")
     extras = [c for c in df.columns if c not in ordered]
-    return df[ordered + extras].reset_index(drop=True)
+    return df[[c for c in ordered if c in df.columns] + extras].reset_index(drop=True)
