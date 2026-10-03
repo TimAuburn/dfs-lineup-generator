@@ -14,7 +14,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.exporter import lineups_to_dk_upload_csv, upload_columns_for
-from src.optimizer import DK_SALARY_CAP, get_nfl_optimizer
+from src.optimizer import (
+    DK_SALARY_CAP,
+    STANDARD_TIER_FLOOR,
+    get_nfl_optimizer,
+    optimize_tiered_salaries,
+    tiered_lineup_counts,
+)
 from src.parser import DKCSVValidationError, parse_dk_csv
 from src.presets import (
     ContestFormat,
@@ -22,7 +28,8 @@ from src.presets import (
     PRESET_LABELS,
     PresetConfig,
     apply_preset,
-    format_preset_summary,
+    config_with_overrides,
+    format_settings_comparison,
     get_preset_config,
     presets_for_format,
 )
@@ -48,6 +55,7 @@ def _init_state() -> None:
         "flash_success": None,
         "contest_format": ContestFormat.CLASSIC.value,
         "contest_preset": ContestPreset.CLASSIC_SMALL_GPP.value,
+        "generated_run": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -60,6 +68,7 @@ def _on_format_change() -> None:
     st.session_state.contest_preset = presets[0].value
     st.session_state.player_pool = None
     st.session_state.lineups = []
+    st.session_state.generated_run = None
     st.session_state.error = None
 
 
@@ -68,15 +77,44 @@ def _preset_key(preset: ContestPreset, name: str) -> str:
     return f"{name}_{preset.value}"
 
 
-def _render_strategy_summary(preset_cfg: PresetConfig) -> None:
-    rows = format_preset_summary(preset_cfg)
-    summary_df = pd.DataFrame(rows, columns=["Setting", "Preset default"])
+def _render_settings_comparison(rows: List[Tuple[str, str, str]]) -> None:
+    summary_df = pd.DataFrame(rows, columns=["Setting", "Preset default", "Actual"])
     st.dataframe(
         summary_df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
-        height=min(38 + 35 * len(summary_df), 320),
+        height=min(38 + 35 * len(summary_df), 420),
     )
+
+
+def _extra_setting_rows(
+    *,
+    jitter_seed: int,
+    use_max_exposure: bool,
+    max_exposure_pct: int,
+    use_min_exposure: bool,
+    min_exposure_pct: int,
+) -> List[Tuple[str, str, str]]:
+    """UI-only settings that are not part of a contest preset."""
+    rows: List[Tuple[str, str, str]] = []
+    if int(jitter_seed) != 42:
+        rows.append(("Jitter seed", "42", str(int(jitter_seed))))
+    if use_max_exposure or use_min_exposure:
+        rows.append(
+            (
+                "Max exposure",
+                "Off",
+                f"{int(max_exposure_pct)}%" if use_max_exposure else "Off",
+            )
+        )
+        rows.append(
+            (
+                "Min exposure",
+                "Off",
+                f"{int(min_exposure_pct)}%" if use_min_exposure else "Off",
+            )
+        )
+    return rows
 
 
 def _collect_strategy_overrides(
@@ -394,7 +432,7 @@ def _apply_strategy_overrides(optimizer: Any, overrides: Dict[str, Any]) -> None
 _init_state()
 
 # ---------------------------------------------------------------------------
-# Sidebar — format, preset, strategy defaults, and editable overrides
+# Sidebar — format, preset, and editable overrides
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.markdown("### Contest Format")
@@ -423,10 +461,6 @@ with st.sidebar:
     preset = ContestPreset(st.session_state.contest_preset)
     preset_cfg = get_preset_config(preset)
 
-    st.caption(f"Defaults from: {preset_cfg.label}")
-    with st.expander("Strategy defaults", expanded=True):
-        _render_strategy_summary(preset_cfg)
-
     lo, hi = preset_cfg.lineup_count_range
     lineup_count = st.number_input(
         "Lineups",
@@ -447,6 +481,46 @@ with st.sidebar:
     with st.expander("Adjust strategy", expanded=True):
         strategy_overrides, strategy_changed = _collect_strategy_overrides(
             contest_format, preset, preset_cfg
+        )
+
+    st.markdown("### Salary settings")
+    enable_tiered_salary = st.toggle(
+        "Enable Tiered Salary Distribution",
+        value=False,
+        key="enable_tiered_salary",
+        help=(
+            "Spend most lineups near the cap, and let a set share "
+            "finish under a lower salary ceiling."
+        ),
+    )
+    leave_money_pct = st.slider(
+        "Lineups Leaving Money on Table (%)",
+        min_value=0,
+        max_value=100,
+        value=40,
+        step=5,
+        disabled=not enable_tiered_salary,
+        key="leave_money_pct",
+    )
+    discount_cap = st.number_input(
+        "Discount Cap Ceiling",
+        min_value=48_000,
+        max_value=DK_SALARY_CAP,
+        value=49_500,
+        step=100,
+        disabled=not enable_tiered_salary,
+        key="discount_cap",
+        help="Maximum salary for lineups that leave money on the table.",
+    )
+    if enable_tiered_salary:
+        full_cap_n, discount_n = tiered_lineup_counts(
+            int(lineup_count), float(leave_money_pct) / 100.0
+        )
+        full_label = "lineup" if full_cap_n == 1 else "lineups"
+        discount_label = "lineup" if discount_n == 1 else "lineups"
+        st.caption(
+            f"{full_cap_n} {full_label} at ${STANDARD_TIER_FLOOR:,}–${DK_SALARY_CAP:,}; "
+            f"{discount_n} {discount_label} at $48,000–${int(discount_cap):,}."
         )
 
     with st.expander("Advanced overrides", expanded=False):
@@ -490,10 +564,51 @@ with st.sidebar:
         all_changed.insert(0, "Lineups")
     if use_max_exposure or use_min_exposure:
         all_changed.append("Exposure")
+    if enable_tiered_salary:
+        all_changed.append("Tiered salary")
     if all_changed:
         st.info("Overrides active: " + ", ".join(all_changed))
     else:
         st.caption("Using preset defaults (no overrides).")
+
+actual_cfg = config_with_overrides(
+    preset_cfg,
+    lineup_count=int(lineup_count),
+    overrides=strategy_overrides,
+)
+extra_setting_rows = _extra_setting_rows(
+    jitter_seed=int(jitter_seed),
+    use_max_exposure=bool(use_max_exposure),
+    max_exposure_pct=int(max_exposure_pct),
+    use_min_exposure=bool(use_min_exposure),
+    min_exposure_pct=int(min_exposure_pct),
+)
+if enable_tiered_salary:
+    full_cap_n, discount_n = tiered_lineup_counts(
+        int(lineup_count), float(leave_money_pct) / 100.0
+    )
+    extra_setting_rows.append(
+        (
+            "Tiered salary",
+            "Off",
+            (
+                f"{int(leave_money_pct)}% leave money "
+                f"({discount_n} under ${int(discount_cap):,}; "
+                f"{full_cap_n} at ${STANDARD_TIER_FLOOR:,}–${DK_SALARY_CAP:,})"
+            ),
+        )
+    )
+live_setting_rows = format_settings_comparison(
+    preset_cfg,
+    actual_cfg,
+    extra_setting_rows,
+)
+generated_run = st.session_state.generated_run
+settings_match_run = bool(
+    generated_run
+    and generated_run.get("preset") == preset.value
+    and generated_run.get("rows") == live_setting_rows
+)
 
 # ---------------------------------------------------------------------------
 # Main — title + primary action bar (upload / generate / download)
@@ -571,33 +686,31 @@ if st.session_state.flash_success:
     st.success(st.session_state.flash_success)
     st.session_state.flash_success = None
 
+if settings_match_run and st.session_state.lineups:
+    settings_note = "Actual is what these lineups were generated with."
+elif st.session_state.lineups and generated_run:
+    settings_note = (
+        "Actual is what Generate Lineups will use now. "
+        "The lineups below were built with different settings."
+    )
+else:
+    settings_note = "Actual is what Generate Lineups will use."
+
+with st.container(border=True):
+    st.markdown(f"#### Lineup settings — {preset_cfg.label}")
+    st.caption(preset_cfg.description)
+    st.caption(settings_note)
+    _render_settings_comparison(live_setting_rows)
+
 pool: pd.DataFrame | None = st.session_state.player_pool
 
 if pool is None:
-    # Still show strategy summary before upload so presets are understandable.
-    with st.expander(
-        f"Strategy defaults — {preset_cfg.label}",
-        expanded=True,
-    ):
-        st.caption(preset_cfg.description)
-        _render_strategy_summary(preset_cfg)
-        if all_changed:
-            st.warning("Active overrides: " + ", ".join(all_changed))
     st.info(
         "Upload a DraftKings NFL Showdown DKSalaries.csv (CPT/FLEX rows) to begin."
         if is_showdown
         else "Upload a DraftKings NFL Classic DKSalaries.csv to begin."
     )
     st.stop()
-
-# Compact strategy panel once a pool is loaded (sidebar already has full detail).
-with st.expander(f"Strategy defaults — {preset_cfg.label}", expanded=False):
-    st.caption(preset_cfg.description)
-    _render_strategy_summary(preset_cfg)
-    if all_changed:
-        st.warning("Active overrides: " + ", ".join(all_changed))
-    else:
-        st.caption("Controls match preset defaults.")
 
 roster_n = 6 if is_showdown else 9
 st.subheader("Player pool")
@@ -645,9 +758,23 @@ if generate:
             max_exposure_pct=float(max_exposure_pct) if use_max_exposure else None,
         )
         progress.progress(30, text=f"Generating {lineup_count} lineups…")
-        generated = optimizer.generate_lineups()
+        if enable_tiered_salary:
+            generated = optimize_tiered_salaries(
+                optimizer,
+                total_n=int(lineup_count),
+                leave_money_ratio=float(leave_money_pct) / 100.0,
+                standard_cap=DK_SALARY_CAP,
+                discount_cap=int(discount_cap),
+            )
+        else:
+            generated = optimizer.generate_lineups()
         progress.progress(100, text="Done")
         st.session_state.lineups = generated
+        st.session_state.generated_run = {
+            "preset": preset.value,
+            "preset_label": preset_cfg.label,
+            "rows": live_setting_rows,
+        }
         override_note = (
             f" (overrides: {', '.join(all_changed)})" if all_changed else ""
         )
@@ -658,27 +785,84 @@ if generate:
         st.rerun()
     except Exception as exc:  # noqa: BLE001 - show optimizer failures in UI
         st.session_state.lineups = []
+        st.session_state.generated_run = None
         st.error(f"Optimization failed: {exc}")
     finally:
         progress.empty()
 
 lineups = st.session_state.lineups
 if lineups:
+    used = st.session_state.generated_run
+    if used and used.get("rows") != live_setting_rows:
+        with st.container(border=True):
+            st.markdown(f"#### Settings used for these lineups — {used['preset_label']}")
+            st.caption(
+                "Sidebar settings have changed since this generate. "
+                "This table is what the lineups below were built with."
+            )
+            _render_settings_comparison(used["rows"])
+
     st.subheader(f"Generated lineups ({len(lineups)})")
 
     options = list(range(len(lineups)))
 
+    def _spent(lu: pd.DataFrame) -> int:
+        return int(lu.attrs.get("salary", int(lu["Salary"].sum())))
+
+    def _remaining(lu: pd.DataFrame) -> int:
+        if "salary_remaining" in lu.attrs:
+            return int(lu.attrs["salary_remaining"])
+        return DK_SALARY_CAP - _spent(lu)
+
+    preview = pd.DataFrame(
+        {
+            "Lineup": [i + 1 for i in options],
+            "Salary": [_spent(lu) for lu in lineups],
+            "Salary Remaining ($)": [_remaining(lu) for lu in lineups],
+            "Projection": [
+                float(lu.attrs.get("projection", float(lu["Projection"].sum())))
+                for lu in lineups
+            ],
+        }
+    )
+    st.dataframe(
+        preview,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Salary": st.column_config.NumberColumn("Salary", format="$%d"),
+            "Salary Remaining ($)": st.column_config.NumberColumn(
+                "Salary Remaining ($)",
+                format="$%d",
+                help="Dollars left under the $50,000 DraftKings cap.",
+            ),
+            "Projection": st.column_config.NumberColumn("Projection", format="%.2f"),
+        },
+    )
+
     def _lineup_label(i: int) -> str:
         lu = lineups[i]
-        salary = lu.attrs.get("salary", int(lu["Salary"].sum()))
         projection = lu.attrs.get("projection", float(lu["Projection"].sum()))
-        return f"Lineup {i + 1} · ${salary:,} · {projection:.2f} proj"
+        return (
+            f"Lineup {i + 1} · ${_spent(lu):,} · "
+            f"${_remaining(lu):,} left · {projection:.2f} proj"
+        )
 
     selected = st.selectbox("View lineup", options=options, format_func=_lineup_label)
     lineup = lineups[selected]
+    lineup_view = lineup[["Slot", "Name", "Team", "Salary", "Projection"]].copy()
+    lineup_view["Salary Remaining ($)"] = _remaining(lineup)
     st.dataframe(
-        lineup[["Slot", "Name", "Team", "Salary", "Projection"]],
-        use_container_width=True,
+        lineup_view,
+        width="stretch",
         hide_index=True,
         height=320,
+        column_config={
+            "Salary": st.column_config.NumberColumn("Salary", format="$%d"),
+            "Salary Remaining ($)": st.column_config.NumberColumn(
+                "Salary Remaining ($)",
+                format="$%d",
+            ),
+            "Projection": st.column_config.NumberColumn("Projection", format="%.2f"),
+        },
     )

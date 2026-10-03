@@ -6,7 +6,9 @@ from src.presets import (
     ContestFormat,
     ContestPreset,
     PRESET_CONFIGS,
+    config_with_overrides,
     format_preset_summary,
+    format_settings_comparison,
     get_preset_config,
 )
 
@@ -48,6 +50,61 @@ def test_format_preset_summary_showdown_gpp():
     assert rows["CPT QB pass-catchers"] == "1"
     assert rows["Max K+DST combined"] == "2"
     assert rows["Max repeating players"] == "4"
+
+
+def test_settings_comparison_matches_when_unchanged():
+    cfg = get_preset_config(ContestPreset.CLASSIC_SMALL_GPP)
+    actual = config_with_overrides(cfg, lineup_count=cfg.default_lineup_count, overrides={})
+    rows = format_settings_comparison(cfg, actual)
+    assert rows
+    assert all(default == actual_value for _, default, actual_value in rows)
+    assert "Strategy notes" not in {setting for setting, _, _ in rows}
+
+
+def test_settings_comparison_shows_lineup_and_stack_overrides():
+    cfg = get_preset_config(ContestPreset.CLASSIC_SMALL_GPP)
+    actual = config_with_overrides(
+        cfg,
+        lineup_count=5,
+        overrides={
+            "enable_bring_back": True,
+            "bring_back_position": "TE",
+            "jitter_pct": (0.0, 0.0),
+            "position_jitter_sds": None,
+            "not_a_field": "ignored",
+        },
+    )
+    compared = {
+        setting: (default, value)
+        for setting, default, value in format_settings_comparison(
+            cfg,
+            actual,
+            extra_rows=[("Max exposure", "Off", "40%")],
+        )
+    }
+    assert compared["Lineup count"][0].startswith("3 ")
+    assert compared["Lineup count"][1].startswith("5 ")
+    assert "bring-back" not in compared["Stacks"][0]
+    assert "TE bring-back" in compared["Stacks"][1]
+    assert compared["Projection jitter"][1].startswith("None")
+    assert compared["Max exposure"] == ("Off", "40%")
+    assert actual.label == cfg.label
+
+
+def test_settings_comparison_showdown_salary_window():
+    cfg = get_preset_config(ContestPreset.SHOWDOWN_GPP)
+    actual = config_with_overrides(
+        cfg,
+        lineup_count=20,
+        overrides={"min_salary_cap": None, "max_salary_cap": None, "min_teams": None},
+    )
+    compared = dict(
+        (setting, actual_value)
+        for setting, _, actual_value in format_settings_comparison(cfg, actual)
+    )
+    assert compared["Salary window"] == "Full cap"
+    assert compared["Min teams"] == "No minimum"
+    assert compared["Lineup count"].startswith("20 ")
 
 
 def test_format_preset_summary_covers_every_preset():
