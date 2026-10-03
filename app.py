@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -19,7 +20,9 @@ from src.presets import (
     ContestFormat,
     ContestPreset,
     PRESET_LABELS,
+    PresetConfig,
     apply_preset,
+    format_preset_summary,
     get_preset_config,
     presets_for_format,
 )
@@ -60,10 +63,338 @@ def _on_format_change() -> None:
     st.session_state.error = None
 
 
+def _preset_key(preset: ContestPreset, name: str) -> str:
+    """Widget keys include the preset so controls reset when the preset changes."""
+    return f"{name}_{preset.value}"
+
+
+def _render_strategy_summary(preset_cfg: PresetConfig) -> None:
+    rows = format_preset_summary(preset_cfg)
+    summary_df = pd.DataFrame(rows, columns=["Setting", "Preset default"])
+    st.dataframe(
+        summary_df,
+        use_container_width=True,
+        hide_index=True,
+        height=min(38 + 35 * len(summary_df), 320),
+    )
+
+
+def _collect_strategy_overrides(
+    contest_format: ContestFormat,
+    preset: ContestPreset,
+    preset_cfg: PresetConfig,
+) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Render editable strategy controls seeded from the active preset.
+
+    Returns a dict of override values to apply after ``apply_preset``, plus a
+    list of human-readable labels for fields that differ from preset defaults.
+    """
+    overrides: Dict[str, Any] = {}
+    changed: List[str] = []
+
+    st.caption(f"Defaults from: **{preset_cfg.label}** — edit any value to deviate.")
+
+    preset_jitter = preset_cfg.jitter_pct or (0.0, 0.0)
+    preset_j_lo = int(round(float(preset_jitter[0]) * 100))
+    preset_j_hi = int(round(float(preset_jitter[1]) * 100))
+    use_position_sds = bool(preset_cfg.position_jitter_sds)
+    enable_jitter = st.checkbox(
+        "Projection jitter",
+        value=preset_j_hi > 0 or use_position_sds,
+        key=_preset_key(preset, "enable_jitter"),
+        help=(
+            "Large-Field GPP uses position-specific SDs by default; "
+            "uncheck to disable, or set a uniform % band to override."
+        ),
+    )
+    jitter_band = st.slider(
+        "Jitter band %",
+        min_value=0,
+        max_value=30,
+        value=(max(preset_j_lo, 0), max(preset_j_hi, 1) if preset_j_hi == 0 else preset_j_hi)
+        if not use_position_sds
+        else (12, 18),
+        disabled=not enable_jitter,
+        key=_preset_key(preset, "jitter_band"),
+    )
+    keep_position_sds = st.checkbox(
+        "Use position-specific jitter SDs",
+        value=use_position_sds,
+        disabled=not enable_jitter or not use_position_sds,
+        key=_preset_key(preset, "keep_position_sds"),
+        help="Only available when the preset defines position SDs (Large-Field GPP).",
+    )
+    if not enable_jitter:
+        overrides["jitter_pct"] = (0.0, 0.0)
+        overrides["position_jitter_sds"] = None
+    elif keep_position_sds and use_position_sds:
+        overrides["jitter_pct"] = preset_cfg.jitter_pct
+        overrides["position_jitter_sds"] = dict(preset_cfg.position_jitter_sds or {})
+    else:
+        overrides["jitter_pct"] = (
+            float(jitter_band[0]) / 100.0,
+            float(jitter_band[1]) / 100.0,
+        )
+        overrides["position_jitter_sds"] = None
+
+    preset_jitter_on = preset_j_hi > 0 or use_position_sds
+    if bool(enable_jitter) != preset_jitter_on:
+        changed.append("Jitter")
+    elif enable_jitter and use_position_sds and not keep_position_sds:
+        changed.append("Jitter")
+    elif (
+        enable_jitter
+        and not use_position_sds
+        and (
+            int(jitter_band[0]) != preset_j_lo or int(jitter_band[1]) != preset_j_hi
+        )
+    ):
+        changed.append("Jitter")
+
+    if contest_format is ContestFormat.CLASSIC:
+        enable_qb_stack = st.checkbox(
+            "QB stack",
+            value=preset_cfg.enable_qb_stack,
+            key=_preset_key(preset, "enable_qb_stack"),
+        )
+        stack_pass_catchers = st.number_input(
+            "Pass-catchers in stack",
+            min_value=1,
+            max_value=3,
+            value=int(preset_cfg.stack_pass_catchers),
+            step=1,
+            disabled=not enable_qb_stack,
+            key=_preset_key(preset, "stack_pass_catchers"),
+        )
+        enable_bring_back = st.checkbox(
+            "Opposing bring-back",
+            value=preset_cfg.enable_bring_back,
+            disabled=not enable_qb_stack,
+            key=_preset_key(preset, "enable_bring_back"),
+        )
+        bring_back_position = st.selectbox(
+            "Bring-back position",
+            options=["WR", "TE"],
+            index=0 if preset_cfg.bring_back_position == "WR" else 1,
+            disabled=not (enable_qb_stack and enable_bring_back),
+            key=_preset_key(preset, "bring_back_position"),
+        )
+        exclude_vs_dst = st.checkbox(
+            "Exclude offense vs DST",
+            value=preset_cfg.exclude_vs_dst,
+            key=_preset_key(preset, "exclude_vs_dst"),
+        )
+
+        overrides.update(
+            enable_qb_stack=bool(enable_qb_stack),
+            stack_pass_catchers=int(stack_pass_catchers),
+            enable_bring_back=bool(enable_bring_back),
+            bring_back_position=str(bring_back_position),
+            exclude_vs_dst=bool(exclude_vs_dst),
+        )
+        if bool(enable_qb_stack) != preset_cfg.enable_qb_stack:
+            changed.append("QB stack")
+        elif enable_qb_stack and int(stack_pass_catchers) != preset_cfg.stack_pass_catchers:
+            changed.append("Pass-catchers")
+        if bool(enable_bring_back) != preset_cfg.enable_bring_back:
+            changed.append("Bring-back")
+        elif (
+            enable_bring_back
+            and str(bring_back_position) != preset_cfg.bring_back_position
+        ):
+            changed.append("Bring-back position")
+        if bool(exclude_vs_dst) != preset_cfg.exclude_vs_dst:
+            changed.append("Exclude vs DST")
+    else:
+        min_default = int(preset_cfg.min_salary_cap or 0)
+        max_default = int(preset_cfg.max_salary_cap or DK_SALARY_CAP)
+        use_salary_window = st.checkbox(
+            "Enforce salary window",
+            value=preset_cfg.min_salary_cap is not None
+            or preset_cfg.max_salary_cap is not None,
+            key=_preset_key(preset, "use_salary_window"),
+        )
+        salary_lo, salary_hi = st.slider(
+            "Salary window",
+            min_value=40_000,
+            max_value=DK_SALARY_CAP,
+            value=(
+                min_default if min_default > 0 else 48_000,
+                max_default if max_default > 0 else DK_SALARY_CAP,
+            ),
+            step=100,
+            disabled=not use_salary_window,
+            key=_preset_key(preset, "salary_window"),
+        )
+        require_both_teams = st.checkbox(
+            "Require both teams",
+            value=bool(preset_cfg.min_teams and preset_cfg.min_teams >= 2),
+            key=_preset_key(preset, "require_both_teams"),
+        )
+        game_script = st.checkbox(
+            "Game-script correlation (CPT stacks)",
+            value=preset_cfg.game_script_correlation,
+            key=_preset_key(preset, "game_script"),
+        )
+        cpt_qb_pass_catchers = st.number_input(
+            "CPT QB pass-catchers",
+            min_value=1,
+            max_value=3,
+            value=int(preset_cfg.cpt_qb_pass_catchers),
+            step=1,
+            disabled=not game_script,
+            key=_preset_key(preset, "cpt_qb_pass_catchers"),
+        )
+        limit_k_dst = st.checkbox(
+            "Limit combined K + DST",
+            value=preset_cfg.max_k_dst_combined is not None,
+            key=_preset_key(preset, "limit_k_dst"),
+        )
+        max_k_dst = st.number_input(
+            "Max K + DST combined",
+            min_value=0,
+            max_value=6,
+            value=int(
+                preset_cfg.max_k_dst_combined
+                if preset_cfg.max_k_dst_combined is not None
+                else 2
+            ),
+            step=1,
+            disabled=not limit_k_dst,
+            key=_preset_key(preset, "max_k_dst"),
+        )
+
+        overrides.update(
+            min_salary_cap=int(salary_lo) if use_salary_window else None,
+            max_salary_cap=int(salary_hi) if use_salary_window else None,
+            min_teams=2 if require_both_teams else None,
+            game_script_correlation=bool(game_script),
+            cpt_qb_pass_catchers=int(cpt_qb_pass_catchers),
+            max_k_dst_combined=int(max_k_dst) if limit_k_dst else None,
+        )
+        preset_uses_window = (
+            preset_cfg.min_salary_cap is not None or preset_cfg.max_salary_cap is not None
+        )
+        if bool(use_salary_window) != preset_uses_window:
+            changed.append("Salary window")
+        elif use_salary_window and (
+            int(salary_lo) != int(preset_cfg.min_salary_cap or salary_lo)
+            or int(salary_hi) != int(preset_cfg.max_salary_cap or salary_hi)
+        ):
+            changed.append("Salary window")
+        preset_both = bool(preset_cfg.min_teams and preset_cfg.min_teams >= 2)
+        if bool(require_both_teams) != preset_both:
+            changed.append("Min teams")
+        if bool(game_script) != preset_cfg.game_script_correlation:
+            changed.append("Game-script")
+        elif game_script and int(cpt_qb_pass_catchers) != preset_cfg.cpt_qb_pass_catchers:
+            changed.append("CPT QB pass-catchers")
+        preset_limit_k = preset_cfg.max_k_dst_combined is not None
+        if bool(limit_k_dst) != preset_limit_k:
+            changed.append("Max K+DST")
+        elif limit_k_dst and int(max_k_dst) != int(preset_cfg.max_k_dst_combined or 0):
+            changed.append("Max K+DST")
+
+    limit_repeating = st.checkbox(
+        "Limit max repeating players",
+        value=preset_cfg.max_repeating_players is not None,
+        key=_preset_key(preset, "limit_repeating"),
+    )
+    default_repeats = (
+        int(preset_cfg.max_repeating_players)
+        if preset_cfg.max_repeating_players is not None
+        else 6
+    )
+    max_repeating = st.number_input(
+        "Max repeating players",
+        min_value=0,
+        max_value=9 if contest_format is ContestFormat.CLASSIC else 6,
+        value=default_repeats,
+        step=1,
+        disabled=not limit_repeating,
+        key=_preset_key(preset, "max_repeating"),
+    )
+
+    limit_ownership = st.checkbox(
+        "Apply cumulative ownership cap",
+        value=preset_cfg.max_cumulative_ownership is not None,
+        key=_preset_key(preset, "limit_ownership"),
+    )
+    default_own_pct = int(
+        round((preset_cfg.max_cumulative_ownership or 1.25) * 100)
+    )
+    ownership_pct = st.number_input(
+        "Ownership cap % (cumulative)",
+        min_value=50,
+        max_value=900,
+        value=default_own_pct,
+        step=5,
+        disabled=not limit_ownership,
+        key=_preset_key(preset, "ownership_pct"),
+        help="Sum of ownership fractions across the roster (125 = 125%).",
+    )
+
+    overrides["max_repeating_players"] = (
+        int(max_repeating) if limit_repeating else None
+    )
+    overrides["max_cumulative_ownership"] = (
+        float(ownership_pct) / 100.0 if limit_ownership else None
+    )
+
+    preset_limit_rep = preset_cfg.max_repeating_players is not None
+    if bool(limit_repeating) != preset_limit_rep:
+        changed.append("Max repeating")
+    elif limit_repeating and int(max_repeating) != int(
+        preset_cfg.max_repeating_players or 0
+    ):
+        changed.append("Max repeating")
+
+    preset_limit_own = preset_cfg.max_cumulative_ownership is not None
+    if bool(limit_ownership) != preset_limit_own:
+        changed.append("Ownership cap")
+    elif limit_ownership and abs(
+        float(ownership_pct) / 100.0 - float(preset_cfg.max_cumulative_ownership or 0)
+    ) > 1e-9:
+        changed.append("Ownership cap")
+
+    return overrides, changed
+
+
+def _apply_strategy_overrides(optimizer: Any, overrides: Dict[str, Any]) -> None:
+    """Apply UI strategy deviations on top of ``apply_preset``."""
+    if "jitter_pct" in overrides:
+        optimizer.jitter_pct = overrides["jitter_pct"]
+        optimizer.position_jitter_sds = overrides.get("position_jitter_sds")
+
+    if "enable_qb_stack" in overrides and hasattr(optimizer, "set_qb_stack"):
+        optimizer.set_qb_stack(
+            enabled=overrides["enable_qb_stack"],
+            pass_catchers=overrides["stack_pass_catchers"],
+            bring_back=overrides["enable_bring_back"],
+            bring_back_position=overrides["bring_back_position"],
+        )
+    if "exclude_vs_dst" in overrides:
+        optimizer.exclude_vs_dst = overrides["exclude_vs_dst"]
+
+    if "min_salary_cap" in overrides and hasattr(optimizer, "configure_showdown_rules"):
+        optimizer.configure_showdown_rules(
+            min_salary_cap=overrides["min_salary_cap"],
+            max_salary_cap=overrides["max_salary_cap"],
+            min_teams=overrides["min_teams"],
+            game_script_correlation=overrides["game_script_correlation"],
+            cpt_qb_pass_catchers=overrides["cpt_qb_pass_catchers"],
+            max_k_dst_combined=overrides["max_k_dst_combined"],
+        )
+
+    optimizer.set_max_repeating_players(overrides.get("max_repeating_players"))
+    optimizer.max_cumulative_ownership = overrides.get("max_cumulative_ownership")
+
+
 _init_state()
 
 # ---------------------------------------------------------------------------
-# Sidebar — format, preset, and compact optimizer settings
+# Sidebar — format, preset, strategy defaults, and editable overrides
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.markdown("### Contest Format")
@@ -91,7 +422,10 @@ with st.sidebar:
     )
     preset = ContestPreset(st.session_state.contest_preset)
     preset_cfg = get_preset_config(preset)
-    st.caption(preset_cfg.description)
+
+    st.caption(f"Defaults from: {preset_cfg.label}")
+    with st.expander("Strategy defaults", expanded=True):
+        _render_strategy_summary(preset_cfg)
 
     lo, hi = preset_cfg.lineup_count_range
     lineup_count = st.number_input(
@@ -100,8 +434,20 @@ with st.sidebar:
         max_value=int(hi),
         value=int(min(max(preset_cfg.default_lineup_count, lo), hi)),
         step=1,
-        key=f"lineup_count_{preset.value}",
+        key=_preset_key(preset, "lineup_count"),
+        help=f"Preset default: {preset_cfg.default_lineup_count} (range {lo}–{hi}).",
     )
+    lineup_overridden = int(lineup_count) != int(preset_cfg.default_lineup_count)
+    if lineup_overridden:
+        st.caption(
+            f"Override: lineups {int(lineup_count)} "
+            f"(preset default {preset_cfg.default_lineup_count})."
+        )
+
+    with st.expander("Adjust strategy", expanded=True):
+        strategy_overrides, strategy_changed = _collect_strategy_overrides(
+            contest_format, preset, preset_cfg
+        )
 
     with st.expander("Advanced overrides", expanded=False):
         jitter_seed = st.number_input(
@@ -110,15 +456,44 @@ with st.sidebar:
             max_value=10_000_000,
             value=42,
             help="Projection jitter uses this seed (reproducible). Not used when jitter is 0%.",
+            key=_preset_key(preset, "jitter_seed"),
         )
-        use_max_exposure = st.checkbox("Limit max player exposure", value=False)
+        use_max_exposure = st.checkbox(
+            "Limit max player exposure",
+            value=False,
+            key=_preset_key(preset, "use_max_exposure"),
+        )
         max_exposure_pct = st.slider(
-            "Max exposure %", 1, 100, 40, disabled=not use_max_exposure
+            "Max exposure %",
+            1,
+            100,
+            40,
+            disabled=not use_max_exposure,
+            key=_preset_key(preset, "max_exposure_pct"),
         )
-        use_min_exposure = st.checkbox("Require min player exposure", value=False)
+        use_min_exposure = st.checkbox(
+            "Require min player exposure",
+            value=False,
+            key=_preset_key(preset, "use_min_exposure"),
+        )
         min_exposure_pct = st.slider(
-            "Min exposure %", 0, 100, 0, disabled=not use_min_exposure
+            "Min exposure %",
+            0,
+            100,
+            0,
+            disabled=not use_min_exposure,
+            key=_preset_key(preset, "min_exposure_pct"),
         )
+
+    all_changed = list(strategy_changed)
+    if lineup_overridden:
+        all_changed.insert(0, "Lineups")
+    if use_max_exposure or use_min_exposure:
+        all_changed.append("Exposure")
+    if all_changed:
+        st.info("Overrides active: " + ", ".join(all_changed))
+    else:
+        st.caption("Using preset defaults (no overrides).")
 
 # ---------------------------------------------------------------------------
 # Main — title + primary action bar (upload / generate / download)
@@ -199,12 +574,30 @@ if st.session_state.flash_success:
 pool: pd.DataFrame | None = st.session_state.player_pool
 
 if pool is None:
+    # Still show strategy summary before upload so presets are understandable.
+    with st.expander(
+        f"Strategy defaults — {preset_cfg.label}",
+        expanded=True,
+    ):
+        st.caption(preset_cfg.description)
+        _render_strategy_summary(preset_cfg)
+        if all_changed:
+            st.warning("Active overrides: " + ", ".join(all_changed))
     st.info(
         "Upload a DraftKings NFL Showdown DKSalaries.csv (CPT/FLEX rows) to begin."
         if is_showdown
         else "Upload a DraftKings NFL Classic DKSalaries.csv to begin."
     )
     st.stop()
+
+# Compact strategy panel once a pool is loaded (sidebar already has full detail).
+with st.expander(f"Strategy defaults — {preset_cfg.label}", expanded=False):
+    st.caption(preset_cfg.description)
+    _render_strategy_summary(preset_cfg)
+    if all_changed:
+        st.warning("Active overrides: " + ", ".join(all_changed))
+    else:
+        st.caption("Controls match preset defaults.")
 
 roster_n = 6 if is_showdown else 9
 st.subheader("Player pool")
@@ -246,6 +639,7 @@ if generate:
             lineup_count=int(lineup_count),
             jitter_seed=int(jitter_seed),
         )
+        _apply_strategy_overrides(optimizer, strategy_overrides)
         optimizer.set_exposure_limits(
             min_exposure_pct=float(min_exposure_pct) if use_min_exposure else None,
             max_exposure_pct=float(max_exposure_pct) if use_max_exposure else None,
@@ -254,9 +648,12 @@ if generate:
         generated = optimizer.generate_lineups()
         progress.progress(100, text="Done")
         st.session_state.lineups = generated
+        override_note = (
+            f" (overrides: {', '.join(all_changed)})" if all_changed else ""
+        )
         st.session_state.flash_success = (
             f"Generated {len(generated)} lineup(s) with preset "
-            f"{PRESET_LABELS[preset]}."
+            f"{PRESET_LABELS[preset]}{override_note}."
         )
         st.rerun()
     except Exception as exc:  # noqa: BLE001 - show optimizer failures in UI
