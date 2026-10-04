@@ -47,9 +47,11 @@ def test_format_preset_summary_showdown_gpp():
     assert "$48,000" in rows["Salary window"] and "$49,800" in rows["Salary window"]
     assert rows["Min teams"] == "2"
     assert rows["Game-script correlation"] == "Yes"
-    assert rows["CPT QB pass-catchers"] == "1"
+    assert rows["CPT QB pass-catchers"] == "2"
     assert rows["Max K+DST combined"] == "2"
-    assert rows["Max repeating players"] == "4"
+    assert rows["Max kickers"] == "1"
+    assert rows["Max repeating players"] == "3"
+    assert rows["Kicker captain"] == "No"
 
 
 def test_settings_comparison_matches_when_unchanged():

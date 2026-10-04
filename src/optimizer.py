@@ -11,7 +11,7 @@ from pydfs_lineup_optimizer import Player, Site, Sport, get_optimizer
 from pydfs_lineup_optimizer.player import GameInfo
 from pydfs_lineup_optimizer.stacks import PlayersGroup, PositionsStack
 
-from .parser import parse_dk_csv
+from .parser import drop_inactive_players, is_inactive_injury, parse_dk_csv
 from .presets import ContestFormat
 
 DK_SALARY_CAP = 50_000
@@ -27,6 +27,13 @@ DEFAULT_JITTER_SEED = 42
 
 SKILL_POSITIONS = ("RB", "WR", "TE")
 PASS_CATCHERS = ("WR", "TE")
+# Captain-QB FLEX quota is WR and TE only. RB, K, and DST do not count.
+CPT_QB_PASS_CATCHER_POSITIONS = frozenset({"WR", "TE"})
+_NOT_CPT_QB_PASS_CATCHERS = frozenset({"K", "DST", "DEF", "RB", "QB"})
+# Opposing FLEX piece required with a Captain QB.
+QB_BRING_BACK_POSITIONS = frozenset({"WR", "TE", "RB"})
+# Captain is a skill spot unless a low-total slate explicitly allows a kicker.
+CAPTAIN_POSITIONS = frozenset({"QB", "RB", "WR", "TE"})
 
 
 def _parse_game_info(
@@ -165,6 +172,9 @@ def dataframe_to_players(
         first, last = _split_name(row["Name"])
         projection = float(row["Projection"] if "Projection" in df.columns else row["AvgPointsPerGame"])
         game_raw = row["Game Info"] if "Game Info" in df.columns else None
+        injured = bool(
+            "Injury" in df.columns and is_inactive_injury(row.get("Injury", ""))
+        )
         ownership = None
         for col in ("Ownership", "Projected Ownership", "Own%", "Own"):
             if col in df.columns:
@@ -193,6 +203,7 @@ def dataframe_to_players(
                     min_exposure=min_exposure,
                     max_exposure=max_exposure,
                     projected_ownership=ownership,
+                    is_injured=injured,
                     original_positions=[football_pos] if football_pos else None,
                 )
             )
@@ -210,6 +221,7 @@ def dataframe_to_players(
                     min_exposure=min_exposure,
                     max_exposure=max_exposure,
                     projected_ownership=ownership,
+                    is_injured=injured,
                 )
             )
     return players
@@ -238,13 +250,26 @@ class BaseNFLOptimizer:
         self.jitter_seed: Optional[int] = DEFAULT_JITTER_SEED
         self.min_salary_cap: Optional[int] = None
         self.max_salary_cap: Optional[int] = None
+        # Drop OUT / IR / Doubtful players. Questionable players stay eligible.
+        self.exclude_inactive: bool = True
 
     def load_from_csv(self, path: Union[str, Path]) -> pd.DataFrame:
         df = parse_dk_csv(path, contest_format=ContestFormat(self.contest_format))
         return self.load_from_dataframe(df)
 
+    def set_exclude_inactive(self, exclude: bool) -> None:
+        """When true, players who will not play are removed before the solve."""
+        self.exclude_inactive = bool(exclude)
+
     def load_from_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
-        self._player_df = df.copy()
+        pool = df.copy()
+        if self.exclude_inactive:
+            pool = drop_inactive_players(pool)
+            if pool.empty:
+                raise RuntimeError(
+                    "No active players left after excluding players who will not play."
+                )
+        self._player_df = pool
         self._players = dataframe_to_players(
             self._player_df,
             contest_format=ContestFormat(self.contest_format),
@@ -310,6 +335,10 @@ class BaseNFLOptimizer:
             pydfs_optimizer.settings.budget = int(self.max_salary_cap)
         if self.min_salary_cap is not None:
             pydfs_optimizer.set_min_salary_cap(float(self.min_salary_cap))
+
+    def _apply_injury_filter(self, pydfs_optimizer) -> None:
+        """Keep injured players only when the user has chosen to include them."""
+        pydfs_optimizer.player_pool.with_injured = not self.exclude_inactive
 
     def _players_for_optimize(self) -> List[Player]:
         if self._player_df is None or not self._players:
@@ -436,6 +465,7 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
     def _build_optimizer(self, players: List[Player]):
         optimizer = get_optimizer(self.site, self.sport)
         self._apply_salary_caps(optimizer)
+        self._apply_injury_filter(optimizer)
         optimizer.player_pool.load_players(players)
         if self.max_repeating_players is not None:
             optimizer.set_max_repeating_players(self.max_repeating_players)
@@ -480,8 +510,15 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         self.max_salary_cap: Optional[int] = 49_800
         self.min_teams: Optional[int] = 2
         self.game_script_correlation: bool = True
-        self.cpt_qb_pass_catchers: int = 1
+        self.cpt_qb_pass_catchers: int = 2
         self.max_k_dst_combined: Optional[int] = 2
+        # CPT + FLEX combined. None leaves the kicker count uncapped.
+        self.max_kickers: Optional[int] = 1
+        self.allow_kicker_captain: bool = False
+        # Fraction of the batch a kicker may occupy. None leaves exposure uncapped.
+        self.kicker_max_exposure: Optional[float] = None
+        # Showdown batches share at most 3 players so lineups do not collapse together.
+        self.max_repeating_players = 3
 
     def configure_showdown_rules(
         self,
@@ -490,23 +527,75 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         max_salary_cap: Optional[int] = 49_800,
         min_teams: Optional[int] = 2,
         game_script_correlation: bool = True,
-        cpt_qb_pass_catchers: int = 1,
+        cpt_qb_pass_catchers: int = 2,
         max_k_dst_combined: Optional[int] = 2,
+        max_kickers: Optional[int] = 1,
+        allow_kicker_captain: bool = False,
     ) -> None:
         if cpt_qb_pass_catchers < 1:
             raise ValueError("cpt_qb_pass_catchers must be at least 1")
+        if max_kickers is not None and int(max_kickers) < 0:
+            raise ValueError("max_kickers must be at least 0")
         self.min_salary_cap = min_salary_cap
         self.max_salary_cap = max_salary_cap
         self.min_teams = min_teams
         self.game_script_correlation = bool(game_script_correlation)
         self.cpt_qb_pass_catchers = int(cpt_qb_pass_catchers)
         self.max_k_dst_combined = max_k_dst_combined
+        self.max_kickers = None if max_kickers is None else int(max_kickers)
+        self.allow_kicker_captain = bool(allow_kicker_captain)
 
     @staticmethod
     def _football_pos(player: Player) -> str:
-        if player.original_positions:
-            return str(player.original_positions[0]).upper()
-        return "/".join(player.positions).upper()
+        """Primary football position, ignoring the CPT/FLEX roster slot."""
+        stored = getattr(player, "_original_positions", None)
+        raw = str(stored[0]) if stored else ""
+        primary = raw.split("/")[0].strip().upper()
+        if primary in {"CPT", "FLEX", "UTIL"}:
+            return ""
+        if primary == "DEF":
+            return "DST"
+        return primary
+
+    def _counts_as_cpt_qb_pass_catcher(self, player: Player) -> bool:
+        """FLEX WR or TE only. Kickers, defenses, and running backs do not count."""
+        if "FLEX" not in player.positions:
+            return False
+        pos = self._football_pos(player)
+        if pos in _NOT_CPT_QB_PASS_CATCHERS:
+            return False
+        return pos in CPT_QB_PASS_CATCHER_POSITIONS
+
+    def _counts_as_qb_bring_back(self, player: Player, captain_team: str) -> bool:
+        """Opposing FLEX WR, TE, or RB."""
+        if "FLEX" not in player.positions or player.team == captain_team:
+            return False
+        return self._football_pos(player) in QB_BRING_BACK_POSITIONS
+
+    def _captain_positions_allowed(self) -> frozenset:
+        allowed = set(CAPTAIN_POSITIONS)
+        if self.allow_kicker_captain:
+            allowed.add("K")
+        return frozenset(allowed)
+
+    def _apply_kicker_exposure_cap(self, players: List[Player]) -> None:
+        cap = self.kicker_max_exposure
+        if cap is None:
+            return
+        for player in players:
+            if self._football_pos(player) != "K":
+                continue
+            if player.max_exposure is None or player.max_exposure > cap:
+                player.max_exposure = cap
+
+    def _apply_captain_eligibility(self, optimizer, players: List[Player]) -> None:
+        """Keep CPT on QB/RB/WR/TE. A kicker CPT is allowed only when the flag is on."""
+        allowed = self._captain_positions_allowed()
+        for player in players:
+            if "CPT" not in player.positions:
+                continue
+            if self._football_pos(player) not in allowed:
+                optimizer.player_pool.remove_player(player)
 
     def _apply_game_script(self, optimizer, players: List[Player]) -> None:
         if not self.game_script_correlation:
@@ -521,18 +610,36 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
                 catchers = [
                     p
                     for p in flex_players
-                    if p.team == cpt.team and self._football_pos(p) in PASS_CATCHERS
+                    if p.team == cpt.team and self._counts_as_cpt_qb_pass_catcher(p)
                 ]
-                if catchers:
-                    optimizer.add_players_group(
-                        PlayersGroup(
-                            catchers,
-                            min_from_group=min(self.cpt_qb_pass_catchers, len(catchers)),
-                            max_from_group=len(catchers),
-                            depends_on=cpt,
-                            strict_depend=False,
-                        )
+                needed = int(self.cpt_qb_pass_catchers)
+                bring_backs = [
+                    p
+                    for p in flex_players
+                    if self._counts_as_qb_bring_back(p, cpt.team)
+                ]
+                if len(catchers) < needed or not bring_backs:
+                    # K and DST are not catchers, and a QB captain needs an opposing skill player.
+                    optimizer.player_pool.remove_player(cpt)
+                    continue
+                optimizer.add_players_group(
+                    PlayersGroup(
+                        catchers,
+                        min_from_group=needed,
+                        max_from_group=len(catchers),
+                        depends_on=cpt,
+                        strict_depend=False,
                     )
+                )
+                optimizer.add_players_group(
+                    PlayersGroup(
+                        bring_backs,
+                        min_from_group=1,
+                        max_from_group=len(bring_backs),
+                        depends_on=cpt,
+                        strict_depend=False,
+                    )
+                )
             elif pos in PASS_CATCHERS:
                 qbs = [
                     p
@@ -565,16 +672,62 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
                     )
                 )
 
+    def _apply_kicker_limit(self, optimizer, players: List[Player]) -> None:
+        """Keep CPT and FLEX to at most ``max_kickers`` kickers combined.
+
+        Captain mode roster slots are CPT and FLEX, so a football-position
+        cap is a players group over every kicker row. ``max_from_group``
+        with no minimum encodes sum(kickers) <= max.
+        """
+        if self.max_kickers is None:
+            return
+        kickers = [p for p in players if self._football_pos(p) == "K"]
+        if len(kickers) <= int(self.max_kickers):
+            return
+        optimizer.add_players_group(
+            PlayersGroup(kickers, max_from_group=int(self.max_kickers))
+        )
+
+    def _apply_dst_negative_correlation(self, optimizer, players: List[Player]) -> None:
+        """A defense cannot share a lineup with the opposing QB or kicker."""
+        by_team_pos: Dict[str, Dict[str, List[Player]]] = {}
+        for player in players:
+            pos = self._football_pos(player)
+            if pos not in {"DST", "K", "QB"}:
+                continue
+            by_team_pos.setdefault(player.team, {}).setdefault(pos, []).append(player)
+
+        for team, positions in by_team_pos.items():
+            defenses = positions.get("DST") or []
+            if not defenses:
+                continue
+            for other_team, other_positions in by_team_pos.items():
+                if other_team == team:
+                    continue
+                for blocked_pos in ("K", "QB"):
+                    blocked = other_positions.get(blocked_pos) or []
+                    if not blocked:
+                        continue
+                    # Sum of this defense and the opposing piece is at most 1.
+                    optimizer.add_players_group(
+                        PlayersGroup(defenses + blocked, max_from_group=1)
+                    )
+
     def _build_optimizer(self, players: List[Player]):
         optimizer = get_optimizer(self.site, self.sport)
         # Optional window. Showdown presets leave $200–$2,000 under the DK cap.
         self._apply_salary_caps(optimizer)
+        self._apply_injury_filter(optimizer)
+        self._apply_kicker_exposure_cap(players)
         optimizer.player_pool.load_players(players)
         if self.min_teams is not None:
             optimizer.set_total_teams(min_teams=int(self.min_teams))
         if self.max_repeating_players is not None:
             optimizer.set_max_repeating_players(self.max_repeating_players)
+        self._apply_captain_eligibility(optimizer, players)
         self._apply_game_script(optimizer, players)
+        self._apply_kicker_limit(optimizer, players)
+        self._apply_dst_negative_correlation(optimizer, players)
         self._apply_ownership_cap(optimizer)
         return optimizer
 

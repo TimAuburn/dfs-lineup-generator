@@ -77,8 +77,11 @@ class PresetConfig:
     max_salary_cap: Optional[int] = None
     min_teams: Optional[int] = None
     game_script_correlation: bool = False
-    cpt_qb_pass_catchers: int = 1
+    cpt_qb_pass_catchers: int = 2
     max_k_dst_combined: Optional[int] = None
+    # Showdown roster cap. 1 blocks both teams' kickers in one lineup. None = no cap.
+    max_kickers: Optional[int] = None
+    allow_kicker_captain: bool = False
     description: str = ""
 
 
@@ -133,10 +136,16 @@ PRESET_CONFIGS: Dict[ContestPreset, PresetConfig] = {
         max_salary_cap=49_800,
         min_teams=2,
         game_script_correlation=True,
-        cpt_qb_pass_catchers=1,
+        cpt_qb_pass_catchers=2,
         max_k_dst_combined=2,
-        max_repeating_players=4,
-        description="Showdown GPP: salary window, both teams, CPT game-script stacks, K/DST ≤ 2.",
+        max_kickers=1,
+        max_repeating_players=3,
+        allow_kicker_captain=False,
+        description=(
+            "Showdown GPP: salary window, both teams, CPT QB needs 2 WR/TE "
+            "plus an opposing skill player, no K or DST captains, at most one kicker, "
+            "max 3 repeats."
+        ),
     ),
     ContestPreset.SHOWDOWN_CASH: PresetConfig(
         format=ContestFormat.SHOWDOWN,
@@ -149,8 +158,10 @@ PRESET_CONFIGS: Dict[ContestPreset, PresetConfig] = {
         min_teams=2,
         game_script_correlation=False,
         max_k_dst_combined=2,
+        max_kickers=1,
         max_repeating_players=None,
-        description="Showdown Cash: low/no jitter, few lineups, both teams required.",
+        allow_kicker_captain=True,
+        description="Showdown Cash: low/no jitter, few lineups, both teams required, at most one kicker.",
     ),
 }
 
@@ -265,12 +276,24 @@ def format_preset_summary(config: PresetConfig) -> List[Tuple[str, str]]:
             )
         rows.append(
             (
+                "Kicker captain",
+                "Yes" if config.allow_kicker_captain else "No",
+            )
+        )
+        rows.append(
+            (
                 "Max K+DST combined",
                 (
                     str(config.max_k_dst_combined)
                     if config.max_k_dst_combined is not None
                     else "No limit"
                 ),
+            )
+        )
+        rows.append(
+            (
+                "Max kickers",
+                str(config.max_kickers) if config.max_kickers is not None else "No limit",
             )
         )
 
@@ -375,6 +398,8 @@ def apply_preset(
             game_script_correlation=config.game_script_correlation,
             cpt_qb_pass_catchers=config.cpt_qb_pass_catchers,
             max_k_dst_combined=config.max_k_dst_combined,
+            max_kickers=config.max_kickers,
+            allow_kicker_captain=config.allow_kicker_captain,
         )
 
     return config

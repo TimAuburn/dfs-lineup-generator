@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -13,6 +14,14 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.data_loader import (
+    KICKER_CAPTAIN_MAX_EXPOSURE,
+    apply_vegas_projections,
+    frame_to_lines,
+    lines_to_frame,
+    low_scoring_showdown,
+    projection_adjustment_labels,
+)
 from src.exporter import lineups_to_dk_upload_csv, upload_columns_for
 from src.optimizer import (
     DK_SALARY_CAP,
@@ -21,7 +30,8 @@ from src.optimizer import (
     optimize_tiered_salaries,
     tiered_lineup_counts,
 )
-from src.parser import DKCSVValidationError, parse_dk_csv
+from src.parser import DKCSVValidationError, is_inactive_injury, parse_dk_csv
+from src.vegas_cache import fetch_vegas_lines, format_cache_status
 from src.presets import (
     ContestFormat,
     ContestPreset,
@@ -56,6 +66,9 @@ def _init_state() -> None:
         "contest_format": ContestFormat.CLASSIC.value,
         "contest_preset": ContestPreset.CLASSIC_SMALL_GPP.value,
         "generated_run": None,
+        "vegas_editor_version": 0,
+        "vegas_source_json": None,
+        "vegas_frame": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -302,6 +315,18 @@ def _collect_strategy_overrides(
             disabled=not limit_k_dst,
             key=_preset_key(preset, "max_k_dst"),
         )
+        allow_kicker_captain = st.checkbox(
+            "Allow kicker captain",
+            value=bool(preset_cfg.allow_kicker_captain),
+            key=_preset_key(preset, "allow_kicker_captain"),
+            help="Off keeps CPT to QB, RB, WR, and TE. A game total of 38.5 or lower turns this on.",
+        )
+        limit_kickers = st.checkbox(
+            "Allow at most 1 Kicker per lineup",
+            value=preset_cfg.max_kickers == 1,
+            key=_preset_key(preset, "limit_kickers"),
+            help="Checked lineups include at most one kicker, so both teams' kickers cannot be paired.",
+        )
 
         overrides.update(
             min_salary_cap=int(salary_lo) if use_salary_window else None,
@@ -310,6 +335,8 @@ def _collect_strategy_overrides(
             game_script_correlation=bool(game_script),
             cpt_qb_pass_catchers=int(cpt_qb_pass_catchers),
             max_k_dst_combined=int(max_k_dst) if limit_k_dst else None,
+            max_kickers=1 if limit_kickers else None,
+            allow_kicker_captain=bool(allow_kicker_captain),
         )
         preset_uses_window = (
             preset_cfg.min_salary_cap is not None or preset_cfg.max_salary_cap is not None
@@ -333,6 +360,10 @@ def _collect_strategy_overrides(
             changed.append("Max K+DST")
         elif limit_k_dst and int(max_k_dst) != int(preset_cfg.max_k_dst_combined or 0):
             changed.append("Max K+DST")
+        if bool(allow_kicker_captain) != bool(preset_cfg.allow_kicker_captain):
+            changed.append("Kicker captain")
+        if bool(limit_kickers) != (preset_cfg.max_kickers == 1):
+            changed.append("Max kickers")
 
     limit_repeating = st.checkbox(
         "Limit max repeating players",
@@ -423,6 +454,8 @@ def _apply_strategy_overrides(optimizer: Any, overrides: Dict[str, Any]) -> None
             game_script_correlation=overrides["game_script_correlation"],
             cpt_qb_pass_catchers=overrides["cpt_qb_pass_catchers"],
             max_k_dst_combined=overrides["max_k_dst_combined"],
+            max_kickers=overrides.get("max_kickers", 1),
+            allow_kicker_captain=bool(overrides.get("allow_kicker_captain", False)),
         )
 
     optimizer.set_max_repeating_players(overrides.get("max_repeating_players"))
@@ -460,6 +493,34 @@ with st.sidebar:
     )
     preset = ContestPreset(st.session_state.contest_preset)
     preset_cfg = get_preset_config(preset)
+
+    st.markdown("### Injuries")
+    injury_choice = st.radio(
+        "Players who will not play",
+        options=["exclude", "include"],
+        format_func=lambda v: (
+            "Exclude OUT, IR, and Doubtful"
+            if v == "exclude"
+            else "Include everyone"
+        ),
+        index=0,
+        key="injury_choice",
+        help="Questionable and probable players stay in the pool either way.",
+    )
+    exclude_inactive = injury_choice == "exclude"
+    loaded_pool = st.session_state.player_pool
+    if loaded_pool is not None and "Injury" in loaded_pool.columns:
+        inactive_names = (
+            loaded_pool.loc[loaded_pool["Injury"].map(is_inactive_injury), "Name"]
+            .astype(str)
+            .drop_duplicates()
+        )
+        if exclude_inactive and len(inactive_names):
+            preview = ", ".join(inactive_names.head(4))
+            extra = f" +{len(inactive_names) - 4}" if len(inactive_names) > 4 else ""
+            st.caption(f"Leaving out {len(inactive_names)}: {preview}{extra}")
+        elif exclude_inactive:
+            st.caption("No OUT, IR, or Doubtful players in this pool.")
 
     lo, hi = preset_cfg.lineup_count_range
     lineup_count = st.number_input(
@@ -559,6 +620,47 @@ with st.sidebar:
             key=_preset_key(preset, "min_exposure_pct"),
         )
 
+    st.markdown("### Vegas odds")
+    odds_api_key = st.text_input(
+        "The Odds API Key",
+        type="password",
+        key="odds_api_key",
+        help="Optional. A saved cache is used when this is blank or the request fails.",
+    )
+    force_vegas_refresh = st.button("Force Refresh Vegas Odds", key="force_vegas_refresh")
+    fetched_lines = fetch_vegas_lines(
+        api_key=str(odds_api_key).strip() or None,
+        force_refresh=bool(force_vegas_refresh),
+    )
+    signature = json.dumps(fetched_lines, sort_keys=True, default=str)
+    if (
+        force_vegas_refresh
+        or st.session_state.vegas_frame is None
+        or signature != st.session_state.vegas_source_json
+    ):
+        st.session_state.vegas_source_json = signature
+        st.session_state.vegas_frame = lines_to_frame(fetched_lines)
+        if force_vegas_refresh:
+            st.session_state.vegas_editor_version = int(st.session_state.vegas_editor_version) + 1
+    st.caption(format_cache_status())
+    edited_vegas = st.data_editor(
+        st.session_state.vegas_frame,
+        width="stretch",
+        hide_index=True,
+        num_rows="dynamic",
+        height=240,
+        key=f"vegas_editor_{st.session_state.vegas_editor_version}",
+        column_config={
+            "Game": st.column_config.TextColumn("Game", width="small"),
+            "Team": st.column_config.TextColumn("Team", width="small"),
+            "Spread": st.column_config.NumberColumn("Spread", format="%.1f", width="small"),
+            "Over/Under": st.column_config.NumberColumn(
+                "Over/Under", format="%.1f", width="small"
+            ),
+            "ITT": st.column_config.NumberColumn("ITT", format="%.1f", width="small"),
+        },
+    )
+
     all_changed = list(strategy_changed)
     if lineup_overridden:
         all_changed.insert(0, "Lineups")
@@ -566,10 +668,24 @@ with st.sidebar:
         all_changed.append("Exposure")
     if enable_tiered_salary:
         all_changed.append("Tiered salary")
+    if not exclude_inactive:
+        all_changed.append("Injuries")
     if all_changed:
         st.info("Overrides active: " + ", ".join(all_changed))
     else:
         st.caption("Using preset defaults (no overrides).")
+
+vegas_lines = frame_to_lines(edited_vegas)
+slate_teams: set[str] = set()
+if st.session_state.player_pool is not None and "TeamAbbrev" in st.session_state.player_pool.columns:
+    slate_teams = set(
+        st.session_state.player_pool["TeamAbbrev"].astype(str).str.strip().str.upper()
+    )
+low_scoring_game = contest_format is ContestFormat.SHOWDOWN and low_scoring_showdown(
+    vegas_lines, slate_teams
+)
+if low_scoring_game:
+    strategy_overrides["allow_kicker_captain"] = True
 
 actual_cfg = config_with_overrides(
     preset_cfg,
@@ -596,6 +712,24 @@ if enable_tiered_salary:
                 f"({discount_n} under ${int(discount_cap):,}; "
                 f"{full_cap_n} at ${STANDARD_TIER_FLOOR:,}–${DK_SALARY_CAP:,})"
             ),
+        )
+    )
+extra_setting_rows.append(
+    (
+        "Inactive players",
+        "Excluded",
+        "Excluded" if exclude_inactive else "Included",
+    )
+)
+itt_labels = projection_adjustment_labels(st.session_state.player_pool, vegas_lines)
+if itt_labels:
+    extra_setting_rows.append(("Vegas ITT", "No adjustment", ", ".join(itt_labels)))
+if low_scoring_game:
+    extra_setting_rows.append(
+        (
+            "Kicker exposure",
+            "No cap",
+            "10% (game total ≤ 38.5)",
         )
     )
 live_setting_rows = format_settings_comparison(
@@ -654,7 +788,7 @@ with generate_col:
     generate = st.button(
         "Generate Lineups",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         disabled=st.session_state.player_pool is None and uploaded is None,
     )
 with download_col:
@@ -665,7 +799,7 @@ with download_col:
         file_name=download_name,
         mime="text/csv",
         type="secondary",
-        use_container_width=True,
+        width="stretch",
         disabled=not bool(lineups),
     )
 
@@ -700,6 +834,10 @@ with st.container(border=True):
     st.markdown(f"#### Lineup settings — {preset_cfg.label}")
     st.caption(preset_cfg.description)
     st.caption(settings_note)
+    if low_scoring_game:
+        st.caption(
+            "Game total is 38.5 or lower, so a kicker can be captain with a 10% exposure cap."
+        )
     _render_settings_comparison(live_setting_rows)
 
 pool: pd.DataFrame | None = st.session_state.player_pool
@@ -713,17 +851,33 @@ if pool is None:
     st.stop()
 
 roster_n = 6 if is_showdown else 9
+inactive_in_pool = (
+    int(pool["Injury"].map(is_inactive_injury).sum())
+    if "Injury" in pool.columns
+    else 0
+)
 st.subheader("Player pool")
-st.caption(f"{len(pool)} rows loaded · {roster_n}-player roster · salary cap ${DK_SALARY_CAP:,}")
+injury_note = (
+    f" · {inactive_in_pool} row(s) marked OUT/IR/Doubtful"
+    if inactive_in_pool
+    else ""
+)
+st.caption(
+    f"{len(pool)} rows loaded · {roster_n}-player roster · salary cap ${DK_SALARY_CAP:,}"
+    f"{injury_note}"
+)
 editable_cols = ["Name", "Position", "TeamAbbrev", "Salary", "AvgPointsPerGame", "Projection"]
+has_injury_status = (
+    "Injury" in pool.columns and pool["Injury"].astype(str).str.strip().ne("").any()
+)
 display_extra = [
     c
-    for c in ["ID", "Name + ID", "Roster Position", "RosterSlot", "Game Info", "Ownership"]
-    if c in pool.columns
+    for c in ["ID", "Name + ID", "Roster Position", "RosterSlot", "Game Info", "Ownership", "Injury"]
+    if c in pool.columns and (c != "Injury" or has_injury_status)
 ]
 edited = st.data_editor(
     pool[editable_cols + display_extra],
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
     height=320,
     disabled=[c for c in pool.columns if c != "Projection"],
@@ -744,8 +898,13 @@ working_pool["Projection"] = pd.to_numeric(edited["Projection"], errors="coerce"
 if generate:
     progress = st.progress(0, text="Building optimizer…")
     try:
+        solve_lines = frame_to_lines(edited_vegas)
+        solve_teams = set(working_pool["TeamAbbrev"].astype(str).str.strip().str.upper())
+        solve_low_total = is_showdown and low_scoring_showdown(solve_lines, solve_teams)
+        solve_pool = apply_vegas_projections(working_pool, solve_lines)
         optimizer = get_nfl_optimizer(contest_format)
-        optimizer.load_from_dataframe(working_pool)
+        optimizer.set_exclude_inactive(exclude_inactive)
+        optimizer.load_from_dataframe(solve_pool)
         apply_preset(
             optimizer,
             preset,
@@ -753,6 +912,9 @@ if generate:
             jitter_seed=int(jitter_seed),
         )
         _apply_strategy_overrides(optimizer, strategy_overrides)
+        if solve_low_total:
+            optimizer.allow_kicker_captain = True
+            optimizer.kicker_max_exposure = KICKER_CAPTAIN_MAX_EXPOSURE
         optimizer.set_exposure_limits(
             min_exposure_pct=float(min_exposure_pct) if use_min_exposure else None,
             max_exposure_pct=float(max_exposure_pct) if use_max_exposure else None,
