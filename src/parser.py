@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from io import StringIO
 from pathlib import Path
 from typing import BinaryIO, Optional, TextIO, Union
@@ -35,7 +36,36 @@ _COLUMN_ALIASES = {
     "Projected Ownership": "Ownership",
     "Own%": "Ownership",
     "Own": "Ownership",
+    "Injury Indicator": "Injury",
+    "Injury Status": "Injury",
+    "Inj": "Injury",
+    # Official DKSalaries.csv uses this header for O/Q/D/IR/OUT.
+    "Status": "Injury",
+    "status": "Injury",
 }
+
+# Statuses that mean the player will not take the field. Questionable and
+# probable stay in the pool because those players usually play.
+_WILL_NOT_PLAY = frozenset({"OUT", "DOUBTFUL", "IR", "PUP", "SUS", "NA"})
+_STATUS_CANON = {
+    "O": "OUT",
+    "OUT": "OUT",
+    "D": "DOUBTFUL",
+    "DOUBTFUL": "DOUBTFUL",
+    "IR": "IR",
+    "IR-R": "IR",
+    "IRR": "IR",
+    "PUP": "PUP",
+    "SUS": "SUS",
+    "SUSPENDED": "SUS",
+    "NA": "NA",
+    "NWT": "NA",
+    "Q": "QUESTIONABLE",
+    "QUESTIONABLE": "QUESTIONABLE",
+    "P": "PROBABLE",
+    "PROBABLE": "PROBABLE",
+}
+_NAME_STATUS_RE = re.compile(r"^(?P<name>.*?)\s*\((?P<tag>[A-Za-z][A-Za-z0-9-]*)\)\s*$")
 
 CLASSIC_POSITIONS = {"QB", "RB", "WR", "TE", "DST", "DEF", "K"}
 SHOWDOWN_SLOTS = {"CPT", "FLEX"}
@@ -45,6 +75,49 @@ _IO = Union[str, Path, BinaryIO, TextIO]
 
 class DKCSVValidationError(ValueError):
     """Raised when a DraftKings CSV is missing required structure or values."""
+
+
+def canon_injury_status(raw: object) -> str:
+    """Normalize a DK injury tag. Empty string means no status."""
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return ""
+    text = str(raw).strip().upper()
+    if not text or text in {"NAN", "NONE", "-"}:
+        return ""
+    return _STATUS_CANON.get(text, "")
+
+
+def injury_status_for_player(name: object, explicit: object = None) -> str:
+    """
+    Injury status from a DK column, or a trailing tag on the player name.
+
+    ``Name + ID`` values such as ``Patrick Mahomes (1001)`` are not statuses.
+    """
+    status = canon_injury_status(explicit)
+    if status:
+        return status
+    match = _NAME_STATUS_RE.match(str(name or "").strip())
+    if not match:
+        return ""
+    return canon_injury_status(match.group("tag"))
+
+
+def is_inactive_injury(status: object) -> bool:
+    """True when the player is OUT, IR, Doubtful, PUP, suspended, or inactive."""
+    canon = status if status in _WILL_NOT_PLAY else canon_injury_status(status)
+    return canon in _WILL_NOT_PLAY
+
+
+def drop_inactive_players(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove every row for players who will not play, including CPT and FLEX."""
+    if df.empty or "Injury" not in df.columns or "ID" not in df.columns:
+        return df
+    inactive = df["Injury"].map(is_inactive_injury)
+    if not bool(inactive.any()):
+        return df
+    inactive_ids = set(df.loc[inactive, "ID"].astype(str))
+    kept = df.loc[~df["ID"].astype(str).isin(inactive_ids)].copy()
+    return kept.reset_index(drop=True)
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -220,6 +293,12 @@ def parse_dk_csv(
     if "Ownership" in df.columns:
         df["Ownership"] = df["Ownership"]
 
+    explicit = df["Injury"] if "Injury" in df.columns else pd.Series([""] * len(df), index=df.index)
+    df["Injury"] = [
+        injury_status_for_player(name, status)
+        for name, status in zip(df["Name"], explicit)
+    ]
+
     ordered = [
         "ID",
         "Name + ID",
@@ -231,6 +310,7 @@ def parse_dk_csv(
         "Game Info",
         "AvgPointsPerGame",
         "Projection",
+        "Injury",
     ]
     if fmt is ContestFormat.SHOWDOWN:
         ordered = [
@@ -246,6 +326,7 @@ def parse_dk_csv(
             "Game Info",
             "AvgPointsPerGame",
             "Projection",
+            "Injury",
         ]
     if "Ownership" in df.columns and "Ownership" not in ordered:
         ordered.append("Ownership")

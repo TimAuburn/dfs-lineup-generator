@@ -20,11 +20,19 @@ from src.optimizer import (
     NFLClassicOptimizer,
     NFLShowdownOptimizer,
     apply_projection_jitter,
+    classic_gpp_rule_check,
     get_nfl_optimizer,
     optimize_tiered_salaries,
+    overlap_cap_for_slate,
     tiered_lineup_counts,
 )
-from src.parser import DKCSVValidationError, detect_contest_format, parse_dk_csv
+from src.parser import (
+    DKCSVValidationError,
+    detect_contest_format,
+    injury_status_for_player,
+    is_inactive_injury,
+    parse_dk_csv,
+)
 from src.presets import ContestFormat, ContestPreset, apply_preset, get_preset_config
 
 MOCK_CSV = Path(__file__).parent / "mock_dk_salaries.csv"
@@ -91,12 +99,20 @@ def test_classic_cash_preset_deterministic_single_lineup():
     assert optimizer.lineup_count == 1
     assert optimizer.enable_qb_stack is False
     assert optimizer.jitter_pct == (0.0, 0.0)
+    assert optimizer.flex_positions == ("RB", "WR")
+    assert optimizer.min_skill_salary == 3_800
 
     a = optimizer.generate_lineups()
     b = optimizer.generate_lineups()
     assert len(a) == 1 and len(b) == 1
     assert a[0]["ID"].tolist() == b[0]["ID"].tolist()
     assert a[0]["Slot"].tolist() == CLASSIC_SLOTS
+    lineup = a[0]
+    flex_pos = str(lineup.loc[lineup["Slot"] == "FLEX", "Position"].iloc[0])
+    assert flex_pos in {"RB", "WR"}
+    skill = lineup[lineup["Position"].isin(["RB", "WR", "TE"])]
+    assert int(skill["Salary"].min()) >= 3_800
+    assert int((lineup["Position"] == "TE").sum()) == 1
 
 
 def test_classic_small_gpp_preset_rules():
@@ -130,6 +146,10 @@ def test_classic_large_gpp_preset_clamps_lineups_and_sets_ownership_cap():
     assert optimizer.lineup_count == 20  # clamped up to preset minimum
     assert optimizer.stack_pass_catchers == 2
     assert optimizer.enable_bring_back is True
+    assert optimizer.bring_back_position == "SKILL"
+    assert optimizer.require_wr_in_stack is True
+    assert optimizer.flex_positions == ("RB", "WR")
+    assert optimizer.slate_aware_gpp is True
     assert optimizer.max_repeating_players == 5
     assert optimizer.max_cumulative_ownership == 1.25
     assert optimizer.position_jitter_sds is not None
@@ -139,6 +159,308 @@ def test_classic_large_gpp_preset_clamps_lineups_and_sets_ownership_cap():
     optimizer.set_lineup_count(2)
     lineups = optimizer.generate_lineups()
     assert len(lineups) == 2
+    if optimizer.last_game_count <= 4:
+        assert optimizer.last_stack_exposure == 0.30
+    else:
+        assert optimizer.last_stack_exposure == 0.40
+    if optimizer.last_game_count < 10:
+        assert optimizer.last_overlap_cap == 4
+    else:
+        assert optimizer.last_overlap_cap == 5
+    for lineup in lineups:
+        qb = lineup.loc[lineup["Slot"] == "QB"].iloc[0]
+        catchers = lineup[
+            (lineup["Team"] == qb["Team"]) & lineup["Position"].isin(["WR", "TE"])
+        ]
+        assert len(catchers) >= 2
+        assert (catchers["Position"] == "WR").any()
+        bring = lineup[
+            (lineup["Team"] == qb["Opponent"])
+            & lineup["Position"].isin(["WR", "TE", "RB"])
+        ]
+        assert len(bring) >= 1
+        flex_pos = str(lineup.loc[lineup["Slot"] == "FLEX", "Position"].iloc[0])
+        assert flex_pos in {"RB", "WR"}
+        assert int((lineup["Position"] == "TE").sum()) == 1
+
+
+def _classic_player(pos, name, pid, team, salary, fppg, game) -> dict:
+    return {
+        "Position": pos,
+        "Name + ID": f"{name} ({pid})",
+        "Name": name,
+        "ID": str(pid),
+        "Roster Position": pos,
+        "Salary": salary,
+        "Game Info": game,
+        "TeamAbbrev": team,
+        "Team": team,
+        "AvgPointsPerGame": fppg,
+        "Projection": fppg,
+    }
+
+
+def _roster_frame(rows: list[dict]) -> pd.DataFrame:
+    frame = pd.DataFrame(rows)
+    frame.attrs["salary"] = int(frame["Salary"].sum())
+    return frame
+
+
+def test_large_gpp_rule_check_flags_thin_stacks_and_missing_bring_back():
+    game = "KC@BUF 09/10/2025 08:20PM ET"
+    one_catcher = _roster_frame(
+        [
+            _classic_player("QB", "Patrick Mahomes", 1, "KC", 8000, 25, game),
+            _classic_player("WR", "Xavier Worthy", 2, "KC", 5000, 12, game),
+            _classic_player("RB", "James Cook", 3, "BUF", 6000, 14, game),
+        ]
+    )
+    two_tight_ends = _roster_frame(
+        [
+            _classic_player("QB", "Patrick Mahomes", 1, "KC", 8000, 25, game),
+            _classic_player("TE", "Travis Kelce", 2, "KC", 5000, 14, game),
+            _classic_player("TE", "Noah Gray", 3, "KC", 3000, 6, game),
+            _classic_player("WR", "Khalil Shakir", 4, "BUF", 4000, 10, game),
+        ]
+    )
+    no_bring_back = _roster_frame(
+        [
+            _classic_player("QB", "Patrick Mahomes", 1, "KC", 8000, 25, game),
+            _classic_player("WR", "Xavier Worthy", 2, "KC", 5000, 12, game),
+            _classic_player("TE", "Travis Kelce", 3, "KC", 4500, 11, game),
+            _classic_player("DST", "Bills", 4, "BUF", 3000, 6, game),
+        ]
+    )
+    good = _roster_frame(
+        [
+            _classic_player("QB", "Patrick Mahomes", 1, "KC", 8000, 25, game),
+            _classic_player("WR", "Xavier Worthy", 2, "KC", 5000, 12, game),
+            _classic_player("TE", "Travis Kelce", 3, "KC", 4500, 11, game),
+            _classic_player("WR", "Khalil Shakir", 4, "BUF", 4000, 10, game),
+        ]
+    )
+    for frame in (one_catcher, two_tight_ends, no_bring_back, good):
+        qb = frame.loc[frame["Position"] == "QB"].iloc[0]
+        frame["Slot"] = "FLEX"
+        frame.loc[frame["ID"] == qb["ID"], "Slot"] = "QB"
+        frame["Opponent"] = frame["Team"].map({"KC": "BUF", "BUF": "KC"})
+
+    thin = classic_gpp_rule_check([one_catcher]).iloc[0]
+    assert "Stack needs 2 pass-catchers" in thin["Result"]
+    tight = classic_gpp_rule_check([two_tight_ends]).iloc[0]
+    assert "Stack needs a WR" in tight["Result"]
+    naked = classic_gpp_rule_check([no_bring_back]).iloc[0]
+    assert "No bring-back" in naked["Result"]
+    passed = classic_gpp_rule_check(
+        [good], overlap_cap=4, salary_min=15_000, salary_max=50_000
+    ).iloc[0]
+    assert passed["Result"] == "Pass"
+    assert passed["Bring-back"] == "Khalil Shakir"
+    assert overlap_cap_for_slate(5, 8, True) == 4
+    assert overlap_cap_for_slate(5, 12, True) == 5
+
+
+def test_double_stack_rejects_qb_with_only_tight_ends():
+    game = "KC@BUF 09/10/2025 08:20PM ET"
+    rows = [
+        _classic_player("QB", "Patrick Mahomes", 1, "KC", 9000, 40, game),
+        _classic_player("TE", "Travis Kelce", 2, "KC", 5000, 16, game),
+        _classic_player("TE", "Noah Gray", 3, "KC", 3000, 8, game),
+        _classic_player("RB", "Isiah Pacheco", 4, "KC", 6000, 12, game),
+        _classic_player("DST", "Chiefs", 5, "KC", 3000, 6, game),
+        _classic_player("QB", "Josh Allen", 6, "BUF", 8000, 18, game),
+        _classic_player("WR", "Khalil Shakir", 7, "BUF", 4500, 11, game),
+        _classic_player("WR", "Keon Coleman", 8, "BUF", 4000, 9, game),
+        _classic_player("WR", "Curtis Samuel", 9, "BUF", 3500, 7, game),
+        _classic_player("TE", "Dalton Kincaid", 10, "BUF", 4200, 8, game),
+        _classic_player("RB", "James Cook", 11, "BUF", 5500, 12, game),
+        _classic_player("DST", "Bills", 12, "BUF", 2800, 5, game),
+    ]
+    optimizer = NFLClassicOptimizer()
+    optimizer.jitter_pct = (0.0, 0.0)
+    optimizer.load_from_dataframe(pd.DataFrame(rows))
+    optimizer.set_qb_stack(True, pass_catchers=2, bring_back=True, bring_back_position="SKILL")
+    optimizer.require_wr_in_stack = True
+    optimizer.set_min_salary_cap(30_000)
+    optimizer.set_lineup_count(1)
+    lineup = optimizer.generate_lineups()[0]
+    qb = lineup.loc[lineup["Slot"] == "QB"].iloc[0]
+    assert qb["Name"] == "Josh Allen"
+    catchers = lineup[(lineup["Team"] == "BUF") & lineup["Position"].isin(["WR", "TE"])]
+    assert len(catchers) >= 2
+    assert (catchers["Position"] == "WR").any()
+    assert (lineup["Team"] == "KC").any()
+
+
+def test_flex_wr_or_rb_blocks_a_second_tight_end():
+    game_one = "BUF@KC 09/10/2025 08:20PM ET"
+    game_two = "PHI@DAL 09/11/2025 01:00PM ET"
+    # One spare WR is worse than the second tight end, so an open flex takes the tight end.
+    rows = [
+        _classic_player("QB", "Josh Allen", 1, "BUF", 7000, 18, game_one),
+        _classic_player("RB", "James Cook", 2, "BUF", 5500, 12, game_one),
+        _classic_player("RB", "Ray Davis", 3, "BUF", 4000, 8, game_one),
+        _classic_player("WR", "Khalil Shakir", 4, "BUF", 4500, 10, game_one),
+        _classic_player("WR", "Keon Coleman", 5, "BUF", 4000, 8, game_one),
+        _classic_player("WR", "Curtis Samuel", 6, "BUF", 3000, 6, game_one),
+        _classic_player("TE", "Dalton Kincaid", 7, "BUF", 4200, 7, game_one),
+        _classic_player("DST", "Bills", 8, "BUF", 2800, 5, game_one),
+        _classic_player("TE", "Dawson Knox", 9, "PHI", 2500, 40, game_two),
+        _classic_player("WR", "Britain Covey", 10, "PHI", 3000, 1, game_two),
+        _classic_player("DST", "Eagles", 11, "PHI", 3000, 4, game_two),
+    ]
+    frame = pd.DataFrame(rows)
+    open_flex = NFLClassicOptimizer()
+    open_flex.jitter_pct = (0.0, 0.0)
+    open_flex.load_from_dataframe(frame)
+    open_flex.set_lineup_count(1)
+    unrestricted = open_flex.generate_lineups()[0]
+    assert "Dawson Knox" in set(unrestricted["Name"])
+    assert int((unrestricted["Position"] == "TE").sum()) == 2
+
+    limited = NFLClassicOptimizer()
+    limited.jitter_pct = (0.0, 0.0)
+    limited.flex_positions = ("RB", "WR")
+    limited.load_from_dataframe(frame)
+    limited.set_lineup_count(1)
+    lineup = limited.generate_lineups()[0]
+    flex_pos = str(lineup.loc[lineup["Slot"] == "FLEX", "Position"].iloc[0])
+    assert flex_pos in {"RB", "WR"}
+    assert int((lineup["Position"] == "TE").sum()) == 1
+    checked = classic_gpp_rule_check([unrestricted], flex_positions=("RB", "WR")).iloc[0]
+    assert "Flex is TE" in checked["Result"]
+
+
+def test_cash_skill_floor_drops_punts_unless_locked():
+    game_one = "BUF@KC 09/10/2025 08:20PM ET"
+    game_two = "PHI@DAL 09/11/2025 01:00PM ET"
+    rows = [
+        _classic_player("QB", "Josh Allen", 1, "BUF", 7000, 18, game_one),
+        _classic_player("RB", "James Cook", 2, "BUF", 5500, 12, game_one),
+        _classic_player("RB", "Ray Davis", 3, "BUF", 4000, 8, game_one),
+        _classic_player("WR", "Khalil Shakir", 4, "BUF", 4500, 10, game_one),
+        _classic_player("WR", "Keon Coleman", 5, "BUF", 4000, 8, game_one),
+        _classic_player("WR", "Curtis Samuel", 6, "BUF", 3900, 6, game_one),
+        _classic_player("WR", "Punt Receiver", 7, "BUF", 3000, 40, game_one),
+        _classic_player("TE", "Dalton Kincaid", 8, "BUF", 4200, 7, game_one),
+        _classic_player("DST", "Bills", 9, "BUF", 2800, 5, game_one),
+        _classic_player("QB", "Jalen Hurts", 10, "PHI", 7000, 16, game_two),
+        _classic_player("RB", "Saquon Barkley", 11, "PHI", 6000, 12, game_two),
+        _classic_player("WR", "A.J. Brown", 12, "PHI", 6400, 13, game_two),
+        _classic_player("DST", "Eagles", 13, "PHI", 3000, 4, game_two),
+    ]
+    frame = pd.DataFrame(rows)
+
+    def _solve(locked=None):
+        optimizer = NFLClassicOptimizer()
+        optimizer.jitter_pct = (0.0, 0.0)
+        optimizer.min_skill_salary = 3_800
+        optimizer.flex_positions = ("RB", "WR")
+        optimizer.load_from_dataframe(frame)
+        optimizer.set_locked_players(locked)
+        optimizer.set_lineup_count(1)
+        return optimizer.generate_lineups()[0]
+
+    blocked = _solve()
+    assert "Punt Receiver" not in set(blocked["Name"])
+    skill = blocked[blocked["Position"].isin(["RB", "WR", "TE"])]
+    assert int(skill["Salary"].min()) >= 3_800
+
+    forced = _solve(["7"])
+    assert "Punt Receiver" in set(forced["Name"])
+
+
+def test_showdown_cash_captain_and_flex_floors():
+    rows = []
+    specs = [
+        ("QB", "Patrick Mahomes", 1, "KC", 10000, 18),
+        ("RB", "Isiah Pacheco", 2, "KC", 8000, 12),
+        ("WR", "Xavier Worthy", 3, "KC", 7500, 11),
+        ("TE", "Travis Kelce", 4, "KC", 9000, 40),
+        ("RB", "Cheap Back", 5, "KC", 1500, 30),
+        ("DST", "Chiefs", 6, "KC", 4000, 20),
+        ("QB", "Josh Allen", 7, "BUF", 9800, 17),
+        ("RB", "James Cook", 8, "BUF", 8200, 12),
+        ("WR", "Khalil Shakir", 9, "BUF", 7000, 10),
+        ("TE", "Dalton Kincaid", 10, "BUF", 6000, 8),
+        ("K", "Tyler Bass", 11, "BUF", 4500, 8),
+        ("DST", "Bills", 12, "BUF", 4200, 19),
+    ]
+    for pos, name, pid, team, salary, fppg in specs:
+        rows.extend(_showdown_pair(pos, name, pid * 10, team, salary, fppg))
+
+    optimizer = NFLShowdownOptimizer()
+    optimizer.jitter_pct = (0.0, 0.0)
+    optimizer.load_from_dataframe(pd.DataFrame(rows))
+    optimizer.configure_showdown_rules(
+        min_salary_cap=40_000,
+        max_salary_cap=50_000,
+        min_teams=2,
+        game_script_correlation=False,
+        max_kickers=1,
+        max_dst=1,
+        allow_kicker_captain=False,
+        captain_positions=("QB", "RB", "WR"),
+        captain_min_salary=8_000,
+        flex_min_salary=2_000,
+    )
+    optimizer.set_lineup_count(1)
+    lineup = optimizer.generate_lineups()[0]
+    cpt = lineup.loc[lineup["Slot"] == "CPT"].iloc[0]
+    assert cpt["Position"] in {"QB", "RB", "WR"}
+    assert cpt["Name"] != "Travis Kelce"
+    assert int(cpt["Salary"]) >= 12_000
+    assert "Cheap Back" not in set(lineup["Name"])
+    assert int((lineup["Position"] == "DST").sum()) <= 1
+    assert int((lineup["Position"] == "K").sum()) <= 1
+
+
+def test_showdown_drops_scrubs_unless_flex_punt_is_locked():
+    rows = []
+    rows += _showdown_pair("WR", "Amon-Ra St. Brown", 100, "DET", 11000, 22)
+    rows += _showdown_pair("RB", "Jahmyr Gibbs", 110, "DET", 12000, 18)
+    rows += _showdown_pair("WR", "Bench Punt", 120, "DET", 200, 14)
+    rows += _showdown_pair("WR", "Other Punt", 130, "DET", 200, 13)
+    rows += _showdown_pair("WR", "Zero Projection", 140, "DET", 5000, 0.5)
+    rows += _showdown_pair("WR", "Jameson Williams", 150, "DET", 5500, 10)
+    rows += _showdown_pair("TE", "Sam LaPorta", 160, "DET", 4800, 9)
+    rows += _showdown_pair("K", "Jake Bates", 170, "DET", 4000, 8)
+    rows += _showdown_pair("QB", "Jared Goff", 180, "DET", 7000, 16)
+    rows += _showdown_pair("QB", "Jordan Love", 200, "GB", 8000, 15)
+    rows += _showdown_pair("WR", "Romeo Doubs", 210, "GB", 5200, 9)
+    rows += _showdown_pair("TE", "Tucker Kraft", 220, "GB", 4500, 8)
+    rows += _showdown_pair("RB", "Josh Jacobs", 230, "GB", 7000, 12)
+
+    frame = pd.DataFrame(rows)
+
+    def _solve(locked=None):
+        optimizer = NFLShowdownOptimizer()
+        optimizer.jitter_pct = (0.0, 0.0)
+        optimizer.load_from_dataframe(frame)
+        optimizer.configure_showdown_rules(
+            min_salary_cap=20_000,
+            max_salary_cap=50_000,
+            min_teams=2,
+            game_script_correlation=False,
+            max_kickers=1,
+            allow_kicker_captain=False,
+            flex_min_salary=None,
+        )
+        optimizer.set_locked_players(locked)
+        optimizer.set_lineup_count(1)
+        return optimizer.generate_lineups()[0]
+
+    lineup = _solve()
+    names = set(lineup["Name"])
+    assert "Bench Punt" not in names
+    assert "Other Punt" not in names
+    assert "Zero Projection" not in names
+    flex = lineup.loc[lineup["Slot"] == "FLEX"]
+    assert int(flex["Salary"].min()) >= 1_200
+
+    forced = _solve(["120"])
+    assert "Bench Punt" in set(forced["Name"])
+    assert "Zero Projection" not in set(forced["Name"])
 
 
 def test_projection_jitter_seed_reproducible():
@@ -170,7 +492,13 @@ def test_showdown_pipeline_roster_salary_and_export():
     optimizer.load_from_csv(MOCK_SHOWDOWN_CSV)
     apply_preset(optimizer, ContestPreset.SHOWDOWN_CASH, lineup_count=2, jitter_seed=42)
     # Cash preset allows up to 5; keep 2 for speed.
-    assert optimizer.min_salary_cap == 48_000
+    assert optimizer.min_salary_cap == 49_500
+    assert optimizer.max_salary_cap == 50_000
+    assert optimizer.captain_min_salary == 8_000
+    assert optimizer.flex_min_salary == 2_000
+    assert optimizer.max_kickers == 1
+    assert optimizer.max_dst == 1
+    assert optimizer.allow_kicker_captain is False
     assert optimizer.min_teams == 2
 
     lineups = optimizer.generate_lineups()
@@ -179,7 +507,14 @@ def test_showdown_pipeline_roster_salary_and_export():
         assert lineup["Slot"].tolist() == SHOWDOWN_SLOTS
         assert len(lineup) == 6
         salary = int(lineup.attrs.get("salary", lineup["Salary"].sum()))
-        assert 48_000 <= salary <= DK_SALARY_CAP
+        assert 49_500 <= salary <= DK_SALARY_CAP
+        cpt = lineup.loc[lineup["Slot"] == "CPT"].iloc[0]
+        assert cpt["Position"] in {"QB", "RB", "WR"}
+        assert int(cpt["Salary"]) >= 12_000
+        flex = lineup.loc[lineup["Slot"] == "FLEX"]
+        assert int(flex["Salary"].min()) >= 2_000
+        assert int((lineup["Position"] == "K").sum()) <= 1
+        assert int((lineup["Position"] == "DST").sum()) <= 1
         teams = set(lineup["Team"])
         assert len(teams) >= 2
         # Same player cannot appear as both CPT and FLEX.
@@ -202,6 +537,10 @@ def test_showdown_gpp_preset_with_game_script():
     assert optimizer.max_salary_cap == 49_800
     assert optimizer.game_script_correlation is True
     assert optimizer.max_k_dst_combined == 2
+    assert optimizer.cpt_qb_pass_catchers == 2
+    assert optimizer.max_repeating_players == 3
+    assert optimizer.max_kickers == 1
+    assert optimizer.allow_kicker_captain is False
 
     lineups = optimizer.generate_lineups()
     assert len(lineups) == 3
@@ -210,17 +549,286 @@ def test_showdown_gpp_preset_with_game_script():
         assert 48_000 <= salary <= 49_800
         k_dst = lineup["Position"].isin(["K", "DST", "DEF"]).sum()
         assert k_dst <= 2
+        assert int((lineup["Position"] == "K").sum()) <= 1
 
         cpt = lineup.loc[lineup["Slot"] == "CPT"].iloc[0]
         flex = lineup.loc[lineup["Slot"] == "FLEX"]
+        assert cpt["Position"] in {"QB", "RB", "WR", "TE"}
         if cpt["Position"] == "QB":
             same_team_catchers = flex[
                 (flex["Team"] == cpt["Team"]) & (flex["Position"].isin(["WR", "TE"]))
             ]
-            assert len(same_team_catchers) >= 1
+            assert len(same_team_catchers) >= 2
+            bring_backs = flex[
+                (flex["Team"] != cpt["Team"]) & (flex["Position"].isin(["WR", "TE", "RB"]))
+            ]
+            assert len(bring_backs) >= 1
         elif cpt["Position"] in {"WR", "TE"}:
             same_team_qb = flex[(flex["Team"] == cpt["Team"]) & (flex["Position"] == "QB")]
             assert len(same_team_qb) >= 1
+        dst_teams = set(lineup.loc[lineup["Position"].isin(["DST", "DEF"]), "Team"])
+        for dst_team in dst_teams:
+            opponents = lineup[
+                (lineup["Team"] != dst_team) & (lineup["Position"].isin(["QB", "K"]))
+            ]
+            assert opponents.empty
+
+
+def _showdown_row(pos, name, pid, slot, team, salary, fppg) -> dict:
+    return {
+        "Position": pos,
+        "Name + ID": f"{name} ({pid})",
+        "Name": name,
+        "ID": str(pid),
+        "Roster Position": slot,
+        "Salary": salary,
+        "Game Info": "GB@CHI 09/10/2025 08:20PM ET",
+        "TeamAbbrev": team,
+        "AvgPointsPerGame": fppg,
+        "Projection": fppg,
+    }
+
+
+def _showdown_pair(pos, name, flex_id, team, flex_salary, fppg) -> list:
+    """CPT and FLEX rows for one player. CPT salary is 1.5x the FLEX salary."""
+    return [
+        _showdown_row(pos, name, flex_id + 1, "CPT", team, int(flex_salary * 1.5), fppg),
+        _showdown_row(pos, name, flex_id, "FLEX", team, flex_salary, fppg),
+    ]
+
+
+def test_cpt_qb_pass_catcher_group_excludes_k_and_dst():
+    """The quota is same-team WR and TE. RB, K, and DST do not count."""
+    rows = []
+    rows += _showdown_pair("QB", "Jordan Love", 100, "GB", 8000, 30)
+    rows += _showdown_pair("WR", "Romeo Doubs", 110, "GB", 6000, 12)
+    rows += _showdown_pair("TE", "Tucker Kraft", 120, "GB", 5000, 10)
+    rows += _showdown_pair("RB", "Josh Jacobs", 130, "GB", 7000, 16)
+    rows += _showdown_pair("K", "Brandon McManus", 140, "GB", 4000, 9)
+    rows += _showdown_pair("DST", "Packers", 150, "GB", 3800, 8)
+    rows += _showdown_pair("QB", "Caleb Williams", 200, "CHI", 7600, 18)
+    rows += _showdown_pair("WR", "DJ Moore", 210, "CHI", 6400, 14)
+    rows += _showdown_pair("TE", "Cole Kmet", 230, "CHI", 4000, 8)
+
+    optimizer = NFLShowdownOptimizer()
+    optimizer.jitter_pct = (0.0, 0.0)
+    optimizer.load_from_dataframe(pd.DataFrame(rows))
+    players = optimizer._players_for_optimize()
+
+    captured = []
+
+    class _Sink:
+        def add_players_group(self, group):
+            captured.append(group)
+
+    optimizer._apply_game_script(_Sink(), players)
+
+    cpt_qb = next(p for p in players if p.full_name == "Jordan Love" and "CPT" in p.positions)
+    qb_groups = [g for g in captured if g.depends_on is cpt_qb]
+    catchers = next(
+        g
+        for g in qb_groups
+        if {NFLShowdownOptimizer._football_pos(p) for p in g.players} <= {"WR", "TE"}
+        and all(p.team == "GB" for p in g.players)
+    )
+    bring_backs = next(
+        g for g in qb_groups if all(p.team != "GB" for p in g.players)
+    )
+    catcher_names = {p.full_name for p in catchers.players}
+    bring_names = {p.full_name for p in bring_backs.players}
+
+    assert catcher_names == {"Romeo Doubs", "Tucker Kraft"}
+    assert "Josh Jacobs" not in catcher_names
+    assert "Brandon McManus" not in catcher_names
+    assert "Packers" not in catcher_names
+    assert all("FLEX" in p.positions for p in catchers.players)
+    assert catchers.min_from_group == 2
+    assert bring_names == {"DJ Moore", "Cole Kmet"}
+    assert bring_backs.min_from_group == 1
+    assert all(
+        NFLShowdownOptimizer._football_pos(p) in {"WR", "TE", "RB"}
+        for p in bring_backs.players
+    )
+
+
+def test_cpt_qb_lineup_cannot_use_kicker_or_dst_as_pass_catcher():
+    """A Captain QB with no same-team WR, TE, or RB cannot be saved by K or DST."""
+    rows = []
+    rows += _showdown_pair("QB", "Jordan Love", 100, "GB", 8000, 40)
+    rows += _showdown_pair("K", "Brandon McManus", 140, "GB", 3000, 22)
+    rows += _showdown_pair("DST", "Packers", 150, "GB", 3000, 20)
+    rows += _showdown_pair("QB", "Caleb Williams", 200, "CHI", 7000, 16)
+    rows += _showdown_pair("WR", "DJ Moore", 210, "CHI", 6000, 15)
+    rows += _showdown_pair("WR", "Rome Odunze", 220, "CHI", 5000, 12)
+    rows += _showdown_pair("TE", "Cole Kmet", 230, "CHI", 4000, 9)
+
+    optimizer = NFLShowdownOptimizer()
+    optimizer.jitter_pct = (0.0, 0.0)
+    optimizer.jitter_seed = 1
+    optimizer.load_from_dataframe(pd.DataFrame(rows))
+    optimizer.configure_showdown_rules(
+        min_salary_cap=30_000,
+        max_salary_cap=50_000,
+        min_teams=2,
+        game_script_correlation=True,
+        cpt_qb_pass_catchers=1,
+        max_k_dst_combined=2,
+    )
+    optimizer.set_lineup_count(1)
+
+    lineup = optimizer.generate_lineups()[0]
+    cpt = lineup.loc[lineup["Slot"] == "CPT"].iloc[0]
+    flex = lineup.loc[lineup["Slot"] == "FLEX"]
+    # Love's only GB teammates are K and DST, so he cannot be Captain.
+    assert cpt["Name"] != "Jordan Love"
+    if cpt["Position"] == "QB":
+        catchers = flex[
+            (flex["Team"] == cpt["Team"]) & (flex["Position"].isin(["WR", "TE"]))
+        ]
+        assert len(catchers) >= 1
+
+
+def test_cpt_qb_must_bring_a_wr_or_te_not_kicker_or_dst():
+    """A same-team kicker or defense does not satisfy the Captain-QB quota."""
+    rows = []
+    rows += _showdown_pair("QB", "Jordan Love", 100, "GB", 8000, 40)
+    rows += _showdown_pair("WR", "Romeo Doubs", 110, "GB", 4500, 4)
+    rows += _showdown_pair("TE", "Tucker Kraft", 120, "GB", 4000, 3)
+    rows += _showdown_pair("K", "Brandon McManus", 140, "GB", 3000, 2)
+    rows += _showdown_pair("DST", "Packers", 150, "GB", 3000, 2)
+    rows += _showdown_pair("RB", "Josh Jacobs", 130, "GB", 5000, 6)
+    rows += _showdown_pair("QB", "Caleb Williams", 200, "CHI", 6000, 10)
+    rows += _showdown_pair("WR", "DJ Moore", 210, "CHI", 5500, 11)
+    rows += _showdown_pair("TE", "Cole Kmet", 230, "CHI", 4000, 8)
+
+    optimizer = NFLShowdownOptimizer()
+    optimizer.jitter_pct = (0.0, 0.0)
+    optimizer.jitter_seed = 1
+    optimizer.load_from_dataframe(pd.DataFrame(rows))
+    optimizer.configure_showdown_rules(
+        min_salary_cap=30_000,
+        max_salary_cap=50_000,
+        min_teams=2,
+        game_script_correlation=True,
+        cpt_qb_pass_catchers=2,
+        max_k_dst_combined=2,
+    )
+    optimizer.set_lineup_count(1)
+
+    lineup = optimizer.generate_lineups()[0]
+    cpt = lineup.loc[lineup["Slot"] == "CPT"].iloc[0]
+    flex = lineup.loc[lineup["Slot"] == "FLEX"]
+    assert cpt["Name"] == "Jordan Love"
+    gb_names = set(flex.loc[flex["Team"] == "GB", "Name"])
+    assert {"Romeo Doubs", "Tucker Kraft"} <= gb_names
+    opp_skill = flex[
+        (flex["Team"] != "GB") & (flex["Position"].isin(["WR", "TE", "RB"]))
+    ]
+    assert len(opp_skill) >= 1
+
+
+def test_defense_excludes_opposing_qb_and_kicker():
+    """A rostered defense cannot share the lineup with the other team's QB or K."""
+    rows = []
+    rows += _showdown_pair("DST", "Packers", 150, "GB", 4000, 80)
+    rows += _showdown_pair("QB", "Caleb Williams", 200, "CHI", 7000, 30)
+    rows += _showdown_pair("K", "Cairo Santos", 240, "CHI", 3000, 20)
+    rows += _showdown_pair("QB", "Jordan Love", 100, "GB", 6000, 12)
+    rows += _showdown_pair("WR", "Romeo Doubs", 110, "GB", 5000, 10)
+    rows += _showdown_pair("RB", "Josh Jacobs", 130, "GB", 5000, 10)
+    rows += _showdown_pair("WR", "DJ Moore", 210, "CHI", 5000, 11)
+    rows += _showdown_pair("TE", "Cole Kmet", 230, "CHI", 4000, 8)
+
+    optimizer = NFLShowdownOptimizer()
+    optimizer.jitter_pct = (0.0, 0.0)
+    optimizer.load_from_dataframe(pd.DataFrame(rows))
+    optimizer.configure_showdown_rules(
+        min_salary_cap=30_000,
+        max_salary_cap=50_000,
+        min_teams=2,
+        game_script_correlation=False,
+        allow_kicker_captain=True,
+        max_k_dst_combined=2,
+    )
+    optimizer.set_lineup_count(1)
+    lineup = optimizer.generate_lineups()[0]
+    names = {str(name).strip() for name in lineup["Name"]}
+    assert "Packers" in names
+    assert "Caleb Williams" not in names
+    assert "Cairo Santos" not in names
+
+
+def test_showdown_lineup_has_at_most_one_kicker():
+    """Opposing kickers cannot share a lineup when the one-kicker cap is on."""
+    rows = []
+    rows += _showdown_pair("K", "Spencer Shrader", 180, "IND", 5000, 40)
+    rows += _showdown_pair("K", "Drew Stevens", 190, "WAS", 4800, 38)
+    rows += _showdown_pair("QB", "Marcus Mariota", 100, "WAS", 7000, 12)
+    rows += _showdown_pair("RB", "Jonathan Taylor", 110, "IND", 8000, 14)
+    rows += _showdown_pair("WR", "Stefon Diggs", 120, "WAS", 6000, 11)
+    rows += _showdown_pair("TE", "Tyler Warren", 130, "IND", 5500, 10)
+    rows += _showdown_pair("WR", "Josh Downs", 140, "IND", 4000, 8)
+
+    def _solve(max_kickers):
+        optimizer = NFLShowdownOptimizer()
+        optimizer.jitter_pct = (0.0, 0.0)
+        optimizer.load_from_dataframe(pd.DataFrame(rows))
+        optimizer.configure_showdown_rules(
+            min_salary_cap=20_000,
+            max_salary_cap=50_000,
+            min_teams=2,
+            game_script_correlation=False,
+            allow_kicker_captain=True,
+            max_k_dst_combined=None,
+            max_kickers=max_kickers,
+        )
+        optimizer.set_lineup_count(1)
+        return optimizer.generate_lineups()[0]
+
+    capped = _solve(1)
+    kickers = set(capped.loc[capped["Position"] == "K", "Name"])
+    assert len(kickers) <= 1
+    assert kickers != {"Spencer Shrader", "Drew Stevens"}
+
+    uncapped = _solve(None)
+    assert set(uncapped.loc[uncapped["Position"] == "K", "Name"]) == {
+        "Spencer Shrader",
+        "Drew Stevens",
+    }
+
+
+def test_kicker_captain_is_off_unless_allowed_and_dst_never_captains():
+    rows = []
+    rows += _showdown_pair("K", "Brandon McManus", 140, "GB", 4000, 40)
+    rows += _showdown_pair("DST", "Packers", 150, "GB", 3600, 55)
+    rows += _showdown_pair("QB", "Jordan Love", 100, "GB", 7000, 12)
+    rows += _showdown_pair("WR", "Romeo Doubs", 110, "GB", 5000, 10)
+    rows += _showdown_pair("RB", "Josh Jacobs", 130, "GB", 5500, 11)
+    rows += _showdown_pair("QB", "Caleb Williams", 200, "CHI", 6800, 11)
+    rows += _showdown_pair("WR", "DJ Moore", 210, "CHI", 5200, 10)
+    rows += _showdown_pair("TE", "Cole Kmet", 230, "CHI", 4200, 8)
+
+    def _captain(allow_kicker: bool) -> str:
+        optimizer = NFLShowdownOptimizer()
+        optimizer.jitter_pct = (0.0, 0.0)
+        optimizer.load_from_dataframe(pd.DataFrame(rows))
+        optimizer.configure_showdown_rules(
+            min_salary_cap=30_000,
+            max_salary_cap=50_000,
+            min_teams=2,
+            game_script_correlation=False,
+            allow_kicker_captain=allow_kicker,
+            max_k_dst_combined=2,
+        )
+        optimizer.set_lineup_count(1)
+        lineup = optimizer.generate_lineups()[0]
+        return str(lineup.loc[lineup["Slot"] == "CPT", "Name"].iloc[0])
+
+    blocked = _captain(False)
+    assert blocked != "Brandon McManus"
+    assert blocked != "Packers"
+    allowed = _captain(True)
+    assert allowed == "Brandon McManus"
 
 
 def test_preset_format_mismatch_raises():
@@ -291,6 +899,78 @@ def test_optimize_tiered_salaries_respects_salary_bands():
         assert int(lineup.attrs["salary_remaining"]) == DK_SALARY_CAP - int(lineup.attrs["salary"])
     assert optimizer.min_salary_cap is None
     assert optimizer.max_salary_cap is None
+
+
+def test_injury_status_ignores_name_plus_id_and_keeps_questionable():
+    assert injury_status_for_player("Patrick Mahomes (1001)") == ""
+    assert injury_status_for_player("Josh Allen (Q)") == "QUESTIONABLE"
+    assert injury_status_for_player("Joe Mixon", "O") == "OUT"
+    assert injury_status_for_player("Tee Higgins (IR)") == "IR"
+    assert is_inactive_injury("OUT")
+    assert is_inactive_injury("DOUBTFUL")
+    assert not is_inactive_injury("QUESTIONABLE")
+    assert not is_inactive_injury("")
+
+
+def test_optimizer_excludes_players_who_will_not_play():
+    df = parse_dk_csv(MOCK_CSV)
+    out_idx = df.index[df["Position"] == "QB"][0]
+    out_name = str(df.at[out_idx, "Name"])
+    df.at[out_idx, "Injury"] = "OUT"
+    df.at[out_idx, "Projection"] = 90.0
+
+    excluded = NFLClassicOptimizer()
+    excluded.set_qb_stack(enabled=False)
+    excluded.set_exclude_inactive(True)
+    excluded.load_from_dataframe(df)
+    assert out_name not in set(excluded._player_df["Name"])
+    lineup = excluded.generate_lineups(1)[0]
+    assert out_name not in set(lineup["Name"])
+
+    included = NFLClassicOptimizer()
+    included.set_exclude_inactive(False)
+    included.load_from_dataframe(df)
+    assert out_name in set(included._player_df["Name"])
+
+
+def test_parse_dk_status_column_marks_ir_and_out():
+    from io import StringIO
+
+    raw = (
+        "Position,Name + ID,Name,ID,Roster Position,Salary,Game Info,"
+        "TeamAbbrev,AvgPointsPerGame,Status\n"
+        "WR,Alec Pierce (44331997),Alec Pierce,44331997,CPT,300,"
+        "IND@WAS 10/04/2026 09:30AM ET,IND,6.1,IR\n"
+        "WR,Alec Pierce (44331942),Alec Pierce,44331942,FLEX,200,"
+        "IND@WAS 10/04/2026 09:30AM ET,IND,6.1,IR\n"
+        "RB,Jonathan Taylor (44331958),Jonathan Taylor,44331958,CPT,17400,"
+        "IND@WAS 10/04/2026 09:30AM ET,IND,21.5,\n"
+        "WR,Questionable Guy (44331999),Questionable Guy,44331999,FLEX,5000,"
+        "IND@WAS 10/04/2026 09:30AM ET,IND,10,Q\n"
+    )
+    df = parse_dk_csv(StringIO(raw), contest_format="showdown")
+    statuses = dict(zip(df["Name"], df["Injury"]))
+    assert statuses["Alec Pierce"] == "IR"
+    assert statuses["Jonathan Taylor"] == ""
+    assert statuses["Questionable Guy"] == "QUESTIONABLE"
+    assert int(df["Injury"].map(is_inactive_injury).sum()) == 2
+
+
+def test_parse_injury_indicator_column():
+    from io import StringIO
+
+    raw = (
+        "Position,Name + ID,Name,ID,Roster Position,Salary,Game Info,"
+        "TeamAbbrev,AvgPointsPerGame,Injury Indicator\n"
+        "QB,Patrick Mahomes (1001),Patrick Mahomes,1001,QB,7200,"
+        "KC@BUF 09/10/2025 08:20PM ET,KC,22.5,O\n"
+        "RB,Josh Allen (1002),Josh Allen (Q),1002,RB,7400,"
+        "KC@BUF 09/10/2025 08:20PM ET,BUF,23.0,\n"
+    )
+    df = parse_dk_csv(StringIO(raw))
+    statuses = dict(zip(df["ID"], df["Injury"]))
+    assert statuses["1001"] == "OUT"
+    assert statuses["1002"] == "QUESTIONABLE"
 
 
 def test_get_preset_config_labels():
