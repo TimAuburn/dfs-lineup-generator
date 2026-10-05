@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from pydfs_lineup_optimizer import Player, Site, Sport, get_optimizer
 from pydfs_lineup_optimizer.player import GameInfo
+from pydfs_lineup_optimizer.settings import LineupPosition
 from pydfs_lineup_optimizer.stacks import PlayersGroup, PositionsStack
 
 from .parser import drop_inactive_players, is_inactive_injury, parse_dk_csv
@@ -27,6 +28,15 @@ DEFAULT_JITTER_SEED = 42
 
 SKILL_POSITIONS = ("RB", "WR", "TE")
 PASS_CATCHERS = ("WR", "TE")
+BRING_BACK_POSITIONS = frozenset({"WR", "TE", "SKILL"})
+# DraftKings FLEX accepts RB, WR, or TE. Large-field defaults drop TE.
+FLEX_POSITIONS = frozenset({"RB", "WR", "TE"})
+# Large-field GPP: short slates cannot share as many players as a main slate.
+SMALL_SLATE_GAME_LIMIT = 10
+SMALL_SLATE_REPEATING_CAP = 4
+SHORT_SLATE_GAME_LIMIT = 4
+SHORT_SLATE_STACK_EXPOSURE = 0.30
+DEFAULT_STACK_EXPOSURE = 0.40
 # Captain-QB FLEX quota is WR and TE only. RB, K, and DST do not count.
 CPT_QB_PASS_CATCHER_POSITIONS = frozenset({"WR", "TE"})
 _NOT_CPT_QB_PASS_CATCHERS = frozenset({"K", "DST", "DEF", "RB", "QB"})
@@ -34,6 +44,17 @@ _NOT_CPT_QB_PASS_CATCHERS = frozenset({"K", "DST", "DEF", "RB", "QB"})
 QB_BRING_BACK_POSITIONS = frozenset({"WR", "TE", "RB"})
 # Captain is a skill spot unless a low-total slate explicitly allows a kicker.
 CAPTAIN_POSITIONS = frozenset({"QB", "RB", "WR", "TE"})
+# Cash classic: no sub-$3,800 WR/RB/TE unless the user locks that player in.
+CASH_SKILL_MIN_SALARY = 3_800
+CASH_SKILL_POSITIONS = frozenset({"RB", "WR", "TE"})
+# Showdown cash spends the cap and captains a high-salary QB, RB, or WR.
+SHOWDOWN_CASH_MIN_SALARY = 49_500
+SHOWDOWN_CASH_CAPTAIN_POSITIONS = frozenset({"QB", "RB", "WR"})
+SHOWDOWN_CASH_CAPTAIN_MIN_SALARY = 8_000
+SHOWDOWN_CASH_FLEX_MIN_SALARY = 2_000
+# Every Showdown lineup: no near-zero projections, and no sub-$1,200 FLEX punt.
+SHOWDOWN_MIN_PROJECTION = 1.0
+SHOWDOWN_FLEX_MIN_SALARY = 1_200
 
 
 def _parse_game_info(
@@ -71,6 +92,69 @@ def _split_name(full_name: str) -> tuple[str, str]:
     if len(parts) == 1:
         return parts[0], ""
     return parts[0], parts[1]
+
+
+def _position_tokens(value: object) -> set[str]:
+    """Football positions from a slot label such as ``WR`` or ``RB/FLEX``."""
+    tokens = set()
+    for part in str(value).split("/"):
+        token = part.strip().upper()
+        if token and token not in {"FLEX", "CPT", "UTIL"}:
+            tokens.add(token)
+    return tokens
+
+
+def _player_positions(player: Player) -> set[str]:
+    tokens: set[str] = set()
+    for pos in player.positions:
+        tokens.update(_position_tokens(pos))
+    return tokens
+
+
+def _opponent_team(player: Player) -> Optional[str]:
+    """The other team in this player's game, when Game Info parsed."""
+    info = getattr(player, "game_info", None)
+    if info is None or not info.home_team or not info.away_team:
+        return None
+    if player.team == info.home_team:
+        return str(info.away_team)
+    if player.team == info.away_team:
+        return str(info.home_team)
+    return None
+
+
+def count_slate_games(players: Sequence[Player]) -> int:
+    """Unique parsed matchups on the slate."""
+    games = set()
+    for player in players:
+        info = getattr(player, "game_info", None)
+        if info is None or not info.home_team or not info.away_team:
+            continue
+        games.add((str(info.home_team), str(info.away_team)))
+    return len(games)
+
+
+def overlap_cap_for_slate(
+    configured: Optional[int],
+    n_games: int,
+    slate_aware: bool,
+) -> Optional[int]:
+    """Cap shared players at 4 on slates with fewer than 10 games."""
+    if configured is None:
+        return None
+    cap = int(configured)
+    if slate_aware and int(n_games) < SMALL_SLATE_GAME_LIMIT:
+        return min(cap, SMALL_SLATE_REPEATING_CAP)
+    return cap
+
+
+def stack_exposure_for_slate(n_games: int, slate_aware: bool) -> Optional[float]:
+    """Limit how often one team's double stack can repeat across the batch."""
+    if not slate_aware:
+        return None
+    if int(n_games) <= SHORT_SLATE_GAME_LIMIT:
+        return SHORT_SLATE_STACK_EXPOSURE
+    return DEFAULT_STACK_EXPOSURE
 
 
 def _ownership_fraction(raw: object) -> Optional[float]:
@@ -252,6 +336,12 @@ class BaseNFLOptimizer:
         self.max_salary_cap: Optional[int] = None
         # Drop OUT / IR / Doubtful players. Questionable players stay eligible.
         self.exclude_inactive: bool = True
+        # Player IDs the user forced into the lineup. Salary floors skip these.
+        self.locked_player_ids: set[str] = set()
+
+    def set_locked_players(self, player_ids: Optional[Sequence[str]]) -> None:
+        """Force these player IDs into the lineup. Empty clears the locks."""
+        self.locked_player_ids = {str(player_id) for player_id in (player_ids or [])}
 
     def load_from_csv(self, path: Union[str, Path]) -> pd.DataFrame:
         df = parse_dk_csv(path, contest_format=ContestFormat(self.contest_format))
@@ -340,6 +430,19 @@ class BaseNFLOptimizer:
         """Keep injured players only when the user has chosen to include them."""
         pydfs_optimizer.player_pool.with_injured = not self.exclude_inactive
 
+    def _apply_locked_players(self, optimizer) -> None:
+        """Force user-locked players in after salary floors have removed punts."""
+        if not self.locked_player_ids:
+            return
+        removed = optimizer.player_pool.removed_players
+        for player_id in self.locked_player_ids:
+            player = optimizer.player_pool.get_player_by_id(player_id)
+            if player is None or player in removed:
+                continue
+            if player in optimizer.player_pool.locked_players:
+                continue
+            optimizer.player_pool.lock_player(player)
+
     def _players_for_optimize(self) -> List[Player]:
         if self._player_df is None or not self._players:
             raise RuntimeError("No players loaded. Call load_from_csv or load_from_dataframe first.")
@@ -398,6 +501,7 @@ class BaseNFLOptimizer:
                     "Team": player.team,
                     "Salary": int(player.salary),
                     "Projection": float(player.fppg),
+                    "Opponent": _opponent_team(player) or "",
                 }
             )
         df = pd.DataFrame(rows)
@@ -438,6 +542,17 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
         self.stack_pass_catchers: int = 1
         self.enable_bring_back: bool = False
         self.bring_back_position: str = "WR"
+        # Double stacks must include a WR. Single stacks stay WR or TE.
+        self.require_wr_in_stack: bool = False
+        # Short slates tighten overlap and team-stack exposure.
+        self.slate_aware_gpp: bool = False
+        self.last_game_count: int = 0
+        self.last_overlap_cap: Optional[int] = None
+        self.last_stack_exposure: Optional[float] = None
+        # None keeps the DraftKings flex (RB, WR, or TE).
+        self.flex_positions: Optional[Tuple[str, ...]] = None
+        # None leaves cheap skill players eligible. Cash sets this to $3,800.
+        self.min_skill_salary: Optional[int] = None
 
     def set_qb_stack(
         self,
@@ -450,35 +565,123 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
         Configure QB + WR/TE primary stacking and optional opposing bring-back.
 
         ``pass_catchers`` is the number of same-team WR/TE stacked with the QB
-        (typically 1 or 2). Bring-back forces a player from the opposing team
-        at ``bring_back_position`` (WR or TE).
+        (typically 1 or 2). Bring-back forces an opposing player from the
+        quarterback's game. ``SKILL`` accepts WR, TE, or RB.
         """
         if pass_catchers < 1:
             raise ValueError("pass_catchers must be at least 1")
-        if bring_back_position not in {"WR", "TE"}:
-            raise ValueError("bring_back_position must be WR or TE")
+        if bring_back_position not in BRING_BACK_POSITIONS:
+            raise ValueError("bring_back_position must be WR, TE, or SKILL")
         self.enable_qb_stack = bool(enabled)
         self.stack_pass_catchers = int(pass_catchers)
         self.enable_bring_back = bool(bring_back)
         self.bring_back_position = bring_back_position
+
+    def _qb_stack_positions(self) -> List[Union[str, tuple]]:
+        """QB + WR + remaining WR/TE when a double stack must include a WR."""
+        if self.require_wr_in_stack and self.stack_pass_catchers >= 2:
+            positions: List[Union[str, tuple]] = ["QB", "WR"]
+            for _ in range(self.stack_pass_catchers - 1):
+                positions.append(("WR", "TE"))
+            return positions
+        positions = ["QB"]
+        for _ in range(self.stack_pass_catchers):
+            positions.append(("WR", "TE"))
+        return positions
+
+    def _apply_bring_back(self, optimizer, players: List[Player]) -> None:
+        """Pair the rostered QB with an opposing skill player from his game."""
+        if self.bring_back_position != "SKILL":
+            optimizer.force_positions_for_opposing_team(("QB", self.bring_back_position))
+            return
+        allowed = set(SKILL_POSITIONS)
+        for qb in players:
+            if "QB" not in _player_positions(qb):
+                continue
+            opponent = _opponent_team(qb)
+            bring_backs = [
+                player
+                for player in players
+                if opponent
+                and player.team == opponent
+                and _player_positions(player) & allowed
+            ]
+            if not bring_backs:
+                optimizer.player_pool.remove_player(qb)
+                continue
+            optimizer.add_players_group(
+                PlayersGroup(
+                    bring_backs,
+                    min_from_group=1,
+                    max_from_group=len(bring_backs),
+                    depends_on=qb,
+                    strict_depend=False,
+                )
+            )
 
     def _build_optimizer(self, players: List[Player]):
         optimizer = get_optimizer(self.site, self.sport)
         self._apply_salary_caps(optimizer)
         self._apply_injury_filter(optimizer)
         optimizer.player_pool.load_players(players)
-        if self.max_repeating_players is not None:
-            optimizer.set_max_repeating_players(self.max_repeating_players)
+        n_games = count_slate_games(players)
+        overlap_cap = overlap_cap_for_slate(
+            self.max_repeating_players, n_games, self.slate_aware_gpp
+        )
+        stack_exposure = stack_exposure_for_slate(n_games, self.slate_aware_gpp)
+        self.last_game_count = n_games
+        self.last_overlap_cap = overlap_cap
+        self.last_stack_exposure = stack_exposure
+        if overlap_cap is not None:
+            optimizer.set_max_repeating_players(overlap_cap)
         if self.enable_qb_stack:
-            stack_positions: List[Union[str, tuple]] = ["QB"]
-            for _ in range(self.stack_pass_catchers):
-                stack_positions.append(("WR", "TE"))
-            optimizer.add_stack(PositionsStack(stack_positions))
+            optimizer.add_stack(
+                PositionsStack(
+                    self._qb_stack_positions(),
+                    max_exposure=stack_exposure,
+                )
+            )
         if self.enable_bring_back:
-            optimizer.force_positions_for_opposing_team(("QB", self.bring_back_position))
+            self._apply_bring_back(optimizer, players)
+        self._apply_flex_positions(optimizer)
+        self._apply_skill_salary_floor(optimizer, players)
+        self._apply_locked_players(optimizer)
         self._apply_exclude_vs_dst(optimizer)
         self._apply_ownership_cap(optimizer)
         return optimizer
+
+    def _apply_skill_salary_floor(self, optimizer, players: List[Player]) -> None:
+        """Drop WR, RB, and TE priced under the cash floor. Locked players stay."""
+        floor = self.min_skill_salary
+        if floor is None:
+            return
+        locked = self.locked_player_ids
+        for player in players:
+            if str(player.id) in locked:
+                continue
+            if not (_player_positions(player) & CASH_SKILL_POSITIONS):
+                continue
+            if float(player.salary) < int(floor):
+                optimizer.player_pool.remove_player(player)
+
+    def _apply_flex_positions(self, optimizer) -> None:
+        """Limit the FLEX slot so a second tight end cannot fill it."""
+        allowed = self.flex_positions
+        if not allowed:
+            return
+        chosen = tuple(dict.fromkeys(str(pos).upper() for pos in allowed))
+        if not chosen or not set(chosen) <= FLEX_POSITIONS:
+            raise ValueError("flex positions must be RB, WR, or TE")
+        if set(chosen) == FLEX_POSITIONS:
+            return
+        flex = LineupPosition("FLEX", chosen)
+        positions = [
+            flex if pos.name == "FLEX" else pos
+            for pos in list(optimizer.settings.positions)
+        ]
+        # Instance assignment leaves the shared DraftKings settings list alone.
+        optimizer.settings.positions = positions
+        optimizer.player_pool._remaining_positions = list(positions)
 
     def generate_lineups(self, n: Optional[int] = None) -> List[pd.DataFrame]:
         """Generate lineups and return each as a DataFrame of rostered players."""
@@ -517,6 +720,13 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         self.allow_kicker_captain: bool = False
         # Fraction of the batch a kicker may occupy. None leaves exposure uncapped.
         self.kicker_max_exposure: Optional[float] = None
+        # Showdown cash narrows CPT to QB/RB/WR at a base-salary floor.
+        self.captain_positions: Optional[frozenset] = None
+        self.captain_min_salary: Optional[int] = None
+        # FLEX rows under this salary are punts. None leaves them eligible.
+        self.flex_min_salary: Optional[int] = None
+        # None leaves the defense count uncapped.
+        self.max_dst: Optional[int] = None
         # Showdown batches share at most 3 players so lineups do not collapse together.
         self.max_repeating_players = 3
 
@@ -531,11 +741,21 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         max_k_dst_combined: Optional[int] = 2,
         max_kickers: Optional[int] = 1,
         allow_kicker_captain: bool = False,
+        captain_positions: Optional[Sequence[str]] = None,
+        captain_min_salary: Optional[int] = None,
+        flex_min_salary: Optional[int] = None,
+        max_dst: Optional[int] = None,
     ) -> None:
         if cpt_qb_pass_catchers < 1:
             raise ValueError("cpt_qb_pass_catchers must be at least 1")
         if max_kickers is not None and int(max_kickers) < 0:
             raise ValueError("max_kickers must be at least 0")
+        if max_dst is not None and int(max_dst) < 0:
+            raise ValueError("max_dst must be at least 0")
+        if captain_min_salary is not None and int(captain_min_salary) < 0:
+            raise ValueError("captain_min_salary must be at least 0")
+        if flex_min_salary is not None and int(flex_min_salary) < 0:
+            raise ValueError("flex_min_salary must be at least 0")
         self.min_salary_cap = min_salary_cap
         self.max_salary_cap = max_salary_cap
         self.min_teams = min_teams
@@ -544,6 +764,16 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         self.max_k_dst_combined = max_k_dst_combined
         self.max_kickers = None if max_kickers is None else int(max_kickers)
         self.allow_kicker_captain = bool(allow_kicker_captain)
+        self.captain_positions = (
+            None
+            if captain_positions is None
+            else frozenset(str(pos).upper() for pos in captain_positions)
+        )
+        self.captain_min_salary = (
+            None if captain_min_salary is None else int(captain_min_salary)
+        )
+        self.flex_min_salary = None if flex_min_salary is None else int(flex_min_salary)
+        self.max_dst = None if max_dst is None else int(max_dst)
 
     @staticmethod
     def _football_pos(player: Player) -> str:
@@ -573,10 +803,28 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         return self._football_pos(player) in QB_BRING_BACK_POSITIONS
 
     def _captain_positions_allowed(self) -> frozenset:
+        if self.captain_positions is not None:
+            return frozenset(self.captain_positions)
         allowed = set(CAPTAIN_POSITIONS)
         if self.allow_kicker_captain:
             allowed.add("K")
         return frozenset(allowed)
+
+    @staticmethod
+    def _listed_salary(player: Player) -> int:
+        """DraftKings base salary. Captain rows are stored at 1.5x."""
+        salary = float(player.salary)
+        if "CPT" in player.positions:
+            salary = salary / 1.5
+        return int(round(salary))
+
+    @staticmethod
+    def _baseline_projection(player: Player) -> float:
+        """Projection before the 1.5x captain boost."""
+        points = float(player.fppg)
+        if "CPT" in player.positions:
+            return points / 1.5
+        return points
 
     def _apply_kicker_exposure_cap(self, players: List[Player]) -> None:
         cap = self.kicker_max_exposure
@@ -589,13 +837,44 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
                 player.max_exposure = cap
 
     def _apply_captain_eligibility(self, optimizer, players: List[Player]) -> None:
-        """Keep CPT on QB/RB/WR/TE. A kicker CPT is allowed only when the flag is on."""
+        """Keep CPT on the allowed positions. Cash also requires a base-salary floor."""
         allowed = self._captain_positions_allowed()
+        minimum = self.captain_min_salary
         for player in players:
             if "CPT" not in player.positions:
                 continue
             if self._football_pos(player) not in allowed:
                 optimizer.player_pool.remove_player(player)
+                continue
+            if minimum is not None and self._listed_salary(player) < int(minimum):
+                optimizer.player_pool.remove_player(player)
+
+    def _apply_projection_floor(self, optimizer, players: List[Player]) -> None:
+        """Drop players whose own projection is 1.0 or less, before the captain boost."""
+        for player in players:
+            if self._baseline_projection(player) <= SHOWDOWN_MIN_PROJECTION:
+                optimizer.player_pool.remove_player(player)
+
+    def _flex_salary_floor(self) -> int:
+        """Showdown FLEX floor. Cash can raise it. A lock is the only way under $1,200."""
+        configured = self.flex_min_salary
+        floor = SHOWDOWN_FLEX_MIN_SALARY if configured is None else int(configured)
+        return max(SHOWDOWN_FLEX_MIN_SALARY, floor)
+
+    def _apply_flex_salary_floor(self, optimizer, players: List[Player]) -> None:
+        """Drop punts priced under the floor. A locked row is the explicit exception.
+
+        The check uses base salary, so a $200 player's $300 captain row is the
+        same punt and is removed with the FLEX row.
+        """
+        floor = self._flex_salary_floor()
+        locked = self.locked_player_ids
+        for player in players:
+            if self._listed_salary(player) >= floor:
+                continue
+            if str(player.id) in locked:
+                continue
+            optimizer.player_pool.remove_player(player)
 
     def _apply_game_script(self, optimizer, players: List[Player]) -> None:
         if not self.game_script_correlation:
@@ -688,6 +967,17 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             PlayersGroup(kickers, max_from_group=int(self.max_kickers))
         )
 
+    def _apply_dst_limit(self, optimizer, players: List[Player]) -> None:
+        """Keep CPT and FLEX to at most ``max_dst`` defenses combined."""
+        if self.max_dst is None:
+            return
+        defenses = [p for p in players if self._football_pos(p) == "DST"]
+        if len(defenses) <= int(self.max_dst):
+            return
+        optimizer.add_players_group(
+            PlayersGroup(defenses, max_from_group=int(self.max_dst))
+        )
+
     def _apply_dst_negative_correlation(self, optimizer, players: List[Player]) -> None:
         """A defense cannot share a lineup with the opposing QB or kicker."""
         by_team_pos: Dict[str, Dict[str, List[Player]]] = {}
@@ -725,8 +1015,12 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         if self.max_repeating_players is not None:
             optimizer.set_max_repeating_players(self.max_repeating_players)
         self._apply_captain_eligibility(optimizer, players)
+        self._apply_projection_floor(optimizer, players)
+        self._apply_flex_salary_floor(optimizer, players)
+        self._apply_locked_players(optimizer)
         self._apply_game_script(optimizer, players)
         self._apply_kicker_limit(optimizer, players)
+        self._apply_dst_limit(optimizer, players)
         self._apply_dst_negative_correlation(optimizer, players)
         self._apply_ownership_cap(optimizer)
         return optimizer
@@ -744,6 +1038,92 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             )
         )
         return [self.format_lineup(lineup) for lineup in raw_lineups]
+
+
+def classic_gpp_rule_check(
+    lineups: Sequence[pd.DataFrame],
+    *,
+    overlap_cap: Optional[int] = None,
+    salary_min: Optional[int] = None,
+    salary_max: int = DK_SALARY_CAP,
+    flex_positions: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """Score each Classic lineup against the large-field stack, bring-back, salary, and overlap rules."""
+    rows = []
+    id_sets = []
+    for lineup in lineups:
+        ids = set(lineup["ID"].astype(str)) if "ID" in lineup.columns else set(lineup["Name"].astype(str))
+        id_sets.append(ids)
+    for index, lineup in enumerate(lineups):
+        reasons: List[str] = []
+        qb_rows = lineup.loc[lineup["Slot"] == "QB"] if "Slot" in lineup.columns else lineup.iloc[0:0]
+        if qb_rows.empty:
+            stack = "No QB"
+            bring_back = ""
+            reasons.append("No QB")
+        else:
+            qb = qb_rows.iloc[0]
+            qb_team = str(qb["Team"])
+            opponent = str(qb.get("Opponent", "") or "")
+            catchers = lineup[
+                (lineup["Team"].astype(str) == qb_team)
+                & lineup["Position"].map(lambda pos: bool(_position_tokens(pos) & set(PASS_CATCHERS)))
+            ]
+            wideouts = [
+                name
+                for name, pos in zip(catchers["Name"], catchers["Position"])
+                if "WR" in _position_tokens(pos)
+            ]
+            catcher_names = [str(name).strip() for name in catchers["Name"]]
+            stack = " + ".join([str(qb["Name"]).strip(), *catcher_names]) if catcher_names else str(qb["Name"]).strip()
+            if len(catchers) < 2:
+                reasons.append("Stack needs 2 pass-catchers")
+            if not wideouts:
+                reasons.append("Stack needs a WR")
+            if opponent:
+                bring_rows = lineup[
+                    (lineup["Team"].astype(str) == opponent)
+                    & lineup["Position"].map(
+                        lambda pos: bool(_position_tokens(pos) & set(SKILL_POSITIONS))
+                    )
+                ]
+            else:
+                bring_rows = lineup.iloc[0:0]
+                reasons.append("No bring-back")
+            bring_names = [str(name).strip() for name in bring_rows["Name"]] if len(bring_rows) else []
+            bring_back = ", ".join(bring_names)
+            if opponent and not bring_names:
+                reasons.append("No bring-back")
+        spent = int(lineup.attrs.get("salary", int(lineup["Salary"].sum())))
+        if salary_min is not None and not salary_min <= spent <= int(salary_max):
+            reasons.append(f"Salary outside ${int(salary_min):,}–${int(salary_max):,}")
+        shared = 0
+        for other_index, other_ids in enumerate(id_sets):
+            if other_index == index:
+                continue
+            shared = max(shared, len(id_sets[index] & other_ids))
+        if overlap_cap is not None and shared > int(overlap_cap):
+            reasons.append(f"Shares {shared} players")
+        flex_label = ""
+        if "Slot" in lineup.columns:
+            flex_rows = lineup.loc[lineup["Slot"] == "FLEX"]
+            if not flex_rows.empty:
+                flex_label = str(flex_rows.iloc[0]["Position"])
+                allowed_flex = {pos.upper() for pos in flex_positions} if flex_positions else set()
+                if allowed_flex and not (_position_tokens(flex_label) & allowed_flex):
+                    reasons.append(f"Flex is {flex_label}")
+        rows.append(
+            {
+                "Lineup": index + 1,
+                "Stack": stack,
+                "Bring-back": bring_back,
+                "Flex": flex_label,
+                "Salary remaining": int(DK_SALARY_CAP - spent),
+                "Max overlap": shared,
+                "Result": "Pass" if not reasons else "; ".join(reasons),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def tiered_lineup_counts(total_n: int, leave_money_ratio: float) -> Tuple[int, int]:

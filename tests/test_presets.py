@@ -10,7 +10,14 @@ from src.presets import (
     format_preset_summary,
     format_settings_comparison,
     get_preset_config,
+    presets_for_format,
 )
+
+
+def test_showdown_presets_list_cash_before_gpp():
+    presets = presets_for_format(ContestFormat.SHOWDOWN)
+    assert presets[0] is ContestPreset.SHOWDOWN_CASH
+    assert presets[1] is ContestPreset.SHOWDOWN_GPP
 
 
 def test_format_preset_summary_classic_cash():
@@ -21,6 +28,8 @@ def test_format_preset_summary_classic_cash():
         "Projection jitter"
     ].startswith("None")
     assert rows["Stacks"] == "None"
+    assert rows["Flex"] == "WR or RB"
+    assert rows["Skill salary floor"] == "$3,800"
     assert rows["Exclude vs DST"] == "No"
     assert rows["Max repeating players"] == "No limit"
     assert rows["Ownership cap"] == "None"
@@ -33,11 +42,14 @@ def test_format_preset_summary_classic_large_gpp():
     rows = dict(format_preset_summary(cfg))
     assert "20" in rows["Lineup count"]
     assert "Position SDs" in rows["Projection jitter"]
-    assert "QB + 2" in rows["Stacks"]
-    assert "bring-back" in rows["Stacks"]
+    assert rows["Stacks"] == "QB + WR + 1 WR/TE + skill bring-back"
+    assert rows["Flex"] == "WR or RB"
     assert rows["Exclude vs DST"] == "Yes"
     assert rows["Max repeating players"] == "5"
+    assert rows["Max player exposure"] == "50%"
     assert "125%" in rows["Ownership cap"]
+    assert rows["Tiered salary"].startswith("12 at $49,800–$50,000")
+    assert "$49,200–$49,700" in rows["Tiered salary"]
 
 
 def test_format_preset_summary_showdown_gpp():

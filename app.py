@@ -26,6 +26,7 @@ from src.exporter import lineups_to_dk_upload_csv, upload_columns_for
 from src.optimizer import (
     DK_SALARY_CAP,
     STANDARD_TIER_FLOOR,
+    classic_gpp_rule_check,
     get_nfl_optimizer,
     optimize_tiered_salaries,
     tiered_lineup_counts,
@@ -39,6 +40,9 @@ from src.presets import (
     PresetConfig,
     apply_preset,
     config_with_overrides,
+    FLEX_POSITION_LABELS,
+    flex_position_label,
+    flex_positions_for_label,
     format_settings_comparison,
     get_preset_config,
     presets_for_format,
@@ -112,21 +116,8 @@ def _extra_setting_rows(
     rows: List[Tuple[str, str, str]] = []
     if int(jitter_seed) != 42:
         rows.append(("Jitter seed", "42", str(int(jitter_seed))))
-    if use_max_exposure or use_min_exposure:
-        rows.append(
-            (
-                "Max exposure",
-                "Off",
-                f"{int(max_exposure_pct)}%" if use_max_exposure else "Off",
-            )
-        )
-        rows.append(
-            (
-                "Min exposure",
-                "Off",
-                f"{int(min_exposure_pct)}%" if use_min_exposure else "Off",
-            )
-        )
+    if use_min_exposure:
+        rows.append(("Min exposure", "Off", f"{int(min_exposure_pct)}%"))
     return rows
 
 
@@ -224,18 +215,38 @@ def _collect_strategy_overrides(
             disabled=not enable_qb_stack,
             key=_preset_key(preset, "enable_bring_back"),
         )
+        bring_back_options = ["WR", "TE", "SKILL"]
         bring_back_position = st.selectbox(
             "Bring-back position",
-            options=["WR", "TE"],
-            index=0 if preset_cfg.bring_back_position == "WR" else 1,
+            options=bring_back_options,
+            index=(
+                bring_back_options.index(preset_cfg.bring_back_position)
+                if preset_cfg.bring_back_position in bring_back_options
+                else 0
+            ),
             disabled=not (enable_qb_stack and enable_bring_back),
             key=_preset_key(preset, "bring_back_position"),
+            help="SKILL is any opposing WR, TE, or RB from the quarterback's game.",
         )
         exclude_vs_dst = st.checkbox(
             "Exclude offense vs DST",
             value=preset_cfg.exclude_vs_dst,
             key=_preset_key(preset, "exclude_vs_dst"),
         )
+        flex_choice = None
+        if preset is ContestPreset.CLASSIC_LARGE_GPP:
+            flex_labels = [label for label, _positions in FLEX_POSITION_LABELS]
+            preset_flex = flex_position_label(preset_cfg.flex_positions)
+            flex_choice = st.radio(
+                "Flex position",
+                options=flex_labels,
+                index=flex_labels.index(preset_flex) if preset_flex in flex_labels else 0,
+                key=_preset_key(preset, "flex_position"),
+                help=(
+                    "WR or RB keeps the tight end in the TE spot. "
+                    "A lineup then cannot add another tight end in the flex."
+                ),
+            )
 
         overrides.update(
             enable_qb_stack=bool(enable_qb_stack),
@@ -244,6 +255,8 @@ def _collect_strategy_overrides(
             bring_back_position=str(bring_back_position),
             exclude_vs_dst=bool(exclude_vs_dst),
         )
+        if flex_choice is not None:
+            overrides["flex_positions"] = flex_positions_for_label(str(flex_choice))
         if bool(enable_qb_stack) != preset_cfg.enable_qb_stack:
             changed.append("QB stack")
         elif enable_qb_stack and int(stack_pass_catchers) != preset_cfg.stack_pass_catchers:
@@ -257,6 +270,10 @@ def _collect_strategy_overrides(
             changed.append("Bring-back position")
         if bool(exclude_vs_dst) != preset_cfg.exclude_vs_dst:
             changed.append("Exclude vs DST")
+        if flex_choice is not None and str(flex_choice) != flex_position_label(
+            preset_cfg.flex_positions
+        ):
+            changed.append("Flex")
     else:
         min_default = int(preset_cfg.min_salary_cap or 0)
         max_default = int(preset_cfg.max_salary_cap or DK_SALARY_CAP)
@@ -276,7 +293,7 @@ def _collect_strategy_overrides(
             ),
             step=100,
             disabled=not use_salary_window,
-            key=_preset_key(preset, "salary_window"),
+            key=_preset_key(preset, f"salary_window_{min_default}_{max_default}"),
         )
         require_both_teams = st.checkbox(
             "Require both teams",
@@ -337,6 +354,10 @@ def _collect_strategy_overrides(
             max_k_dst_combined=int(max_k_dst) if limit_k_dst else None,
             max_kickers=1 if limit_kickers else None,
             allow_kicker_captain=bool(allow_kicker_captain),
+            captain_positions=preset_cfg.captain_positions,
+            captain_min_salary=preset_cfg.captain_min_salary,
+            flex_min_salary=preset_cfg.flex_min_salary,
+            max_dst=preset_cfg.max_dst,
         )
         preset_uses_window = (
             preset_cfg.min_salary_cap is not None or preset_cfg.max_salary_cap is not None
@@ -445,6 +466,8 @@ def _apply_strategy_overrides(optimizer: Any, overrides: Dict[str, Any]) -> None
         )
     if "exclude_vs_dst" in overrides:
         optimizer.exclude_vs_dst = overrides["exclude_vs_dst"]
+    if "flex_positions" in overrides and hasattr(optimizer, "flex_positions"):
+        optimizer.flex_positions = overrides["flex_positions"]
 
     if "min_salary_cap" in overrides and hasattr(optimizer, "configure_showdown_rules"):
         optimizer.configure_showdown_rules(
@@ -456,6 +479,10 @@ def _apply_strategy_overrides(optimizer: Any, overrides: Dict[str, Any]) -> None
             max_k_dst_combined=overrides["max_k_dst_combined"],
             max_kickers=overrides.get("max_kickers", 1),
             allow_kicker_captain=bool(overrides.get("allow_kicker_captain", False)),
+            captain_positions=overrides.get("captain_positions"),
+            captain_min_salary=overrides.get("captain_min_salary"),
+            flex_min_salary=overrides.get("flex_min_salary"),
+            max_dst=overrides.get("max_dst"),
         )
 
     optimizer.set_max_repeating_players(overrides.get("max_repeating_players"))
@@ -547,8 +574,8 @@ with st.sidebar:
     st.markdown("### Salary settings")
     enable_tiered_salary = st.toggle(
         "Enable Tiered Salary Distribution",
-        value=False,
-        key="enable_tiered_salary",
+        value=bool(preset_cfg.tiered_salary),
+        key=_preset_key(preset, "enable_tiered_salary"),
         help=(
             "Spend most lineups near the cap, and let a set share "
             "finish under a lower salary ceiling."
@@ -558,19 +585,29 @@ with st.sidebar:
         "Lineups Leaving Money on Table (%)",
         min_value=0,
         max_value=100,
-        value=40,
+        value=int(round(float(preset_cfg.tiered_leave_ratio) * 100)),
         step=5,
         disabled=not enable_tiered_salary,
-        key="leave_money_pct",
+        key=_preset_key(preset, "leave_money_pct"),
+    )
+    discount_floor = st.number_input(
+        "Discount floor",
+        min_value=40_000,
+        max_value=DK_SALARY_CAP,
+        value=int(preset_cfg.tiered_discount_floor),
+        step=100,
+        disabled=not enable_tiered_salary,
+        key=_preset_key(preset, "discount_floor"),
+        help="Minimum salary for lineups that leave money on the table.",
     )
     discount_cap = st.number_input(
         "Discount Cap Ceiling",
-        min_value=48_000,
+        min_value=40_000,
         max_value=DK_SALARY_CAP,
-        value=49_500,
+        value=int(preset_cfg.tiered_discount_cap),
         step=100,
         disabled=not enable_tiered_salary,
-        key="discount_cap",
+        key=_preset_key(preset, "discount_cap"),
         help="Maximum salary for lineups that leave money on the table.",
     )
     if enable_tiered_salary:
@@ -581,7 +618,7 @@ with st.sidebar:
         discount_label = "lineup" if discount_n == 1 else "lineups"
         st.caption(
             f"{full_cap_n} {full_label} at ${STANDARD_TIER_FLOOR:,}–${DK_SALARY_CAP:,}; "
-            f"{discount_n} {discount_label} at $48,000–${int(discount_cap):,}."
+            f"{discount_n} {discount_label} at ${int(discount_floor):,}–${int(discount_cap):,}."
         )
 
     with st.expander("Advanced overrides", expanded=False):
@@ -595,14 +632,14 @@ with st.sidebar:
         )
         use_max_exposure = st.checkbox(
             "Limit max player exposure",
-            value=False,
+            value=preset_cfg.max_player_exposure is not None,
             key=_preset_key(preset, "use_max_exposure"),
         )
         max_exposure_pct = st.slider(
             "Max exposure %",
             1,
             100,
-            40,
+            int(round((preset_cfg.max_player_exposure or 0.40) * 100)),
             disabled=not use_max_exposure,
             key=_preset_key(preset, "max_exposure_pct"),
         )
@@ -661,12 +698,32 @@ with st.sidebar:
         },
     )
 
+    strategy_overrides["tiered_salary"] = bool(enable_tiered_salary)
+    strategy_overrides["tiered_leave_ratio"] = float(leave_money_pct) / 100.0
+    strategy_overrides["tiered_discount_floor"] = int(discount_floor)
+    strategy_overrides["tiered_discount_cap"] = int(discount_cap)
+    strategy_overrides["max_player_exposure"] = (
+        float(max_exposure_pct) / 100.0 if use_max_exposure else None
+    )
+
     all_changed = list(strategy_changed)
     if lineup_overridden:
         all_changed.insert(0, "Lineups")
-    if use_max_exposure or use_min_exposure:
+    preset_exposure_on = preset_cfg.max_player_exposure is not None
+    preset_exposure_pct = int(round((preset_cfg.max_player_exposure or 0) * 100))
+    exposure_changed = bool(use_max_exposure) != preset_exposure_on or (
+        use_max_exposure and int(max_exposure_pct) != preset_exposure_pct
+    )
+    if exposure_changed or use_min_exposure:
         all_changed.append("Exposure")
-    if enable_tiered_salary:
+    tiered_changed = bool(enable_tiered_salary) != bool(preset_cfg.tiered_salary)
+    if enable_tiered_salary and not tiered_changed:
+        tiered_changed = (
+            int(leave_money_pct) != int(round(float(preset_cfg.tiered_leave_ratio) * 100))
+            or int(discount_floor) != int(preset_cfg.tiered_discount_floor)
+            or int(discount_cap) != int(preset_cfg.tiered_discount_cap)
+        )
+    if tiered_changed:
         all_changed.append("Tiered salary")
     if not exclude_inactive:
         all_changed.append("Injuries")
@@ -699,21 +756,6 @@ extra_setting_rows = _extra_setting_rows(
     use_min_exposure=bool(use_min_exposure),
     min_exposure_pct=int(min_exposure_pct),
 )
-if enable_tiered_salary:
-    full_cap_n, discount_n = tiered_lineup_counts(
-        int(lineup_count), float(leave_money_pct) / 100.0
-    )
-    extra_setting_rows.append(
-        (
-            "Tiered salary",
-            "Off",
-            (
-                f"{int(leave_money_pct)}% leave money "
-                f"({discount_n} under ${int(discount_cap):,}; "
-                f"{full_cap_n} at ${STANDARD_TIER_FLOOR:,}–${DK_SALARY_CAP:,})"
-            ),
-        )
-    )
 extra_setting_rows.append(
     (
         "Inactive players",
@@ -862,9 +904,16 @@ injury_note = (
     if inactive_in_pool
     else ""
 )
+lock_note = ""
+if preset is ContestPreset.CLASSIC_CASH:
+    lock_note = " Lock a skill player under $3,800 to force that punt in."
+elif preset is ContestPreset.SHOWDOWN_CASH:
+    lock_note = " Lock a FLEX player under $2,000 to force that punt in."
+elif is_showdown:
+    lock_note = " Lock a FLEX player under $1,200 to force that punt in."
 st.caption(
     f"{len(pool)} rows loaded · {roster_n}-player roster · salary cap ${DK_SALARY_CAP:,}"
-    f"{injury_note}"
+    f"{injury_note}.{lock_note}"
 )
 editable_cols = ["Name", "Position", "TeamAbbrev", "Salary", "AvgPointsPerGame", "Projection"]
 has_injury_status = (
@@ -875,13 +924,19 @@ display_extra = [
     for c in ["ID", "Name + ID", "Roster Position", "RosterSlot", "Game Info", "Ownership", "Injury"]
     if c in pool.columns and (c != "Injury" or has_injury_status)
 ]
+editor_frame = pool[editable_cols + display_extra].copy()
+editor_frame.insert(0, "Lock", False)
 edited = st.data_editor(
-    pool[editable_cols + display_extra],
+    editor_frame,
     width="stretch",
     hide_index=True,
     height=320,
-    disabled=[c for c in pool.columns if c != "Projection"],
+    disabled=[c for c in editor_frame.columns if c not in {"Projection", "Lock"}],
     column_config={
+        "Lock": st.column_config.CheckboxColumn(
+            "Lock",
+            help="Force this player into the lineup, including a cash punt under the salary floor.",
+        ),
         "Projection": st.column_config.NumberColumn(
             "Projection", help="Editable custom projection (FPPG)"
         ),
@@ -905,6 +960,11 @@ if generate:
         optimizer = get_nfl_optimizer(contest_format)
         optimizer.set_exclude_inactive(exclude_inactive)
         optimizer.load_from_dataframe(solve_pool)
+        locked_ids = []
+        if "Lock" in edited.columns and "ID" in edited.columns:
+            locked_mask = edited["Lock"].fillna(False).astype(bool)
+            locked_ids = edited.loc[locked_mask, "ID"].astype(str).tolist()
+        optimizer.set_locked_players(locked_ids)
         apply_preset(
             optimizer,
             preset,
@@ -912,7 +972,7 @@ if generate:
             jitter_seed=int(jitter_seed),
         )
         _apply_strategy_overrides(optimizer, strategy_overrides)
-        if solve_low_total:
+        if solve_low_total and preset is not ContestPreset.SHOWDOWN_CASH:
             optimizer.allow_kicker_captain = True
             optimizer.kicker_max_exposure = KICKER_CAPTAIN_MAX_EXPOSURE
         optimizer.set_exposure_limits(
@@ -927,15 +987,27 @@ if generate:
                 leave_money_ratio=float(leave_money_pct) / 100.0,
                 standard_cap=DK_SALARY_CAP,
                 discount_cap=int(discount_cap),
+                discount_floor=int(discount_floor),
             )
         else:
             generated = optimizer.generate_lineups()
         progress.progress(100, text="Done")
+        rule_check = None
+        if preset is ContestPreset.CLASSIC_LARGE_GPP:
+            rule_check = {
+                "overlap_cap": optimizer.last_overlap_cap,
+                "game_count": optimizer.last_game_count,
+                "stack_exposure": optimizer.last_stack_exposure,
+                "salary_min": int(discount_floor) if enable_tiered_salary else None,
+                "salary_max": DK_SALARY_CAP,
+                "flex_positions": strategy_overrides.get("flex_positions"),
+            }
         st.session_state.lineups = generated
         st.session_state.generated_run = {
             "preset": preset.value,
             "preset_label": preset_cfg.label,
             "rows": live_setting_rows,
+            "rule_check": rule_check,
         }
         override_note = (
             f" (overrides: {', '.join(all_changed)})" if all_changed else ""
@@ -1001,6 +1073,39 @@ if lineups:
             "Projection": st.column_config.NumberColumn("Projection", format="%.2f"),
         },
     )
+    rule_meta = (used or {}).get("rule_check") if used else None
+    if rule_meta:
+        games = rule_meta.get("game_count")
+        overlap_cap = rule_meta.get("overlap_cap")
+        stack_exposure = rule_meta.get("stack_exposure")
+        notes = []
+        if games:
+            notes.append(f"{int(games)}-game slate")
+        if overlap_cap is not None:
+            notes.append(f"overlap cap {int(overlap_cap)}")
+        if stack_exposure is not None:
+            notes.append(f"team stack exposure {int(round(float(stack_exposure) * 100))}%")
+        st.markdown("#### Large-field rule check")
+        if notes:
+            st.caption(". ".join(notes) + ".")
+        rule_table = classic_gpp_rule_check(
+            lineups,
+            overlap_cap=overlap_cap,
+            salary_min=rule_meta.get("salary_min"),
+            salary_max=int(rule_meta.get("salary_max") or DK_SALARY_CAP),
+            flex_positions=rule_meta.get("flex_positions"),
+        )
+        st.dataframe(
+            rule_table,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Salary remaining": st.column_config.NumberColumn(
+                    "Salary remaining",
+                    format="$%d",
+                ),
+            },
+        )
 
     def _lineup_label(i: int) -> str:
         lu = lineups[i]

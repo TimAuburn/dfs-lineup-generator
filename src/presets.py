@@ -30,8 +30,8 @@ CLASSIC_PRESETS = (
 )
 
 SHOWDOWN_PRESETS = (
-    ContestPreset.SHOWDOWN_GPP,
     ContestPreset.SHOWDOWN_CASH,
+    ContestPreset.SHOWDOWN_GPP,
 )
 
 PRESET_LABELS = {
@@ -68,10 +68,24 @@ class PresetConfig:
     stack_pass_catchers: int = 1
     enable_bring_back: bool = False
     bring_back_position: str = "WR"
+    # Double stacks are QB + WR + WR/TE. Single stacks stay QB + WR/TE.
+    require_wr_in_stack: bool = False
+    # FLEX eligibility. None keeps RB, WR, and TE. ("RB", "WR") blocks a second tight end.
+    flex_positions: Optional[Tuple[str, ...]] = None
+    # Classic cash drops WR/RB/TE under this salary unless the user locks them.
+    min_skill_salary: Optional[int] = None
+    # Fewer than 10 games tightens the repeating-player cap; 4 games lowers stack exposure.
+    slate_aware_gpp: bool = False
     exclude_vs_dst: bool = False
     max_repeating_players: Optional[int] = None
     # Cumulative ownership cap as a fraction (1.25 == 125%). None = do not apply.
     max_cumulative_ownership: Optional[float] = None
+    # Fraction of the batch one player may occupy. None leaves exposure uncapped.
+    max_player_exposure: Optional[float] = None
+    tiered_salary: bool = False
+    tiered_leave_ratio: float = 0.40
+    tiered_discount_floor: int = 48_000
+    tiered_discount_cap: int = 49_500
     # Showdown-specific
     min_salary_cap: Optional[int] = None
     max_salary_cap: Optional[int] = None
@@ -81,7 +95,13 @@ class PresetConfig:
     max_k_dst_combined: Optional[int] = None
     # Showdown roster cap. 1 blocks both teams' kickers in one lineup. None = no cap.
     max_kickers: Optional[int] = None
+    # Showdown cash: at most one defense, same idea as the kicker cap.
+    max_dst: Optional[int] = None
     allow_kicker_captain: bool = False
+    # Showdown cash captain pool. None keeps the default CPT positions.
+    captain_positions: Optional[Tuple[str, ...]] = None
+    captain_min_salary: Optional[int] = None
+    flex_min_salary: Optional[int] = None
     description: str = ""
 
 
@@ -93,9 +113,14 @@ PRESET_CONFIGS: Dict[ContestPreset, PresetConfig] = {
         default_lineup_count=1,
         jitter_pct=(0.0, 0.0),
         enable_qb_stack=False,
+        flex_positions=("RB", "WR"),
+        min_skill_salary=3_800,
         exclude_vs_dst=False,
         max_repeating_players=None,
-        description="Single deterministic cash lineup; maximize projected points, no stacks.",
+        description=(
+            "Single deterministic cash lineup. No stacks. FLEX is WR or RB. "
+            "WR, RB, and TE under $3,800 are excluded unless locked."
+        ),
     ),
     ContestPreset.CLASSIC_SMALL_GPP: PresetConfig(
         format=ContestFormat.CLASSIC,
@@ -120,11 +145,23 @@ PRESET_CONFIGS: Dict[ContestPreset, PresetConfig] = {
         enable_qb_stack=True,
         stack_pass_catchers=2,
         enable_bring_back=True,
-        bring_back_position="WR",
+        bring_back_position="SKILL",
+        require_wr_in_stack=True,
+        flex_positions=("RB", "WR"),
+        slate_aware_gpp=True,
         exclude_vs_dst=True,
         max_repeating_players=5,
         max_cumulative_ownership=1.25,
-        description="Large-field multi-entry: position jitter, QB double stack + bring-back, ownership cap.",
+        max_player_exposure=0.50,
+        tiered_salary=True,
+        tiered_leave_ratio=0.40,
+        tiered_discount_floor=49_200,
+        tiered_discount_cap=49_700,
+        description=(
+            "Large-field multi-entry: QB + WR + WR/TE, skill bring-back, "
+            "FLEX is WR or RB, slate-aware overlap, 50% player exposure, "
+            "salary from $49,200 to $50,000."
+        ),
     ),
     ContestPreset.SHOWDOWN_GPP: PresetConfig(
         format=ContestFormat.SHOWDOWN,
@@ -141,10 +178,11 @@ PRESET_CONFIGS: Dict[ContestPreset, PresetConfig] = {
         max_kickers=1,
         max_repeating_players=3,
         allow_kicker_captain=False,
+        flex_min_salary=1_200,
         description=(
             "Showdown GPP: salary window, both teams, CPT QB needs 2 WR/TE "
             "plus an opposing skill player, no K or DST captains, at most one kicker, "
-            "max 3 repeats."
+            "no FLEX under $1,200, drop players at 1.0 points or less, max 3 repeats."
         ),
     ),
     ContestPreset.SHOWDOWN_CASH: PresetConfig(
@@ -153,15 +191,22 @@ PRESET_CONFIGS: Dict[ContestPreset, PresetConfig] = {
         lineup_count_range=(1, 5),
         default_lineup_count=1,
         jitter_pct=(0.0, 0.0),
-        min_salary_cap=48_000,
+        min_salary_cap=49_500,
         max_salary_cap=50_000,
         min_teams=2,
         game_script_correlation=False,
         max_k_dst_combined=2,
         max_kickers=1,
+        max_dst=1,
         max_repeating_players=None,
-        allow_kicker_captain=True,
-        description="Showdown Cash: low/no jitter, few lineups, both teams required, at most one kicker.",
+        allow_kicker_captain=False,
+        captain_positions=("QB", "RB", "WR"),
+        captain_min_salary=8_000,
+        flex_min_salary=2_000,
+        description=(
+            "Showdown Cash: spend $49,500–$50,000, captain a QB/RB/WR at $8,000+, "
+            "no FLEX under $2,000, at most one kicker and one DST."
+        ),
     ),
 }
 
@@ -211,6 +256,33 @@ def _fmt_pct_band(band: Optional[Tuple[float, float]]) -> str:
     return f"{lo * 100:.0f}–{hi * 100:.0f}%"
 
 
+FLEX_POSITION_LABELS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("WR or RB", ("RB", "WR")),
+    ("WR", ("WR",)),
+    ("RB", ("RB",)),
+    ("Any", ("RB", "TE", "WR")),
+)
+
+
+def flex_positions_for_label(label: str) -> Tuple[str, ...]:
+    """Map a flex radio label to the positions allowed in the FLEX slot."""
+    for name, positions in FLEX_POSITION_LABELS:
+        if name == label:
+            return positions
+    raise ValueError("flex label must be WR or RB, WR, RB, or Any")
+
+
+def flex_position_label(positions: Optional[Tuple[str, ...]]) -> str:
+    """Label for a flex-position tuple. Missing values mean the full DraftKings flex."""
+    if not positions:
+        return "Any"
+    wanted = frozenset(str(pos).upper() for pos in positions)
+    for name, allowed in FLEX_POSITION_LABELS:
+        if frozenset(allowed) == wanted:
+            return name
+    return ", ".join(sorted(wanted))
+
+
 def format_preset_summary(config: PresetConfig) -> List[Tuple[str, str]]:
     """
     Build readable (setting, value) rows for UI display from a PresetConfig.
@@ -239,13 +311,31 @@ def format_preset_summary(config: PresetConfig) -> List[Tuple[str, str]]:
 
     if config.format is ContestFormat.CLASSIC:
         if config.enable_qb_stack:
-            stack = f"QB + {config.stack_pass_catchers} WR/TE"
+            if config.require_wr_in_stack and config.stack_pass_catchers >= 2:
+                stack = f"QB + WR + {config.stack_pass_catchers - 1} WR/TE"
+            else:
+                stack = f"QB + {config.stack_pass_catchers} WR/TE"
             if config.enable_bring_back:
-                stack += f" + {config.bring_back_position} bring-back"
+                bring = "skill" if config.bring_back_position == "SKILL" else config.bring_back_position
+                stack += f" + {bring} bring-back"
             rows.append(("Stacks", stack))
         else:
             rows.append(("Stacks", "None"))
+        if config.flex_positions:
+            rows.append(("Flex", flex_position_label(config.flex_positions)))
+        if config.min_skill_salary is not None:
+            rows.append(("Skill salary floor", f"${config.min_skill_salary:,}"))
         rows.append(("Exclude vs DST", "Yes" if config.exclude_vs_dst else "No"))
+        rows.append(
+            (
+                "Max player exposure",
+                (
+                    f"{config.max_player_exposure * 100:.0f}%"
+                    if config.max_player_exposure is not None
+                    else "Off"
+                ),
+            )
+        )
     else:
         min_sal = config.min_salary_cap
         max_sal = config.max_salary_cap
@@ -280,6 +370,13 @@ def format_preset_summary(config: PresetConfig) -> List[Tuple[str, str]]:
                 "Yes" if config.allow_kicker_captain else "No",
             )
         )
+        if config.captain_positions:
+            captain = ", ".join(config.captain_positions)
+            if config.captain_min_salary is not None:
+                captain = f"{captain} at ${config.captain_min_salary:,}+"
+            rows.append(("Captain", captain))
+        if config.flex_min_salary is not None:
+            rows.append(("Flex floor", f"${config.flex_min_salary:,}"))
         rows.append(
             (
                 "Max K+DST combined",
@@ -296,6 +393,8 @@ def format_preset_summary(config: PresetConfig) -> List[Tuple[str, str]]:
                 str(config.max_kickers) if config.max_kickers is not None else "No limit",
             )
         )
+        if config.max_dst is not None:
+            rows.append(("Max DST", str(config.max_dst)))
 
     rows.append(
         (
@@ -318,10 +417,25 @@ def format_preset_summary(config: PresetConfig) -> List[Tuple[str, str]]:
     else:
         rows.append(("Ownership cap", "None"))
 
+    rows.append(("Tiered salary", _tiered_salary_label(config)))
+
     if config.description:
         rows.append(("Strategy notes", config.description))
 
     return rows
+
+
+def _tiered_salary_label(config: PresetConfig) -> str:
+    if not config.tiered_salary:
+        return "Off"
+    total = int(config.default_lineup_count)
+    standard_n = int(round((1.0 - float(config.tiered_leave_ratio)) * total))
+    standard_n = max(0, min(total, standard_n))
+    discount_n = total - standard_n
+    return (
+        f"{standard_n} at $49,800–$50,000; "
+        f"{discount_n} at ${int(config.tiered_discount_floor):,}–${int(config.tiered_discount_cap):,}"
+    )
 
 
 def format_settings_comparison(
@@ -389,6 +503,13 @@ def apply_preset(
             bring_back=config.enable_bring_back,
             bring_back_position=config.bring_back_position,
         )
+    if hasattr(optimizer, "require_wr_in_stack"):
+        optimizer.require_wr_in_stack = bool(config.require_wr_in_stack)
+        optimizer.slate_aware_gpp = bool(config.slate_aware_gpp)
+    if hasattr(optimizer, "flex_positions"):
+        optimizer.flex_positions = config.flex_positions
+    if hasattr(optimizer, "min_skill_salary"):
+        optimizer.min_skill_salary = config.min_skill_salary
 
     if hasattr(optimizer, "configure_showdown_rules"):
         optimizer.configure_showdown_rules(
@@ -400,6 +521,10 @@ def apply_preset(
             max_k_dst_combined=config.max_k_dst_combined,
             max_kickers=config.max_kickers,
             allow_kicker_captain=config.allow_kicker_captain,
+            captain_positions=config.captain_positions,
+            captain_min_salary=config.captain_min_salary,
+            flex_min_salary=config.flex_min_salary,
+            max_dst=config.max_dst,
         )
 
     return config
