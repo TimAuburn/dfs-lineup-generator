@@ -48,10 +48,13 @@ CAPTAIN_POSITIONS = frozenset({"QB", "RB", "WR", "TE"})
 CASH_SKILL_MIN_SALARY = 3_800
 CASH_SKILL_POSITIONS = frozenset({"RB", "WR", "TE"})
 # Showdown cash spends the cap and captains a high-salary QB, RB, or WR.
-SHOWDOWN_CASH_MIN_SALARY = 49_500
+SHOWDOWN_CASH_MIN_SALARY = 49_600
 SHOWDOWN_CASH_CAPTAIN_POSITIONS = frozenset({"QB", "RB", "WR"})
 SHOWDOWN_CASH_CAPTAIN_MIN_SALARY = 8_000
-SHOWDOWN_CASH_FLEX_MIN_SALARY = 2_000
+SHOWDOWN_CASH_FLEX_MIN_SALARY = 3_500
+# At most one rostered player may be priced under this. Stops a stars-and-scrubs cash build.
+SHOWDOWN_CASH_BELOW_SALARY = 4_500
+SHOWDOWN_CASH_MAX_BELOW_SALARY = 1
 # Every Showdown lineup: no near-zero projections, and no sub-$1,200 FLEX punt.
 SHOWDOWN_MIN_PROJECTION = 1.0
 SHOWDOWN_FLEX_MIN_SALARY = 1_200
@@ -725,8 +728,12 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         self.captain_min_salary: Optional[int] = None
         # FLEX rows under this salary are punts. None leaves them eligible.
         self.flex_min_salary: Optional[int] = None
-        # None leaves the defense count uncapped.
+        # None leaves the defense count uncapped. Cash bans defenses instead.
         self.max_dst: Optional[int] = None
+        self.ban_dst: bool = False
+        # Cash: at most one player whose base salary is under the threshold.
+        self.max_below_salary_players: Optional[int] = None
+        self.below_salary_threshold: Optional[int] = None
         # Showdown batches share at most 3 players so lineups do not collapse together.
         self.max_repeating_players = 3
 
@@ -745,6 +752,9 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         captain_min_salary: Optional[int] = None,
         flex_min_salary: Optional[int] = None,
         max_dst: Optional[int] = None,
+        ban_dst: bool = False,
+        max_below_salary_players: Optional[int] = None,
+        below_salary_threshold: Optional[int] = None,
     ) -> None:
         if cpt_qb_pass_catchers < 1:
             raise ValueError("cpt_qb_pass_catchers must be at least 1")
@@ -756,6 +766,10 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             raise ValueError("captain_min_salary must be at least 0")
         if flex_min_salary is not None and int(flex_min_salary) < 0:
             raise ValueError("flex_min_salary must be at least 0")
+        if max_below_salary_players is not None and int(max_below_salary_players) < 0:
+            raise ValueError("max_below_salary_players must be at least 0")
+        if below_salary_threshold is not None and int(below_salary_threshold) < 0:
+            raise ValueError("below_salary_threshold must be at least 0")
         self.min_salary_cap = min_salary_cap
         self.max_salary_cap = max_salary_cap
         self.min_teams = min_teams
@@ -774,6 +788,13 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         )
         self.flex_min_salary = None if flex_min_salary is None else int(flex_min_salary)
         self.max_dst = None if max_dst is None else int(max_dst)
+        self.ban_dst = bool(ban_dst)
+        self.max_below_salary_players = (
+            None if max_below_salary_players is None else int(max_below_salary_players)
+        )
+        self.below_salary_threshold = (
+            None if below_salary_threshold is None else int(below_salary_threshold)
+        )
 
     @staticmethod
     def _football_pos(player: Player) -> str:
@@ -875,6 +896,33 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             if str(player.id) in locked:
                 continue
             optimizer.player_pool.remove_player(player)
+
+    def _apply_dst_ban(self, optimizer, players: List[Player]) -> None:
+        """Cash lineups are QB, RB, WR, TE, and K. Defenses are removed."""
+        if not self.ban_dst:
+            return
+        for player in players:
+            if self._football_pos(player) == "DST":
+                optimizer.player_pool.remove_player(player)
+
+    def _apply_cheap_player_cap(self, optimizer, players: List[Player]) -> None:
+        """At most one player priced under the cash threshold on the six-man roster.
+
+        Both the captain and flex rows of a cheap player count, so a $4,000
+        player cannot be paired with a second player under the threshold.
+        """
+        if self.max_below_salary_players is None or self.below_salary_threshold is None:
+            return
+        threshold = int(self.below_salary_threshold)
+        cheap = [
+            player
+            for player in players
+            if self._listed_salary(player) < threshold
+        ]
+        cap = int(self.max_below_salary_players)
+        if len(cheap) <= cap:
+            return
+        optimizer.add_players_group(PlayersGroup(cheap, max_from_group=cap))
 
     def _apply_game_script(self, optimizer, players: List[Player]) -> None:
         if not self.game_script_correlation:
@@ -1015,9 +1063,11 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         if self.max_repeating_players is not None:
             optimizer.set_max_repeating_players(self.max_repeating_players)
         self._apply_captain_eligibility(optimizer, players)
+        self._apply_dst_ban(optimizer, players)
         self._apply_projection_floor(optimizer, players)
         self._apply_flex_salary_floor(optimizer, players)
         self._apply_locked_players(optimizer)
+        self._apply_cheap_player_cap(optimizer, players)
         self._apply_game_script(optimizer, players)
         self._apply_kicker_limit(optimizer, players)
         self._apply_dst_limit(optimizer, players)

@@ -97,6 +97,11 @@ class PresetConfig:
     max_kickers: Optional[int] = None
     # Showdown cash: at most one defense, same idea as the kicker cap.
     max_dst: Optional[int] = None
+    # Showdown cash removes every defense from the pool.
+    ban_dst: bool = False
+    # Showdown cash: at most this many players priced under the threshold.
+    max_below_salary_players: Optional[int] = None
+    below_salary_threshold: Optional[int] = None
     allow_kicker_captain: bool = False
     # Showdown cash captain pool. None keeps the default CPT positions.
     captain_positions: Optional[Tuple[str, ...]] = None
@@ -191,21 +196,23 @@ PRESET_CONFIGS: Dict[ContestPreset, PresetConfig] = {
         lineup_count_range=(1, 5),
         default_lineup_count=1,
         jitter_pct=(0.0, 0.0),
-        min_salary_cap=49_500,
+        min_salary_cap=49_600,
         max_salary_cap=50_000,
         min_teams=2,
         game_script_correlation=False,
         max_k_dst_combined=2,
         max_kickers=1,
-        max_dst=1,
+        ban_dst=True,
         max_repeating_players=None,
         allow_kicker_captain=False,
         captain_positions=("QB", "RB", "WR"),
         captain_min_salary=8_000,
-        flex_min_salary=2_000,
+        flex_min_salary=3_500,
+        max_below_salary_players=1,
+        below_salary_threshold=4_500,
         description=(
-            "Showdown Cash: spend $49,500–$50,000, captain a QB/RB/WR at $8,000+, "
-            "no FLEX under $2,000, at most one kicker and one DST."
+            "Showdown Cash: spend $49,600–$50,000, no defense, at most one kicker, "
+            "FLEX at $3,500+, and at most one player under $4,500."
         ),
     ),
 }
@@ -377,6 +384,20 @@ def format_preset_summary(config: PresetConfig) -> List[Tuple[str, str]]:
             rows.append(("Captain", captain))
         if config.flex_min_salary is not None:
             rows.append(("Flex floor", f"${config.flex_min_salary:,}"))
+        if config.ban_dst:
+            rows.append(("DST", "Banned"))
+        elif config.max_dst is not None:
+            rows.append(("Max DST", str(config.max_dst)))
+        if (
+            config.max_below_salary_players is not None
+            and config.below_salary_threshold is not None
+        ):
+            rows.append(
+                (
+                    f"Players under ${config.below_salary_threshold:,}",
+                    f"At most {config.max_below_salary_players}",
+                )
+            )
         rows.append(
             (
                 "Max K+DST combined",
@@ -393,8 +414,6 @@ def format_preset_summary(config: PresetConfig) -> List[Tuple[str, str]]:
                 str(config.max_kickers) if config.max_kickers is not None else "No limit",
             )
         )
-        if config.max_dst is not None:
-            rows.append(("Max DST", str(config.max_dst)))
 
     rows.append(
         (
@@ -525,6 +544,9 @@ def apply_preset(
             captain_min_salary=config.captain_min_salary,
             flex_min_salary=config.flex_min_salary,
             max_dst=config.max_dst,
+            ban_dst=config.ban_dst,
+            max_below_salary_players=config.max_below_salary_players,
+            below_salary_threshold=config.below_salary_threshold,
         )
 
     return config

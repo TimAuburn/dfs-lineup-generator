@@ -358,6 +358,9 @@ def _collect_strategy_overrides(
             captain_min_salary=preset_cfg.captain_min_salary,
             flex_min_salary=preset_cfg.flex_min_salary,
             max_dst=preset_cfg.max_dst,
+            ban_dst=preset_cfg.ban_dst,
+            max_below_salary_players=preset_cfg.max_below_salary_players,
+            below_salary_threshold=preset_cfg.below_salary_threshold,
         )
         preset_uses_window = (
             preset_cfg.min_salary_cap is not None or preset_cfg.max_salary_cap is not None
@@ -483,6 +486,9 @@ def _apply_strategy_overrides(optimizer: Any, overrides: Dict[str, Any]) -> None
             captain_min_salary=overrides.get("captain_min_salary"),
             flex_min_salary=overrides.get("flex_min_salary"),
             max_dst=overrides.get("max_dst"),
+            ban_dst=bool(overrides.get("ban_dst", False)),
+            max_below_salary_players=overrides.get("max_below_salary_players"),
+            below_salary_threshold=overrides.get("below_salary_threshold"),
         )
 
     optimizer.set_max_repeating_players(overrides.get("max_repeating_players"))
@@ -908,7 +914,7 @@ lock_note = ""
 if preset is ContestPreset.CLASSIC_CASH:
     lock_note = " Lock a skill player under $3,800 to force that punt in."
 elif preset is ContestPreset.SHOWDOWN_CASH:
-    lock_note = " Lock a FLEX player under $2,000 to force that punt in."
+    lock_note = " Lock a FLEX player under $3,500 to force that punt in."
 elif is_showdown:
     lock_note = " Lock a FLEX player under $1,200 to force that punt in."
 st.caption(

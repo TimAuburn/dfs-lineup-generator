@@ -492,12 +492,14 @@ def test_showdown_pipeline_roster_salary_and_export():
     optimizer.load_from_csv(MOCK_SHOWDOWN_CSV)
     apply_preset(optimizer, ContestPreset.SHOWDOWN_CASH, lineup_count=2, jitter_seed=42)
     # Cash preset allows up to 5; keep 2 for speed.
-    assert optimizer.min_salary_cap == 49_500
+    assert optimizer.min_salary_cap == 49_600
     assert optimizer.max_salary_cap == 50_000
     assert optimizer.captain_min_salary == 8_000
-    assert optimizer.flex_min_salary == 2_000
+    assert optimizer.flex_min_salary == 3_500
     assert optimizer.max_kickers == 1
-    assert optimizer.max_dst == 1
+    assert optimizer.ban_dst is True
+    assert optimizer.max_below_salary_players == 1
+    assert optimizer.below_salary_threshold == 4_500
     assert optimizer.allow_kicker_captain is False
     assert optimizer.min_teams == 2
 
@@ -507,14 +509,22 @@ def test_showdown_pipeline_roster_salary_and_export():
         assert lineup["Slot"].tolist() == SHOWDOWN_SLOTS
         assert len(lineup) == 6
         salary = int(lineup.attrs.get("salary", lineup["Salary"].sum()))
-        assert 49_500 <= salary <= DK_SALARY_CAP
+        assert 49_600 <= salary <= DK_SALARY_CAP
         cpt = lineup.loc[lineup["Slot"] == "CPT"].iloc[0]
         assert cpt["Position"] in {"QB", "RB", "WR"}
         assert int(cpt["Salary"]) >= 12_000
         flex = lineup.loc[lineup["Slot"] == "FLEX"]
-        assert int(flex["Salary"].min()) >= 2_000
+        assert int(flex["Salary"].min()) >= 3_500
         assert int((lineup["Position"] == "K").sum()) <= 1
-        assert int((lineup["Position"] == "DST").sum()) <= 1
+        assert int((lineup["Position"] == "DST").sum()) == 0
+        cheap = 0
+        for _, row in lineup.iterrows():
+            listed = int(row["Salary"])
+            if row["Slot"] == "CPT":
+                listed = int(round(listed / 1.5))
+            if listed < 4_500:
+                cheap += 1
+        assert cheap <= 1
         teams = set(lineup["Team"])
         assert len(teams) >= 2
         # Same player cannot appear as both CPT and FLEX.
@@ -527,6 +537,61 @@ def test_showdown_pipeline_roster_salary_and_export():
     cells = body.split(",")
     assert len(cells) == 6
     assert all(cell.isdigit() for cell in cells)
+
+
+def test_showdown_cash_bans_dst_and_limits_scrubs():
+    rows = []
+    rows += _showdown_pair("QB", "Patrick Mahomes", 100, "KC", 10000, 18)
+    rows += _showdown_pair("RB", "Isiah Pacheco", 110, "KC", 8000, 14)
+    rows += _showdown_pair("WR", "Xavier Worthy", 120, "KC", 7000, 12)
+    rows += _showdown_pair("WR", "Cheap Worthy", 130, "KC", 4000, 22)
+    rows += _showdown_pair("WR", "Deep Punt", 140, "KC", 3000, 20)
+    rows += _showdown_pair("TE", "Travis Kelce", 150, "KC", 6500, 11)
+    rows += _showdown_pair("K", "Harrison Butker", 160, "KC", 4000, 18)
+    rows += _showdown_pair("DST", "Chiefs", 170, "KC", 4600, 40)
+    rows += _showdown_pair("QB", "Josh Allen", 200, "BUF", 9800, 17)
+    rows += _showdown_pair("RB", "James Cook", 210, "BUF", 7500, 13)
+    rows += _showdown_pair("WR", "Khalil Shakir", 220, "BUF", 6800, 12)
+    rows += _showdown_pair("WR", "Second Scrub", 230, "BUF", 4200, 21)
+    rows += _showdown_pair("K", "Tyler Bass", 240, "BUF", 5000, 17)
+    rows += _showdown_pair("DST", "Bills", 250, "BUF", 4400, 35)
+    rows += _showdown_pair("TE", "Dalton Kincaid", 260, "BUF", 6000, 10)
+
+    optimizer = NFLShowdownOptimizer()
+    optimizer.jitter_pct = (0.0, 0.0)
+    optimizer.load_from_dataframe(pd.DataFrame(rows))
+    optimizer.configure_showdown_rules(
+        min_salary_cap=30_000,
+        max_salary_cap=50_000,
+        min_teams=2,
+        game_script_correlation=False,
+        max_kickers=1,
+        allow_kicker_captain=False,
+        ban_dst=True,
+        flex_min_salary=3_500,
+        max_below_salary_players=1,
+        below_salary_threshold=4_500,
+        captain_positions=("QB", "RB", "WR"),
+        captain_min_salary=8_000,
+    )
+    optimizer.set_lineup_count(1)
+    lineup = optimizer.generate_lineups()[0]
+    names = set(lineup["Name"])
+    assert "Chiefs" not in names
+    assert "Bills" not in names
+    assert "Deep Punt" not in names
+    assert int((lineup["Position"] == "K").sum()) <= 1
+    assert int((lineup["Position"] == "DST").sum()) == 0
+    cheap_names = []
+    for _, row in lineup.iterrows():
+        listed = int(row["Salary"])
+        if row["Slot"] == "CPT":
+            listed = int(round(listed / 1.5))
+        if listed < 4_500:
+            cheap_names.append(row["Name"])
+    assert len(cheap_names) <= 1
+    flex = lineup.loc[lineup["Slot"] == "FLEX"]
+    assert int(flex["Salary"].min()) >= 3_500
 
 
 def test_showdown_gpp_preset_with_game_script():
