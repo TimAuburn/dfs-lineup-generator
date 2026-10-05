@@ -102,6 +102,8 @@ class PresetConfig:
     # Showdown cash: at most this many players priced under the threshold.
     max_below_salary_players: Optional[int] = None
     below_salary_threshold: Optional[int] = None
+    # Showdown cash: at most this many running backs from one team. None = no cap.
+    max_rbs_per_team: Optional[int] = None
     allow_kicker_captain: bool = False
     # Showdown cash captain pool. None keeps the default CPT positions.
     captain_positions: Optional[Tuple[str, ...]] = None
@@ -210,9 +212,11 @@ PRESET_CONFIGS: Dict[ContestPreset, PresetConfig] = {
         flex_min_salary=3_500,
         max_below_salary_players=1,
         below_salary_threshold=4_500,
+        max_rbs_per_team=1,
         description=(
             "Showdown Cash: spend $49,600–$50,000, no defense, at most one kicker, "
-            "FLEX at $3,500+, and at most one player under $4,500."
+            "at most one running back from each team, FLEX at $3,500+, "
+            "and at most one player under $4,500."
         ),
     ),
 }
@@ -398,6 +402,8 @@ def format_preset_summary(config: PresetConfig) -> List[Tuple[str, str]]:
                     f"At most {config.max_below_salary_players}",
                 )
             )
+        if config.max_rbs_per_team is not None:
+            rows.append(("Same-team RBs", f"At most {config.max_rbs_per_team}"))
         rows.append(
             (
                 "Max K+DST combined",
@@ -547,6 +553,7 @@ def apply_preset(
             ban_dst=config.ban_dst,
             max_below_salary_players=config.max_below_salary_players,
             below_salary_threshold=config.below_salary_threshold,
+            max_rbs_per_team=config.max_rbs_per_team,
         )
 
     return config

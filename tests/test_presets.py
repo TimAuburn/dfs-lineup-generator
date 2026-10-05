@@ -52,6 +52,14 @@ def test_format_preset_summary_classic_large_gpp():
     assert "$49,200–$49,700" in rows["Tiered salary"]
 
 
+def test_format_preset_summary_showdown_cash_limits_same_team_rbs():
+    cfg = get_preset_config(ContestPreset.SHOWDOWN_CASH)
+    rows = dict(format_preset_summary(cfg))
+    assert rows["Same-team RBs"] == "At most 1"
+    gpp = dict(format_preset_summary(get_preset_config(ContestPreset.SHOWDOWN_GPP)))
+    assert "Same-team RBs" not in gpp
+
+
 def test_format_preset_summary_showdown_gpp():
     cfg = get_preset_config(ContestPreset.SHOWDOWN_GPP)
     rows = dict(format_preset_summary(cfg))

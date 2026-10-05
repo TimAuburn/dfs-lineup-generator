@@ -58,6 +58,8 @@ SHOWDOWN_CASH_MAX_BELOW_SALARY = 1
 # Every Showdown lineup: no near-zero projections, and no sub-$1,200 FLEX punt.
 SHOWDOWN_MIN_PROJECTION = 1.0
 SHOWDOWN_FLEX_MIN_SALARY = 1_200
+# Showdown backup QBs (Cooper Rush at 5.1) stay out of CPT and FLEX.
+SHOWDOWN_QB_MIN_PROJECTION = 12.0
 
 
 def _parse_game_info(
@@ -105,6 +107,56 @@ def _position_tokens(value: object) -> set[str]:
         if token and token not in {"FLEX", "CPT", "UTIL"}:
             tokens.add(token)
     return tokens
+
+
+def unique_quarterbacks(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per quarterback, using the higher listed projection of CPT and FLEX."""
+    empty = pd.DataFrame(columns=["Name", "TeamAbbrev", "Projection"])
+    if df is None or df.empty or "Position" not in df.columns or "Name" not in df.columns:
+        return empty
+    is_qb = df["Position"].map(lambda value: "QB" in _position_tokens(value))
+    qbs = df.loc[is_qb].copy()
+    if qbs.empty or "TeamAbbrev" not in qbs.columns:
+        return empty
+    proj_col = "Projection" if "Projection" in qbs.columns else "AvgPointsPerGame"
+    if proj_col not in qbs.columns:
+        return empty
+    qbs["Name"] = qbs["Name"].astype(str).str.strip()
+    qbs["TeamAbbrev"] = qbs["TeamAbbrev"].astype(str).str.strip().str.upper()
+    qbs["Projection"] = pd.to_numeric(qbs[proj_col], errors="coerce").fillna(0.0)
+    grouped = (
+        qbs.groupby(["Name", "TeamAbbrev"], as_index=False)["Projection"]
+        .max()
+        .sort_values(["Projection", "Name"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+    return grouped
+
+
+def quarterback_label(name: str, team: str, projection: float) -> str:
+    """Dropdown label for one quarterback."""
+    return f"{name} ({team}) — {float(projection):.2f}"
+
+
+def default_starting_quarterbacks(
+    df: pd.DataFrame,
+    *,
+    limit: int = 2,
+) -> List[Tuple[str, str]]:
+    """Highest-projected quarterback on each team, then the top ``limit`` of those.
+
+    A Showdown slate is one game, so this is one starter from each team.
+    """
+    qbs = unique_quarterbacks(df)
+    if qbs.empty:
+        return []
+    leaders = (
+        qbs.sort_values(["Projection", "Name"], ascending=[False, True])
+        .drop_duplicates("TeamAbbrev", keep="first")
+        .sort_values(["Projection", "Name"], ascending=[False, True])
+        .head(max(0, int(limit)))
+    )
+    return [(str(row.Name), str(row.TeamAbbrev)) for row in leaders.itertuples(index=False)]
 
 
 def _player_positions(player: Player) -> set[str]:
@@ -734,8 +786,12 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         # Cash: at most one player whose base salary is under the threshold.
         self.max_below_salary_players: Optional[int] = None
         self.below_salary_threshold: Optional[int] = None
+        # Cash: at most this many running backs from one team. None leaves it uncapped.
+        self.max_rbs_per_team: Optional[int] = None
         # Showdown batches share at most 3 players so lineups do not collapse together.
         self.max_repeating_players = 3
+        # None keeps every QB who clears the projection floor. A set keeps only those.
+        self.confirmed_quarterbacks: Optional[set[Tuple[str, str]]] = None
 
     def configure_showdown_rules(
         self,
@@ -755,6 +811,7 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         ban_dst: bool = False,
         max_below_salary_players: Optional[int] = None,
         below_salary_threshold: Optional[int] = None,
+        max_rbs_per_team: Optional[int] = None,
     ) -> None:
         if cpt_qb_pass_catchers < 1:
             raise ValueError("cpt_qb_pass_catchers must be at least 1")
@@ -770,6 +827,8 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             raise ValueError("max_below_salary_players must be at least 0")
         if below_salary_threshold is not None and int(below_salary_threshold) < 0:
             raise ValueError("below_salary_threshold must be at least 0")
+        if max_rbs_per_team is not None and int(max_rbs_per_team) < 0:
+            raise ValueError("max_rbs_per_team must be at least 0")
         self.min_salary_cap = min_salary_cap
         self.max_salary_cap = max_salary_cap
         self.min_teams = min_teams
@@ -795,6 +854,53 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         self.below_salary_threshold = (
             None if below_salary_threshold is None else int(below_salary_threshold)
         )
+        self.max_rbs_per_team = None if max_rbs_per_team is None else int(max_rbs_per_team)
+
+    def set_confirmed_quarterbacks(
+        self,
+        players: Optional[Sequence[Tuple[str, str]]],
+    ) -> None:
+        """Keep only these (name, team) quarterbacks. ``None`` clears the name filter.
+
+        Quarterbacks under 12.0 points are still removed.
+        """
+        if players is None:
+            self.confirmed_quarterbacks = None
+            return
+        self.confirmed_quarterbacks = {
+            (str(name).strip(), str(team).strip().upper()) for name, team in players
+        }
+
+    def _without_backup_quarterbacks(self, pool: pd.DataFrame) -> pd.DataFrame:
+        """Drop Showdown QBs whose listed projection is under 12.0.
+
+        The check uses the projection on the salary file, before jitter and
+        before the 1.5x captain boost, so a 10-point backup cannot survive as
+        a 15-point captain row.
+        """
+        if pool.empty or "Position" not in pool.columns:
+            return pool
+        proj_col = "Projection" if "Projection" in pool.columns else "AvgPointsPerGame"
+        if proj_col not in pool.columns:
+            return pool
+        projection = pd.to_numeric(pool[proj_col], errors="coerce")
+        is_qb = pool["Position"].map(lambda value: "QB" in _position_tokens(value))
+        return pool.loc[~(is_qb & (projection < SHOWDOWN_QB_MIN_PROJECTION))].copy()
+
+    def _players_for_optimize(self) -> List[Player]:
+        original = self._player_df
+        if original is None:
+            return super()._players_for_optimize()
+        self._player_df = self._without_backup_quarterbacks(original)
+        try:
+            if self._player_df.empty:
+                raise RuntimeError(
+                    "No players left after removing quarterbacks under "
+                    f"{SHOWDOWN_QB_MIN_PROJECTION:.1f} points."
+                )
+            return super()._players_for_optimize()
+        finally:
+            self._player_df = original
 
     @staticmethod
     def _football_pos(player: Player) -> str:
@@ -876,6 +982,18 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             if self._baseline_projection(player) <= SHOWDOWN_MIN_PROJECTION:
                 optimizer.player_pool.remove_player(player)
 
+    def _apply_confirmed_quarterbacks(self, optimizer, players: List[Player]) -> None:
+        """Drop quarterbacks the user did not confirm as starters."""
+        allowed = self.confirmed_quarterbacks
+        if allowed is None:
+            return
+        for player in players:
+            if self._football_pos(player) != "QB":
+                continue
+            key = (player.full_name.strip(), str(player.team).strip().upper())
+            if key not in allowed:
+                optimizer.player_pool.remove_player(player)
+
     def _flex_salary_floor(self) -> int:
         """Showdown FLEX floor. Cash can raise it. A lock is the only way under $1,200."""
         configured = self.flex_min_salary
@@ -923,6 +1041,27 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         if len(cheap) <= cap:
             return
         optimizer.add_players_group(PlayersGroup(cheap, max_from_group=cap))
+
+    def _apply_same_team_rb_limit(self, optimizer, players: List[Player]) -> None:
+        """At most ``max_rbs_per_team`` running backs from one team.
+
+        Captain and flex rows of the same back are separate players in the
+        pool, and a lineup can take only one of those rows. Capping the rows
+        from a team at the same number caps the backs.
+        """
+        if self.max_rbs_per_team is None:
+            return
+        cap = int(self.max_rbs_per_team)
+        by_team: Dict[str, List[Player]] = {}
+        for player in players:
+            if self._football_pos(player) != "RB":
+                continue
+            by_team.setdefault(player.team, []).append(player)
+        for team_rbs in by_team.values():
+            distinct = {player.full_name for player in team_rbs}
+            if len(distinct) <= cap:
+                continue
+            optimizer.add_players_group(PlayersGroup(team_rbs, max_from_group=cap))
 
     def _apply_game_script(self, optimizer, players: List[Player]) -> None:
         if not self.game_script_correlation:
@@ -1065,9 +1204,11 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         self._apply_captain_eligibility(optimizer, players)
         self._apply_dst_ban(optimizer, players)
         self._apply_projection_floor(optimizer, players)
+        self._apply_confirmed_quarterbacks(optimizer, players)
         self._apply_flex_salary_floor(optimizer, players)
         self._apply_locked_players(optimizer)
         self._apply_cheap_player_cap(optimizer, players)
+        self._apply_same_team_rb_limit(optimizer, players)
         self._apply_game_script(optimizer, players)
         self._apply_kicker_limit(optimizer, players)
         self._apply_dst_limit(optimizer, players)

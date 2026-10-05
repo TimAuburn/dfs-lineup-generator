@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -25,11 +26,15 @@ from src.data_loader import (
 from src.exporter import lineups_to_dk_upload_csv, upload_columns_for
 from src.optimizer import (
     DK_SALARY_CAP,
+    SHOWDOWN_QB_MIN_PROJECTION,
     STANDARD_TIER_FLOOR,
     classic_gpp_rule_check,
+    default_starting_quarterbacks,
     get_nfl_optimizer,
     optimize_tiered_salaries,
+    quarterback_label,
     tiered_lineup_counts,
+    unique_quarterbacks,
 )
 from src.parser import DKCSVValidationError, is_inactive_injury, parse_dk_csv
 from src.vegas_cache import fetch_vegas_lines, format_cache_status
@@ -361,6 +366,7 @@ def _collect_strategy_overrides(
             ban_dst=preset_cfg.ban_dst,
             max_below_salary_players=preset_cfg.max_below_salary_players,
             below_salary_threshold=preset_cfg.below_salary_threshold,
+            max_rbs_per_team=preset_cfg.max_rbs_per_team,
         )
         preset_uses_window = (
             preset_cfg.min_salary_cap is not None or preset_cfg.max_salary_cap is not None
@@ -489,6 +495,7 @@ def _apply_strategy_overrides(optimizer: Any, overrides: Dict[str, Any]) -> None
             ban_dst=bool(overrides.get("ban_dst", False)),
             max_below_salary_players=overrides.get("max_below_salary_players"),
             below_salary_threshold=overrides.get("below_salary_threshold"),
+            max_rbs_per_team=overrides.get("max_rbs_per_team"),
         )
 
     optimizer.set_max_repeating_players(overrides.get("max_repeating_players"))
@@ -496,6 +503,9 @@ def _apply_strategy_overrides(optimizer: Any, overrides: Dict[str, Any]) -> None
 
 
 _init_state()
+
+# None until a Showdown pool is loaded. An empty list excludes every quarterback.
+confirmed_qb_keys: List[Tuple[str, str]] | None = None
 
 # ---------------------------------------------------------------------------
 # Sidebar — format, preset, and editable overrides
@@ -554,6 +564,60 @@ with st.sidebar:
             st.caption(f"Leaving out {len(inactive_names)}: {preview}{extra}")
         elif exclude_inactive:
             st.caption("No OUT, IR, or Doubtful players in this pool.")
+
+    if (
+        contest_format is ContestFormat.SHOWDOWN
+        and loaded_pool is not None
+        and "RosterSlot" in loaded_pool.columns
+    ):
+        qb_table = unique_quarterbacks(loaded_pool)
+        if not qb_table.empty:
+            st.markdown("### Confirmed starting QBs")
+            labels = [
+                quarterback_label(row.Name, row.TeamAbbrev, row.Projection)
+                for row in qb_table.itertuples(index=False)
+            ]
+            label_to_key = {
+                quarterback_label(row.Name, row.TeamAbbrev, row.Projection): (
+                    str(row.Name),
+                    str(row.TeamAbbrev),
+                )
+                for row in qb_table.itertuples(index=False)
+            }
+            starter_keys = set(default_starting_quarterbacks(loaded_pool))
+            default_labels = [
+                label for label in labels if label_to_key[label] in starter_keys
+            ]
+            slate_key = hashlib.sha1("\n".join(labels).encode()).hexdigest()[:12]
+            selected_labels = st.multiselect(
+                "Confirmed starting QBs",
+                options=labels,
+                default=default_labels,
+                key=f"starting_qbs_{slate_key}",
+                label_visibility="collapsed",
+                help=(
+                    "Starts with the highest-projected quarterback on each team. "
+                    "Any quarterback you leave out is excluded. "
+                    "Quarterbacks under 12.0 points are removed automatically."
+                ),
+            )
+            confirmed_qb_keys = [label_to_key[label] for label in selected_labels]
+            left_out = [label for label in labels if label not in set(selected_labels)]
+            under_floor = (
+                qb_table.loc[
+                    qb_table["Projection"] < SHOWDOWN_QB_MIN_PROJECTION, "Name"
+                ]
+                .astype(str)
+                .tolist()
+            )
+            if left_out:
+                st.caption("Leaving out " + ", ".join(left_out) + ".")
+            if under_floor:
+                st.caption(
+                    "Under 12.0 points, removed: "
+                    + ", ".join(dict.fromkeys(under_floor))
+                    + "."
+                )
 
     lo, hi = preset_cfg.lineup_count_range
     lineup_count = st.number_input(
@@ -853,10 +917,15 @@ with download_col:
 
 if uploaded is not None:
     try:
-        st.session_state.player_pool = parse_dk_csv(
-            uploaded, contest_format=contest_format
-        )
+        parsed_pool = parse_dk_csv(uploaded, contest_format=contest_format)
+        signature = hashlib.sha1(uploaded.getvalue()).hexdigest()
+        pool_changed = st.session_state.get("pool_signature") != signature
+        st.session_state.player_pool = parsed_pool
+        st.session_state.pool_signature = signature
         st.session_state.error = None
+        # Sidebar reads the pool before this upload runs, so refresh once.
+        if pool_changed:
+            st.rerun()
     except DKCSVValidationError as exc:
         st.session_state.error = str(exc)
         st.session_state.player_pool = None
@@ -919,7 +988,7 @@ elif is_showdown:
     lock_note = " Lock a FLEX player under $1,200 to force that punt in."
 st.caption(
     f"{len(pool)} rows loaded · {roster_n}-player roster · salary cap ${DK_SALARY_CAP:,}"
-    f"{injury_note}.{lock_note}"
+    f"{injury_note}.{lock_note} Check Exclude to drop a player."
 )
 editable_cols = ["Name", "Position", "TeamAbbrev", "Salary", "AvgPointsPerGame", "Projection"]
 has_injury_status = (
@@ -931,17 +1000,24 @@ display_extra = [
     if c in pool.columns and (c != "Injury" or has_injury_status)
 ]
 editor_frame = pool[editable_cols + display_extra].copy()
+editor_frame.insert(0, "Exclude", False)
 editor_frame.insert(0, "Lock", False)
 edited = st.data_editor(
     editor_frame,
     width="stretch",
     hide_index=True,
     height=320,
-    disabled=[c for c in editor_frame.columns if c not in {"Projection", "Lock"}],
+    disabled=[
+        c for c in editor_frame.columns if c not in {"Projection", "Lock", "Exclude"}
+    ],
     column_config={
         "Lock": st.column_config.CheckboxColumn(
             "Lock",
             help="Force this player into the lineup, including a cash punt under the salary floor.",
+        ),
+        "Exclude": st.column_config.CheckboxColumn(
+            "Exclude",
+            help="Leave this player out. On Showdown, both the captain and flex rows are dropped.",
         ),
         "Projection": st.column_config.NumberColumn(
             "Projection", help="Editable custom projection (FPPG)"
@@ -951,14 +1027,37 @@ edited = st.data_editor(
     key=f"player_editor_{contest_format.value}",
 )
 
-working_pool = pool.copy()
+working_pool = pool.copy().reset_index(drop=True)
+edited = edited.reset_index(drop=True)
 working_pool["Projection"] = pd.to_numeric(edited["Projection"], errors="coerce").fillna(
     working_pool["AvgPointsPerGame"]
-).values
+).to_numpy()
+excluded_keys: set[Tuple[str, str]] = set()
+if "Exclude" in edited.columns and "Name" in edited.columns:
+    excluded_mask = edited["Exclude"].fillna(False).astype(bool)
+    if excluded_mask.any() and "TeamAbbrev" in edited.columns:
+        excluded_keys = {
+            (str(name).strip(), str(team).strip().upper())
+            for name, team in zip(
+                edited.loc[excluded_mask, "Name"],
+                edited.loc[excluded_mask, "TeamAbbrev"],
+            )
+        }
+        person = list(
+            zip(
+                working_pool["Name"].astype(str).str.strip(),
+                working_pool["TeamAbbrev"].astype(str).str.strip().str.upper(),
+            )
+        )
+        working_pool = working_pool.loc[
+            [pair not in excluded_keys for pair in person]
+        ].copy()
 
 if generate:
     progress = st.progress(0, text="Building optimizer…")
     try:
+        if working_pool.empty:
+            raise RuntimeError("Every player is excluded.")
         solve_lines = frame_to_lines(edited_vegas)
         solve_teams = set(working_pool["TeamAbbrev"].astype(str).str.strip().str.upper())
         solve_low_total = is_showdown and low_scoring_showdown(solve_lines, solve_teams)
@@ -969,6 +1068,12 @@ if generate:
         locked_ids = []
         if "Lock" in edited.columns and "ID" in edited.columns:
             locked_mask = edited["Lock"].fillna(False).astype(bool)
+            if excluded_keys and "Name" in edited.columns and "TeamAbbrev" in edited.columns:
+                keep_lock = [
+                    (str(name).strip(), str(team).strip().upper()) not in excluded_keys
+                    for name, team in zip(edited["Name"], edited["TeamAbbrev"])
+                ]
+                locked_mask = locked_mask & pd.Series(keep_lock, index=edited.index)
             locked_ids = edited.loc[locked_mask, "ID"].astype(str).tolist()
         optimizer.set_locked_players(locked_ids)
         apply_preset(
@@ -978,6 +1083,8 @@ if generate:
             jitter_seed=int(jitter_seed),
         )
         _apply_strategy_overrides(optimizer, strategy_overrides)
+        if confirmed_qb_keys is not None and hasattr(optimizer, "set_confirmed_quarterbacks"):
+            optimizer.set_confirmed_quarterbacks(confirmed_qb_keys)
         if solve_low_total and preset is not ContestPreset.SHOWDOWN_CASH:
             optimizer.allow_kicker_captain = True
             optimizer.kicker_max_exposure = KICKER_CAPTAIN_MAX_EXPOSURE

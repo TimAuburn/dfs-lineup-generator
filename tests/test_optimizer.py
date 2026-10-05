@@ -21,6 +21,7 @@ from src.optimizer import (
     NFLShowdownOptimizer,
     apply_projection_jitter,
     classic_gpp_rule_check,
+    default_starting_quarterbacks,
     get_nfl_optimizer,
     optimize_tiered_salaries,
     overlap_cap_for_slate,
@@ -500,6 +501,7 @@ def test_showdown_pipeline_roster_salary_and_export():
     assert optimizer.ban_dst is True
     assert optimizer.max_below_salary_players == 1
     assert optimizer.below_salary_threshold == 4_500
+    assert optimizer.max_rbs_per_team == 1
     assert optimizer.allow_kicker_captain is False
     assert optimizer.min_teams == 2
 
@@ -525,6 +527,8 @@ def test_showdown_pipeline_roster_salary_and_export():
             if listed < 4_500:
                 cheap += 1
         assert cheap <= 1
+        rb_counts = lineup.loc[lineup["Position"] == "RB"].groupby("Team").size()
+        assert rb_counts.empty or int(rb_counts.max()) <= 1
         teams = set(lineup["Team"])
         assert len(teams) >= 2
         # Same player cannot appear as both CPT and FLEX.
@@ -594,6 +598,155 @@ def test_showdown_cash_bans_dst_and_limits_scrubs():
     assert int(flex["Salary"].min()) >= 3_500
 
 
+def test_showdown_cash_blocks_two_running_backs_from_one_team():
+    rows = []
+    rows += _showdown_pair("QB", "Patrick Mahomes", 100, "KC", 9000, 16)
+    rows += _showdown_pair("RB", "Star Back", 110, "KC", 8000, 30)
+    rows += _showdown_pair("RB", "Backup Back", 120, "KC", 7000, 28)
+    rows += _showdown_pair("WR", "Xavier Worthy", 130, "KC", 6000, 10)
+    rows += _showdown_pair("TE", "Travis Kelce", 140, "KC", 5500, 9)
+    rows += _showdown_pair("QB", "Josh Allen", 200, "BUF", 8800, 15)
+    rows += _showdown_pair("RB", "James Cook", 210, "BUF", 6500, 12)
+    rows += _showdown_pair("WR", "Khalil Shakir", 220, "BUF", 6000, 11)
+    rows += _showdown_pair("WR", "Keon Coleman", 230, "BUF", 5000, 10)
+    rows += _showdown_pair("TE", "Dalton Kincaid", 240, "BUF", 5200, 9)
+
+    def _solve(max_rbs_per_team):
+        optimizer = NFLShowdownOptimizer()
+        optimizer.jitter_pct = (0.0, 0.0)
+        optimizer.load_from_dataframe(pd.DataFrame(rows))
+        optimizer.configure_showdown_rules(
+            min_salary_cap=30_000,
+            max_salary_cap=50_000,
+            min_teams=2,
+            game_script_correlation=False,
+            max_kickers=None,
+            allow_kicker_captain=False,
+            ban_dst=True,
+            flex_min_salary=1_200,
+            captain_positions=("QB", "RB", "WR"),
+            captain_min_salary=8_000,
+            max_rbs_per_team=max_rbs_per_team,
+        )
+        optimizer.set_lineup_count(1)
+        return optimizer.generate_lineups()[0]
+
+    open_lineup = _solve(None)
+    open_kc = open_lineup[
+        (open_lineup["Team"] == "KC") & (open_lineup["Position"] == "RB")
+    ]
+    assert set(open_kc["Name"]) == {"Star Back", "Backup Back"}
+
+    capped = _solve(1)
+    for team, group in capped.loc[capped["Position"] == "RB"].groupby("Team"):
+        assert len(group) <= 1, team
+    capped_kc = set(
+        capped.loc[
+            (capped["Team"] == "KC") & (capped["Position"] == "RB"),
+            "Name",
+        ]
+    )
+    assert len(capped_kc) == 1
+    assert capped_kc <= {"Star Back", "Backup Back"}
+
+
+def test_default_starting_quarterbacks_picks_one_per_team():
+    rows = []
+    rows += _showdown_pair("QB", "Patrick Mahomes", 100, "KC", 10000, 22.5)
+    rows += _showdown_pair("QB", "Cooper Rush", 110, "KC", 4000, 5.10)
+    rows += _showdown_pair("QB", "Josh Allen", 200, "BUF", 11000, 23.0)
+    rows += _showdown_pair("QB", "Mitchell Trubisky", 210, "BUF", 4500, 8.0)
+    starters = default_starting_quarterbacks(pd.DataFrame(rows))
+    assert starters == [("Josh Allen", "BUF"), ("Patrick Mahomes", "KC")]
+
+
+def test_showdown_drops_backup_quarterbacks_under_12():
+    rows = []
+    rows += _showdown_pair("QB", "Patrick Mahomes", 100, "KC", 10000, 18)
+    rows += _showdown_pair("QB", "Cooper Rush", 110, "KC", 5000, 10)
+    rows += _showdown_pair("RB", "Isiah Pacheco", 120, "KC", 7000, 12)
+    rows += _showdown_pair("WR", "Xavier Worthy", 130, "KC", 6000, 11)
+    rows += _showdown_pair("TE", "Travis Kelce", 140, "KC", 6500, 10)
+    rows += _showdown_pair("QB", "Josh Allen", 200, "BUF", 9800, 17)
+    rows += _showdown_pair("RB", "James Cook", 210, "BUF", 6800, 12)
+    rows += _showdown_pair("WR", "Khalil Shakir", 220, "BUF", 6000, 11)
+    rows += _showdown_pair("TE", "Dalton Kincaid", 230, "BUF", 5500, 9)
+    rows += _showdown_pair("WR", "Keon Coleman", 240, "BUF", 5200, 10)
+
+    def _solve(locked_ids=None, confirmed=None):
+        optimizer = NFLShowdownOptimizer()
+        optimizer.jitter_pct = (0.0, 0.0)
+        optimizer.load_from_dataframe(pd.DataFrame(rows))
+        optimizer.configure_showdown_rules(
+            min_salary_cap=30_000,
+            max_salary_cap=50_000,
+            min_teams=2,
+            game_script_correlation=False,
+            max_kickers=None,
+            allow_kicker_captain=False,
+            ban_dst=True,
+            flex_min_salary=1_200,
+        )
+        if locked_ids is not None:
+            optimizer.set_locked_players(locked_ids)
+        if confirmed is not None:
+            optimizer.set_confirmed_quarterbacks(confirmed)
+        optimizer.set_lineup_count(1)
+        return optimizer.generate_lineups()[0]
+
+    lineup = _solve()
+    assert "Cooper Rush" not in set(lineup["Name"])
+    # A 10-point backup's captain row is 15 points and is still removed.
+    assert "110" not in set(lineup["ID"].astype(str))
+    assert "111" not in set(lineup["ID"].astype(str))
+
+    locked = _solve(locked_ids=["110"])
+    assert "Cooper Rush" not in set(locked["Name"])
+
+    kept = _solve(confirmed=[("Patrick Mahomes", "KC"), ("Josh Allen", "BUF")])
+    assert "Cooper Rush" not in set(kept["Name"])
+
+
+def test_showdown_confirmed_quarterbacks_drop_other_qbs():
+    rows = []
+    rows += _showdown_pair("QB", "Patrick Mahomes", 100, "KC", 9000, 16)
+    rows += _showdown_pair("QB", "High Backup", 110, "KC", 7000, 30)
+    rows += _showdown_pair("RB", "Isiah Pacheco", 120, "KC", 6000, 10)
+    rows += _showdown_pair("WR", "Xavier Worthy", 130, "KC", 5500, 10)
+    rows += _showdown_pair("TE", "Travis Kelce", 140, "KC", 5200, 9)
+    rows += _showdown_pair("QB", "Josh Allen", 200, "BUF", 8800, 15)
+    rows += _showdown_pair("RB", "James Cook", 210, "BUF", 6500, 12)
+    rows += _showdown_pair("WR", "Khalil Shakir", 220, "BUF", 6000, 11)
+    rows += _showdown_pair("WR", "Keon Coleman", 230, "BUF", 5000, 10)
+    rows += _showdown_pair("TE", "Dalton Kincaid", 240, "BUF", 5200, 9)
+
+    def _solve(confirmed):
+        optimizer = NFLShowdownOptimizer()
+        optimizer.jitter_pct = (0.0, 0.0)
+        optimizer.load_from_dataframe(pd.DataFrame(rows))
+        optimizer.configure_showdown_rules(
+            min_salary_cap=30_000,
+            max_salary_cap=50_000,
+            min_teams=2,
+            game_script_correlation=False,
+            max_kickers=None,
+            allow_kicker_captain=False,
+            ban_dst=True,
+            flex_min_salary=1_200,
+        )
+        if confirmed is not None:
+            optimizer.set_confirmed_quarterbacks(confirmed)
+        optimizer.set_lineup_count(1)
+        return optimizer.generate_lineups()[0]
+
+    open_lineup = _solve(None)
+    assert "High Backup" in set(open_lineup["Name"])
+
+    capped = _solve([("Patrick Mahomes", "KC"), ("Josh Allen", "BUF")])
+    assert "High Backup" not in set(capped["Name"])
+    assert {"Patrick Mahomes", "Josh Allen"} & set(capped["Name"])
+
+
 def test_showdown_gpp_preset_with_game_script():
     optimizer = get_nfl_optimizer(ContestFormat.SHOWDOWN)
     optimizer.load_from_csv(MOCK_SHOWDOWN_CSV)
@@ -606,6 +759,7 @@ def test_showdown_gpp_preset_with_game_script():
     assert optimizer.max_repeating_players == 3
     assert optimizer.max_kickers == 1
     assert optimizer.allow_kicker_captain is False
+    assert optimizer.max_rbs_per_team is None
 
     lineups = optimizer.generate_lineups()
     assert len(lineups) == 3
