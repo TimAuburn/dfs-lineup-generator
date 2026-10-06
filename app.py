@@ -23,6 +23,14 @@ from src.data_loader import (
     low_scoring_showdown,
     projection_adjustment_labels,
 )
+from src.env_config import (
+    ODDS_API_KEY_ENV,
+    WEATHER_API_KEY_ENV,
+    get_odds_api_key,
+    get_weather_api_key,
+    key_status,
+    load_env,
+)
 from src.exporter import lineups_to_dk_upload_csv, upload_columns_for
 from src.optimizer import (
     DK_SALARY_CAP,
@@ -38,6 +46,13 @@ from src.optimizer import (
 )
 from src.parser import DKCSVValidationError, is_inactive_injury, parse_dk_csv
 from src.vegas_cache import fetch_vegas_lines, format_cache_status
+from src.weather import (
+    WIND_THRESHOLD_MPH,
+    apply_weather_projections,
+    fetch_slate_weather,
+    format_weather_cache_status,
+    weather_adjustment_labels,
+)
 from src.presets import (
     ContestFormat,
     ContestPreset,
@@ -52,6 +67,8 @@ from src.presets import (
     get_preset_config,
     presets_for_format,
 )
+
+load_env()
 
 st.set_page_config(
     page_title="DK NFL Lineup Optimizer",
@@ -78,6 +95,8 @@ def _init_state() -> None:
         "vegas_editor_version": 0,
         "vegas_source_json": None,
         "vegas_frame": None,
+        "weather_by_home": {},
+        "weather_source_json": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -727,16 +746,16 @@ with st.sidebar:
             key=_preset_key(preset, "min_exposure_pct"),
         )
 
+    st.markdown("### API keys")
+    st.caption(key_status(ODDS_API_KEY_ENV))
+    st.caption(key_status(WEATHER_API_KEY_ENV))
+    st.caption("Secrets load from a local `.env` (see `.env.example`). Not entered in the UI.")
+
     st.markdown("### Vegas odds")
-    odds_api_key = st.text_input(
-        "The Odds API Key",
-        type="password",
-        key="odds_api_key",
-        help="Optional. A saved cache is used when this is blank or the request fails.",
-    )
+    odds_api_key = get_odds_api_key()
     force_vegas_refresh = st.button("Force Refresh Vegas Odds", key="force_vegas_refresh")
     fetched_lines = fetch_vegas_lines(
-        api_key=str(odds_api_key).strip() or None,
+        api_key=odds_api_key,
         force_refresh=bool(force_vegas_refresh),
     )
     signature = json.dumps(fetched_lines, sort_keys=True, default=str)
@@ -766,6 +785,30 @@ with st.sidebar:
             ),
             "ITT": st.column_config.NumberColumn("ITT", format="%.1f", width="small"),
         },
+    )
+
+    st.markdown("### Weather")
+    weather_api_key = get_weather_api_key()
+    force_weather_refresh = st.button("Force Refresh Weather", key="force_weather_refresh")
+    weather_pool = st.session_state.player_pool
+    fetched_weather = fetch_slate_weather(
+        weather_pool,
+        api_key=weather_api_key,
+        force_refresh=bool(force_weather_refresh),
+    )
+    weather_sig = json.dumps(fetched_weather, sort_keys=True, default=str)
+    if (
+        force_weather_refresh
+        or st.session_state.weather_by_home is None
+        or weather_sig != st.session_state.weather_source_json
+    ):
+        st.session_state.weather_source_json = weather_sig
+        st.session_state.weather_by_home = fetched_weather
+    st.caption(format_weather_cache_status())
+    st.caption(
+        f"Outdoor games with sustained wind over {WIND_THRESHOLD_MPH:.0f} mph "
+        "downgrade QB/WR/TE (−10%) and K (−15%) before optimize; RB/DST unchanged. "
+        "Indoor / enclosed home stadiums skip weather."
     )
 
     strategy_overrides["tiered_salary"] = bool(enable_tiered_salary)
@@ -836,6 +879,10 @@ extra_setting_rows.append(
 itt_labels = projection_adjustment_labels(st.session_state.player_pool, vegas_lines)
 if itt_labels:
     extra_setting_rows.append(("Vegas ITT", "No adjustment", ", ".join(itt_labels)))
+weather_by_home = st.session_state.weather_by_home or {}
+wind_labels = weather_adjustment_labels(st.session_state.player_pool, weather_by_home)
+if wind_labels:
+    extra_setting_rows.append(("Wind weather", "No adjustment", ", ".join(wind_labels)))
 if low_scoring_game:
     extra_setting_rows.append(
         (
@@ -1061,7 +1108,15 @@ if generate:
         solve_lines = frame_to_lines(edited_vegas)
         solve_teams = set(working_pool["TeamAbbrev"].astype(str).str.strip().str.upper())
         solve_low_total = is_showdown and low_scoring_showdown(solve_lines, solve_teams)
+        solve_weather = fetch_slate_weather(
+            working_pool,
+            api_key=get_weather_api_key(),
+            force_refresh=False,
+        )
+        st.session_state.weather_by_home = solve_weather
+        # Vegas ITT first, then wind downgrades, then optimize.
         solve_pool = apply_vegas_projections(working_pool, solve_lines)
+        solve_pool = apply_weather_projections(solve_pool, solve_weather)
         optimizer = get_nfl_optimizer(contest_format)
         optimizer.set_exclude_inactive(exclude_inactive)
         optimizer.load_from_dataframe(solve_pool)
