@@ -1,8 +1,9 @@
-"""Weather Company (weather.com) fetch + wind-based projection downgrades.
+"""National Weather Service fetch + wind-based projection downgrades.
 
 Tunable wind constants live at module top. Pipeline order: Vegas ITT
 adjustments first, then weather (call ``apply_weather_projections`` before
 optimize). Indoor / enclosed home stadiums skip wind downgrades entirely.
+api.weather.gov does not use an API key.
 """
 
 from __future__ import annotations
@@ -14,7 +15,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Sequence
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import pandas as pd
@@ -24,9 +24,12 @@ from .stadiums import STADIUMS, get_stadium, is_outdoor_stadium
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CACHE_PATH = PROJECT_ROOT / "data" / "weather_cache.json"
 
-# Weather Company Currents On Demand (api.weather.com).
-WEATHER_URL = "https://api.weather.com/v3/wx/observations/current"
+# National Weather Service. A User-Agent is required; an API key is not.
+NWS_API_ROOT = "https://api.weather.gov"
+NWS_USER_AGENT = "dfs-lineup-generator (https://github.com/TimAuburn/dfs-lineup-generator)"
 DEFAULT_TTL_SECONDS = 60 * 60  # 1 hour
+_KM_H_TO_MPH = 0.621371
+_M_S_TO_MPH = 2.236936
 
 # ---------------------------------------------------------------------------
 # Wind downgrade knobs (easy to find / tune)
@@ -135,26 +138,43 @@ def format_weather_cache_status(
     return f"Weather: Cached (Last updated: {minutes} minutes ago)"
 
 
+def _nws_quantity(node: object, *, to: str) -> Optional[float]:
+    """Convert an NWS quantitative value to mph or degrees Fahrenheit."""
+    if not isinstance(node, dict):
+        return None
+    raw = node.get("value")
+    if raw is None:
+        return None
+    try:
+        number = float(raw)
+    except (TypeError, ValueError):
+        return None
+    unit = str(node.get("unitCode") or "").lower().replace(" ", "")
+    if to == "mph":
+        if "m_s" in unit:
+            return number * _M_S_TO_MPH
+        if "km_h" in unit or "km/h" in unit:
+            return number * _KM_H_TO_MPH
+        if "mph" in unit or "mi_h" in unit:
+            return number
+        # Observations report wind in kilometers per hour when the unit is omitted.
+        return number * _KM_H_TO_MPH
+    if "degf" in unit or unit.endswith(":f"):
+        return number
+    return number * 9.0 / 5.0 + 32.0
+
+
 def parse_weather_payload(payload: object, *, home_team: str) -> dict:
-    """Normalize a Currents On Demand JSON body for one home stadium."""
+    """Normalize one NWS station observation for a home stadium."""
     if not isinstance(payload, dict):
         raise ValueError("Weather payload must be an object")
-    wind_raw = payload.get("windSpeed")
-    gust_raw = payload.get("windGust")
-    temp_raw = payload.get("temperature")
-    phrase = payload.get("wxPhraseLong") or payload.get("wxPhraseShort") or ""
-    try:
-        wind_mph = float(wind_raw) if wind_raw is not None else None
-    except (TypeError, ValueError):
-        wind_mph = None
-    try:
-        wind_gust = float(gust_raw) if gust_raw is not None else None
-    except (TypeError, ValueError):
-        wind_gust = None
-    try:
-        temperature = float(temp_raw) if temp_raw is not None else None
-    except (TypeError, ValueError):
-        temperature = None
+    props = payload.get("properties")
+    if not isinstance(props, dict):
+        props = payload
+    wind_mph = _nws_quantity(props.get("windSpeed"), to="mph")
+    wind_gust = _nws_quantity(props.get("windGust"), to="mph")
+    temperature = _nws_quantity(props.get("temperature"), to="f")
+    phrase = props.get("textDescription") or ""
     stadium = get_stadium(home_team)
     return {
         "home_team": str(home_team).upper(),
@@ -164,19 +184,37 @@ def parse_weather_payload(payload: object, *, home_team: str) -> dict:
         "wind_gust_mph": wind_gust,
         "temperature_f": temperature,
         "phrase": str(phrase),
-        "applies_wind": should_apply_wind(
-            str(home_team).upper(), wind_mph
-        ),
+        "applies_wind": should_apply_wind(str(home_team).upper(), wind_mph),
     }
 
 
 def _http_get(url: str, timeout: float = 20) -> object:
-    request = Request(url, headers={"Accept": "application/json"})
+    request = Request(
+        url,
+        headers={
+            "User-Agent": NWS_USER_AGENT,
+            "Accept": "application/geo+json",
+        },
+    )
     with urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
-def _fetch_one(home_team: str, api_key: str) -> dict:
+def _first_station_id(payload: object) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    features = payload.get("features") or []
+    if not features or not isinstance(features[0], dict):
+        return ""
+    props = features[0].get("properties") or {}
+    ident = props.get("stationIdentifier")
+    if ident:
+        return str(ident).strip()
+    station_url = str(props.get("@id") or features[0].get("id") or "")
+    return station_url.rstrip("/").rsplit("/", 1)[-1].strip()
+
+
+def _fetch_one(home_team: str) -> dict:
     stadium = get_stadium(home_team)
     if stadium is None:
         return {
@@ -201,17 +239,17 @@ def _fetch_one(home_team: str, api_key: str) -> dict:
             "phrase": "Indoor / enclosed — weather skipped",
             "applies_wind": False,
         }
-    query = urlencode(
-        {
-            "geocode": f"{stadium.lat},{stadium.lon}",
-            "units": "e",
-            "language": "en-US",
-            "format": "json",
-            "apiKey": api_key,
-        }
-    )
-    body = _http_get(f"{WEATHER_URL}?{query}")
-    return parse_weather_payload(body, home_team=home_team)
+    points = _http_get(f"{NWS_API_ROOT}/points/{stadium.lat:.4f},{stadium.lon:.4f}")
+    stations_url = ""
+    if isinstance(points, dict):
+        stations_url = str((points.get("properties") or {}).get("observationStations") or "")
+    if not stations_url:
+        raise ValueError(f"No NWS observation stations for {home_team}")
+    station_id = _first_station_id(_http_get(stations_url))
+    if not station_id:
+        raise ValueError(f"No NWS station id for {home_team}")
+    observation = _http_get(f"{NWS_API_ROOT}/stations/{station_id}/observations/latest")
+    return parse_weather_payload(observation, home_team=home_team)
 
 
 def home_teams_from_pool(pool: Optional[pd.DataFrame]) -> list[str]:
@@ -228,7 +266,6 @@ def home_teams_from_pool(pool: Optional[pd.DataFrame]) -> list[str]:
 
 def fetch_weather_for_homes(
     home_teams: Sequence[str],
-    api_key: Optional[str] = None,
     force_refresh: bool = False,
     *,
     cache_path: Path = CACHE_PATH,
@@ -238,7 +275,7 @@ def fetch_weather_for_homes(
     Return ``{HOME_ABBR: weather_dict}`` for the given home stadiums.
 
     Indoor homes are recorded without an HTTP call. Outdoor homes use the
-    Weather Company Currents On Demand endpoint. Fresh cache entries are reused.
+    National Weather Service latest observation. Fresh cache entries are reused.
     """
     current = now or datetime.now()
     wanted = [str(t).strip().upper() for t in home_teams if str(t).strip()]
@@ -274,31 +311,13 @@ def fetch_weather_for_homes(
         else:
             missing.append(team)
 
-    key = (api_key or "").strip()
     if not missing:
-        return result
-    if not key:
-        for team in missing:
-            if team in cached and isinstance(cached[team], dict):
-                result[team] = cached[team]
-            else:
-                result[team] = {
-                    "home_team": team,
-                    "stadium": (get_stadium(team).name if get_stadium(team) else ""),
-                    "is_outdoor": is_outdoor_stadium(team),
-                    "wind_mph": None,
-                    "wind_gust_mph": None,
-                    "temperature_f": None,
-                    "phrase": "",
-                    "applies_wind": False,
-                    "error": "missing_api_key",
-                }
         return result
 
     updated = dict(cached)
     for team in missing:
         try:
-            info = _fetch_one(team, key)
+            info = _fetch_one(team)
         except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
             if team in cached and isinstance(cached[team], dict):
                 info = cached[team]
@@ -323,7 +342,6 @@ def fetch_weather_for_homes(
 
 def fetch_slate_weather(
     pool: Optional[pd.DataFrame],
-    api_key: Optional[str] = None,
     force_refresh: bool = False,
     *,
     cache_path: Path = CACHE_PATH,
@@ -332,7 +350,6 @@ def fetch_slate_weather(
     """Fetch weather for every home stadium on the loaded slate."""
     return fetch_weather_for_homes(
         home_teams_from_pool(pool),
-        api_key=api_key,
         force_refresh=force_refresh,
         cache_path=cache_path,
         now=now,

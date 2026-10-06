@@ -25,9 +25,7 @@ from src.data_loader import (
 )
 from src.env_config import (
     ODDS_API_KEY_ENV,
-    WEATHER_API_KEY_ENV,
     get_odds_api_key,
-    get_weather_api_key,
     key_status,
     load_env,
 )
@@ -45,6 +43,7 @@ from src.optimizer import (
     unique_quarterbacks,
 )
 from src.parser import DKCSVValidationError, is_inactive_injury, parse_dk_csv
+from src.sleeper import overlay_sleeper_projections, sleeper_status_caption
 from src.vegas_cache import fetch_vegas_lines, format_cache_status
 from src.weather import (
     WIND_THRESHOLD_MPH,
@@ -97,6 +96,8 @@ def _init_state() -> None:
         "vegas_frame": None,
         "weather_by_home": {},
         "weather_source_json": None,
+        "sleeper_summary": None,
+        "sleeper_version": 0,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -748,8 +749,7 @@ with st.sidebar:
 
     st.markdown("### API keys")
     st.caption(key_status(ODDS_API_KEY_ENV))
-    st.caption(key_status(WEATHER_API_KEY_ENV))
-    st.caption("Secrets load from a local `.env` (see `.env.example`). Not entered in the UI.")
+    st.caption("The odds key loads from a local `.env` (see `.env.example`). Weather uses the National Weather Service and does not need a key.")
 
     st.markdown("### Vegas odds")
     odds_api_key = get_odds_api_key()
@@ -788,12 +788,10 @@ with st.sidebar:
     )
 
     st.markdown("### Weather")
-    weather_api_key = get_weather_api_key()
     force_weather_refresh = st.button("Force Refresh Weather", key="force_weather_refresh")
     weather_pool = st.session_state.player_pool
     fetched_weather = fetch_slate_weather(
         weather_pool,
-        api_key=weather_api_key,
         force_refresh=bool(force_weather_refresh),
     )
     weather_sig = json.dumps(fetched_weather, sort_keys=True, default=str)
@@ -965,9 +963,17 @@ with download_col:
 if uploaded is not None:
     try:
         parsed_pool = parse_dk_csv(uploaded, contest_format=contest_format)
+        force_sleeper = bool(st.session_state.pop("sleeper_force", False))
+        parsed_pool, sleeper_summary = overlay_sleeper_projections(
+            parsed_pool,
+            force_refresh=force_sleeper,
+        )
+        if force_sleeper:
+            st.session_state.sleeper_version = int(st.session_state.sleeper_version) + 1
         signature = hashlib.sha1(uploaded.getvalue()).hexdigest()
         pool_changed = st.session_state.get("pool_signature") != signature
         st.session_state.player_pool = parsed_pool
+        st.session_state.sleeper_summary = sleeper_summary
         st.session_state.pool_signature = signature
         st.session_state.error = None
         # Sidebar reads the pool before this upload runs, so refresh once.
@@ -1021,6 +1027,11 @@ inactive_in_pool = (
     else 0
 )
 st.subheader("Player pool")
+sleeper_refresh = st.button("Refresh Sleeper projections", key="refresh_sleeper")
+if sleeper_refresh:
+    st.session_state.sleeper_force = True
+    st.rerun()
+st.caption(sleeper_status_caption(st.session_state.sleeper_summary))
 injury_note = (
     f" · {inactive_in_pool} row(s) marked OUT/IR/Doubtful"
     if inactive_in_pool
@@ -1067,11 +1078,12 @@ edited = st.data_editor(
             help="Leave this player out. On Showdown, both the captain and flex rows are dropped.",
         ),
         "Projection": st.column_config.NumberColumn(
-            "Projection", help="Editable custom projection (FPPG)"
+            "Projection",
+            help="Sleeper PPR projection for the current NFL week. Edit to override.",
         ),
         "Salary": st.column_config.NumberColumn("Salary", format="$%d"),
     },
-    key=f"player_editor_{contest_format.value}",
+    key=f"player_editor_{contest_format.value}_{int(st.session_state.sleeper_version)}",
 )
 
 working_pool = pool.copy().reset_index(drop=True)
@@ -1110,7 +1122,6 @@ if generate:
         solve_low_total = is_showdown and low_scoring_showdown(solve_lines, solve_teams)
         solve_weather = fetch_slate_weather(
             working_pool,
-            api_key=get_weather_api_key(),
             force_refresh=False,
         )
         st.session_state.weather_by_home = solve_weather

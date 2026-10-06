@@ -11,9 +11,7 @@ import pytest
 
 from src.env_config import (
     ODDS_API_KEY_ENV,
-    WEATHER_API_KEY_ENV,
     get_odds_api_key,
-    get_weather_api_key,
     key_status,
     load_env,
 )
@@ -34,29 +32,22 @@ from src.weather import (
 )
 
 
-def test_load_env_reads_odds_and_weather_keys(tmp_path, monkeypatch):
+def test_load_env_reads_odds_key(tmp_path, monkeypatch):
     env_file = tmp_path / ".env"
-    env_file.write_text(
-        "ODDS_API_KEY=odds-secret\nWEATHER_API_KEY=wx-secret\n",
-        encoding="utf-8",
-    )
+    env_file.write_text("ODDS_API_KEY=odds-secret\n", encoding="utf-8")
     monkeypatch.delenv(ODDS_API_KEY_ENV, raising=False)
-    monkeypatch.delenv(WEATHER_API_KEY_ENV, raising=False)
     load_env(env_file, override=True)
     assert get_odds_api_key() == "odds-secret"
-    assert get_weather_api_key() == "wx-secret"
     assert "loaded from .env" in key_status(ODDS_API_KEY_ENV)
-    assert "secret" not in key_status(WEATHER_API_KEY_ENV)
+    assert "secret" not in key_status(ODDS_API_KEY_ENV)
 
 
 def test_blank_env_keys_are_none(tmp_path, monkeypatch):
     env_file = tmp_path / ".env"
-    env_file.write_text("ODDS_API_KEY=\nWEATHER_API_KEY=   \n", encoding="utf-8")
+    env_file.write_text("ODDS_API_KEY=\n", encoding="utf-8")
     monkeypatch.delenv(ODDS_API_KEY_ENV, raising=False)
-    monkeypatch.delenv(WEATHER_API_KEY_ENV, raising=False)
     load_env(env_file, override=True)
     assert get_odds_api_key() is None
-    assert get_weather_api_key() is None
     assert "missing" in key_status(ODDS_API_KEY_ENV)
 
 
@@ -184,14 +175,20 @@ def test_apply_weather_downgrades_outdoor_high_wind_only():
 
 
 def test_parse_weather_payload_sets_applies_wind():
+    # 30.577 km/h is 19 mph. NWS reports Celsius and km/h.
     payload = {
-        "windSpeed": 19,
-        "windGust": 28,
-        "temperature": 48,
-        "wxPhraseLong": "Windy",
+        "properties": {
+            "windSpeed": {"unitCode": "wmoUnit:km_h-1", "value": 30.577},
+            "windGust": {"unitCode": "wmoUnit:km_h-1", "value": 45.062},
+            "temperature": {"unitCode": "wmoUnit:degC", "value": 8.8889},
+            "textDescription": "Windy",
+        }
     }
     outdoor = parse_weather_payload(payload, home_team="BUF")
-    assert outdoor["wind_mph"] == 19.0
+    assert outdoor["wind_mph"] == pytest.approx(19.0, abs=0.02)
+    assert outdoor["wind_gust_mph"] == pytest.approx(28.0, abs=0.02)
+    assert outdoor["temperature_f"] == pytest.approx(48.0, abs=0.05)
+    assert outdoor["phrase"] == "Windy"
     assert outdoor["applies_wind"] is True
     indoor = parse_weather_payload(payload, home_team="NO")
     assert indoor["is_outdoor"] is False
@@ -204,34 +201,45 @@ def test_fetch_weather_skips_indoor_and_mocks_http(tmp_path, monkeypatch):
 
     def _ok(url: str, timeout: float = 20):
         calls.append(url)
-        assert "api.weather.com/v3/wx/observations/current" in url
-        assert "apiKey=wx-secret" in url
-        assert "geocode=" in url
-        return {
-            "windSpeed": 24,
-            "windGust": 31,
-            "temperature": 55,
-            "wxPhraseLong": "Windy",
-        }
+        assert "api.weather.gov" in url
+        assert "apiKey" not in url
+        if "/points/" in url:
+            return {
+                "properties": {
+                    "observationStations": "https://api.weather.gov/gridpoints/BUF/1,1/stations"
+                }
+            }
+        if url.endswith("/stations"):
+            return {"features": [{"properties": {"stationIdentifier": "KBUF"}}]}
+        if url.endswith("/observations/latest"):
+            return {
+                "properties": {
+                    "windSpeed": {"unitCode": "wmoUnit:km_h-1", "value": 38.624},
+                    "windGust": {"unitCode": "wmoUnit:km_h-1", "value": 49.89},
+                    "temperature": {"unitCode": "wmoUnit:degC", "value": 12.7778},
+                    "textDescription": "Windy",
+                }
+            }
+        raise AssertionError(url)
 
     monkeypatch.setattr("src.weather._http_get", _ok)
     now = datetime(2026, 10, 5, 12, 0)
     result = fetch_weather_for_homes(
         ["DAL", "BUF"],
-        api_key="wx-secret",
         force_refresh=True,
         cache_path=cache,
         now=now,
     )
     assert result["DAL"]["is_outdoor"] is False
     assert result["DAL"]["applies_wind"] is False
-    assert result["BUF"]["wind_mph"] == 24.0
+    assert result["BUF"]["wind_mph"] == pytest.approx(24.0, abs=0.02)
     assert result["BUF"]["applies_wind"] is True
-    # Only outdoor BUF should hit the network.
-    assert len(calls) == 1
+    # Points, station list, then the latest observation. Indoor DAL is skipped.
+    assert len(calls) == 3
+    assert calls[0].startswith("https://api.weather.gov/points/")
+    assert calls[2].endswith("/stations/KBUF/observations/latest")
     saved = json.loads(cache.read_text(encoding="utf-8"))
     assert "BUF" in saved["data"]
-    assert "wx-secret" not in cache.read_text(encoding="utf-8")
 
 
 def test_fetch_weather_uses_cache_and_survives_errors(tmp_path, monkeypatch):
@@ -256,7 +264,6 @@ def test_fetch_weather_uses_cache_and_survives_errors(tmp_path, monkeypatch):
     # Fresh cache: no network.
     fresh = fetch_weather_for_homes(
         ["BUF"],
-        api_key="wx-secret",
         force_refresh=False,
         cache_path=cache,
         now=datetime(2026, 10, 5, 12, 30),
@@ -266,19 +273,17 @@ def test_fetch_weather_uses_cache_and_survives_errors(tmp_path, monkeypatch):
     # Force refresh fails → fall back to cache.
     fallback = fetch_weather_for_homes(
         ["BUF"],
-        api_key="wx-secret",
         force_refresh=True,
         cache_path=cache,
         now=datetime(2026, 10, 5, 18, 0),
     )
     assert fallback["BUF"]["wind_mph"] == 20.0
 
-    # Missing key with no cache entry for SEA.
+    # A failed fetch with no cache entry is recorded, without asking for a key.
     empty = fetch_weather_for_homes(
         ["SEA"],
-        api_key=None,
         force_refresh=True,
         cache_path=tmp_path / "missing.json",
         now=datetime(2026, 10, 5, 18, 0),
     )
-    assert empty["SEA"]["error"] == "missing_api_key"
+    assert empty["SEA"]["error"] == "fetch_failed"

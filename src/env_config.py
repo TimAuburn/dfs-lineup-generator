@@ -13,7 +13,6 @@ DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
 
 # Canonical names used across the app and documented in ``.env.example``.
 ODDS_API_KEY_ENV = "ODDS_API_KEY"
-WEATHER_API_KEY_ENV = "WEATHER_API_KEY"
 
 _LOADED = False
 
@@ -50,11 +49,6 @@ def get_env_key(name: str, *, dotenv_path: Optional[Path] = None) -> Optional[st
 def get_odds_api_key(*, dotenv_path: Optional[Path] = None) -> Optional[str]:
     """The Odds API key (``ODDS_API_KEY``)."""
     return get_env_key(ODDS_API_KEY_ENV, dotenv_path=dotenv_path)
-
-
-def get_weather_api_key(*, dotenv_path: Optional[Path] = None) -> Optional[str]:
-    """Weather Company / weather.com API key (``WEATHER_API_KEY``)."""
-    return get_env_key(WEATHER_API_KEY_ENV, dotenv_path=dotenv_path)
 
 
 def key_status(name: str, *, dotenv_path: Optional[Path] = None) -> str:
