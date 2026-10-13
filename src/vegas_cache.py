@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime, time as clock_time
+from datetime import date, datetime, time as clock_time, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.error import HTTPError, URLError
@@ -20,8 +20,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CACHE_PATH = PROJECT_ROOT / "data" / "vegas_cache.json"
 
 ODDS_URL = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds/"
+SLEEPER_STATE_URL = "https://api.sleeper.app/v1/state/nfl"
 SUNDAY_TTL_SECONDS = 30 * 60
 DEFAULT_TTL_SECONDS = 6 * 60 * 60
+# Sleeper's season_start_date is the Wednesday that opens week 1.
+NFL_WEEK_DAYS = 7
 
 # Odds API full names -> DraftKings abbreviations.
 TEAM_ABBREVIATIONS = {
@@ -175,19 +178,96 @@ def _market_outcomes(book: dict, market_key: str) -> list:
     return []
 
 
-def parse_odds_payload(payload: object) -> dict:
-    """Turn an Odds API response into ``{ABBR: {total, itt, spread, game}}``."""
+def nfl_week_window(season_start: str, week: int) -> tuple[datetime, datetime]:
+    """UTC window for one regular-season week, Wednesday through the next Wednesday."""
+    start_day = date.fromisoformat(str(season_start)[:10])
+    begin_day = start_day + timedelta(days=(int(week) - 1) * NFL_WEEK_DAYS)
+    begin = datetime.combine(begin_day, clock_time.min, tzinfo=timezone.utc)
+    return begin, begin + timedelta(days=NFL_WEEK_DAYS)
+
+
+def _commence_time(event: dict) -> Optional[datetime]:
+    raw = event.get("commence_time")
+    if not raw:
+        return None
+    text = str(raw).strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _week_window_from_state(state: object) -> Optional[tuple[datetime, datetime]]:
+    """Current regular-season week from the Sleeper NFL state payload."""
+    if not isinstance(state, dict):
+        return None
+    if str(state.get("season_type") or "regular") != "regular":
+        return None
+    start = state.get("season_start_date")
+    week = state.get("week")
+    if not start or not week:
+        return None
+    try:
+        return nfl_week_window(str(start), int(week))
+    except (TypeError, ValueError):
+        return None
+
+
+def current_nfl_week_window(_now: Optional[datetime] = None) -> Optional[tuple[datetime, datetime]]:
+    """Week window for ``now``. A Sleeper miss leaves the caller unfiltered."""
+    try:
+        state = _http_get(SLEEPER_STATE_URL)
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
+        return None
+    return _week_window_from_state(state)
+
+
+def _in_window(
+    commence: Optional[datetime],
+    commence_from: Optional[datetime],
+    commence_to: Optional[datetime],
+) -> bool:
+    if commence_from is None and commence_to is None:
+        return True
+    if commence is None:
+        return False
+    if commence_from is not None and commence < commence_from:
+        return False
+    if commence_to is not None and commence >= commence_to:
+        return False
+    return True
+
+
+def parse_odds_payload(
+    payload: object,
+    *,
+    commence_from: Optional[datetime] = None,
+    commence_to: Optional[datetime] = None,
+) -> dict:
+    """Turn an Odds API response into ``{ABBR: {total, itt, spread, game}}``.
+
+    Games outside ``[commence_from, commence_to)`` are dropped. The feed lists
+    the next week as soon as those lines exist, and a later kickoff used to
+    replace the current week's opponent for the same team.
+    """
     if not isinstance(payload, list):
         raise ValueError("Odds API payload must be a list of games")
     lines: dict = {}
-    for event in payload:
-        if not isinstance(event, dict):
+    events = [event for event in payload if isinstance(event, dict)]
+    events.sort(key=lambda event: _commence_time(event) or datetime.max.replace(tzinfo=timezone.utc))
+    for event in events:
+        if not _in_window(_commence_time(event), commence_from, commence_to):
             continue
         home_name = str(event.get("home_team") or "")
         away_name = str(event.get("away_team") or "")
         home = team_abbreviation(home_name)
         away = team_abbreviation(away_name)
         if not home or not away:
+            continue
+        if home in lines or away in lines:
             continue
         book = _pick_bookmaker(event.get("bookmakers") or [])
         if book is None:
@@ -265,9 +345,14 @@ def fetch_vegas_lines(
     url = (
         f"{ODDS_URL}?apiKey={quote(key)}&regions=us&markets=totals,spreads"
     )
+    window = current_nfl_week_window(current)
     try:
         body = _http_get(url)
-        lines = parse_odds_payload(body)
+        lines = parse_odds_payload(
+            body,
+            commence_from=None if window is None else window[0],
+            commence_to=None if window is None else window[1],
+        )
     except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
         return _cached_data(cache_path)
 

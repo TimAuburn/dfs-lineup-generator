@@ -74,6 +74,22 @@ def test_format_preset_summary_showdown_gpp():
     assert rows["Kicker captain"] == "No"
 
 
+def test_classic_small_gpp_flex_defaults_to_any_and_can_be_rb_or_wr():
+    cfg = get_preset_config(ContestPreset.CLASSIC_SMALL_GPP)
+    rows = dict(format_preset_summary(cfg))
+    assert rows["Flex"] == "Any"
+    actual = config_with_overrides(
+        cfg,
+        lineup_count=cfg.default_lineup_count,
+        overrides={"flex_positions": ("RB", "WR")},
+    )
+    compared = {
+        setting: (default, value)
+        for setting, default, value in format_settings_comparison(cfg, actual)
+    }
+    assert compared["Flex"] == ("Any", "WR or RB")
+
+
 def test_settings_comparison_matches_when_unchanged():
     cfg = get_preset_config(ContestPreset.CLASSIC_SMALL_GPP)
     actual = config_with_overrides(cfg, lineup_count=cfg.default_lineup_count, overrides={})

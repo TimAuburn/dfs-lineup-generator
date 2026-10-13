@@ -17,14 +17,21 @@ from src.exporter import (
 from src.optimizer import (
     DK_SALARY_CAP,
     STANDARD_TIER_FLOOR,
+    GameScriptBucket,
     NFLClassicOptimizer,
     NFLShowdownOptimizer,
     apply_projection_jitter,
     classic_gpp_rule_check,
     default_starting_quarterbacks,
+    drop_backup_players,
+    even_lineup_counts,
+    game_script_summary,
+    games_from_pool,
     get_nfl_optimizer,
+    optimize_game_scripts,
     optimize_tiered_salaries,
     overlap_cap_for_slate,
+    player_exposure_table,
     tiered_lineup_counts,
 )
 from src.parser import (
@@ -660,6 +667,100 @@ def test_default_starting_quarterbacks_picks_one_per_team():
     assert starters == [("Josh Allen", "BUF"), ("Patrick Mahomes", "KC")]
 
 
+def test_drop_backup_players_keeps_the_leader_at_each_spot():
+    pool = pd.DataFrame(
+        [
+            {"ID": "1", "Name": "Patrick Mahomes", "Position": "QB", "TeamAbbrev": "KC", "Projection": 18, "DepthOrder": 1, "DepthPosition": "QB"},
+            {"ID": "2", "Name": "Justin Fields", "Position": "QB", "TeamAbbrev": "KC", "Projection": 40, "DepthOrder": 2, "DepthPosition": "QB"},
+            {"ID": "3", "Name": "Kenneth Walker", "Position": "RB", "TeamAbbrev": "KC", "Projection": 14, "DepthOrder": 1, "DepthPosition": "RB"},
+            {"ID": "4", "Name": "Emmett Johnson", "Position": "RB", "TeamAbbrev": "KC", "Projection": 30, "DepthOrder": 2, "DepthPosition": "RB"},
+            {"ID": "5", "Name": "Rashee Rice", "Position": "WR", "TeamAbbrev": "KC", "Projection": 15, "DepthOrder": 1, "DepthPosition": "SWR"},
+            {"ID": "6", "Name": "Xavier Worthy", "Position": "WR", "TeamAbbrev": "KC", "Projection": 12, "DepthOrder": 2, "DepthPosition": "RWR"},
+            {"ID": "7", "Name": "Jalen Royals", "Position": "WR", "TeamAbbrev": "KC", "Projection": 8, "DepthOrder": 3, "DepthPosition": "LWR"},
+            {"ID": "8", "Name": "Tyquan Thornton", "Position": "WR", "TeamAbbrev": "KC", "Projection": 20, "DepthOrder": 6, "DepthPosition": "LWR"},
+            {"ID": "9", "Name": "Travis Kelce", "Position": "TE", "TeamAbbrev": "KC", "Projection": 10, "DepthOrder": 1, "DepthPosition": "TE"},
+            {"ID": "10", "Name": "Noah Gray", "Position": "TE", "TeamAbbrev": "KC", "Projection": 12, "DepthOrder": 2, "DepthPosition": "TE"},
+            {"ID": "11", "Name": "Harrison Butker", "Position": "K", "TeamAbbrev": "KC", "Projection": 8, "DepthOrder": 1, "DepthPosition": "K"},
+            {"ID": "12", "Name": "Mystery Wideout", "Position": "WR", "TeamAbbrev": "KC", "Projection": 25, "DepthOrder": pd.NA, "DepthPosition": ""},
+            {"ID": "13", "Name": "Chiefs", "Position": "DST", "TeamAbbrev": "KC", "Projection": 7, "DepthOrder": pd.NA, "DepthPosition": ""},
+            {"ID": "14", "Name": "Only QB", "Position": "QB", "TeamAbbrev": "BUF", "Projection": 4, "DepthOrder": pd.NA, "DepthPosition": ""},
+            {"ID": "15", "Name": "Other QB", "Position": "QB", "TeamAbbrev": "BUF", "Projection": 19, "DepthOrder": pd.NA, "DepthPosition": ""},
+        ]
+    )
+    kept = set(drop_backup_players(pool)["Name"])
+    assert kept >= {
+        "Patrick Mahomes",
+        "Kenneth Walker",
+        "Rashee Rice",
+        "Xavier Worthy",
+        "Jalen Royals",
+        "Travis Kelce",
+        "Harrison Butker",
+        "Chiefs",
+        "Other QB",
+    }
+    assert {
+        "Justin Fields",
+        "Emmett Johnson",
+        "Tyquan Thornton",
+        "Noah Gray",
+        "Mystery Wideout",
+        "Only QB",
+    }.isdisjoint(kept)
+
+
+def test_classic_lineup_does_not_start_backups():
+    game = "KC@BUF 10/11/2026 01:00PM ET"
+
+    def row(pid, name, pos, team, salary, proj, order, slot):
+        return {
+            "ID": str(pid),
+            "Name": name,
+            "Position": pos,
+            "Roster Position": pos if pos != "DST" else "DST",
+            "TeamAbbrev": team,
+            "Salary": salary,
+            "Game Info": game,
+            "AvgPointsPerGame": proj,
+            "Projection": proj,
+            "Injury": "",
+            "DepthOrder": order,
+            "DepthPosition": slot,
+        }
+
+    pool = pd.DataFrame(
+        [
+            row(1, "Starter QB", "QB", "KC", 7000, 16, 1, "QB"),
+            row(2, "Backup QB", "QB", "KC", 4500, 40, 2, "QB"),
+            row(3, "Starter RB", "RB", "KC", 6400, 14, 1, "RB"),
+            row(4, "Backup RB", "RB", "KC", 4000, 35, 2, "RB"),
+            row(5, "Second RB", "RB", "BUF", 6000, 13, 1, "RB"),
+            row(6, "Wide One", "WR", "KC", 5800, 12, 1, "LWR"),
+            row(7, "Wide Two", "WR", "KC", 5600, 11, 2, "RWR"),
+            row(8, "Wide Three", "WR", "BUF", 5400, 11, 1, "SWR"),
+            row(9, "Backup WR", "WR", "KC", 3000, 30, 5, "LWR"),
+            row(10, "Starter TE", "TE", "KC", 5000, 10, 1, "TE"),
+            row(11, "Backup TE", "TE", "KC", 3000, 28, 2, "TE"),
+            row(12, "Flex WR", "WR", "BUF", 5200, 10, 2, "RWR"),
+            row(13, "Chiefs", "DST", "KC", 3000, 8, None, ""),
+            row(14, "Other QB", "QB", "BUF", 6800, 15, 1, "QB"),
+        ]
+    )
+    optimizer = NFLClassicOptimizer()
+    optimizer.jitter_pct = (0.0, 0.0)
+    optimizer.load_from_dataframe(pool)
+    optimizer.set_lineup_count(1)
+    lineup = optimizer.generate_lineups()[0]
+    names = set(lineup["Name"])
+    assert "Backup QB" not in names
+    assert "Backup RB" not in names
+    assert "Backup WR" not in names
+    assert "Backup TE" not in names
+    assert "Starter QB" in names or "Other QB" in names
+    assert {"Starter RB", "Second RB"} <= names
+    assert "Starter TE" in names
+
+
 def test_showdown_drops_backup_quarterbacks_under_12():
     rows = []
     rows += _showdown_pair("QB", "Patrick Mahomes", 100, "KC", 10000, 18)
@@ -1195,3 +1296,109 @@ def test_parse_injury_indicator_column():
 def test_get_preset_config_labels():
     assert "Cash" in get_preset_config(ContestPreset.CLASSIC_CASH).label
     assert "Showdown GPP" in get_preset_config(ContestPreset.SHOWDOWN_GPP).label
+
+
+def _game_script_pool() -> pd.DataFrame:
+    """Two games, each with a full skill group, so buckets can avoid each other."""
+    game_a = "DET@ARI 10/11/2026 01:00PM ET"
+    game_b = "SF@SEA 10/11/2026 04:25PM ET"
+    rows = []
+    pid = 1
+    # Game A projections sit above game B so the first lineup stays in DET@ARI
+    # except for the defense, which has to come from the other game.
+    for team, game, base in (
+        ("DET", game_a, 30),
+        ("ARI", game_a, 24),
+        ("SF", game_b, 14),
+        ("SEA", game_b, 12),
+    ):
+        for pos, salary, bump in (
+            ("QB", 6200, 8),
+            ("RB", 5400, 4),
+            ("RB", 4800, 2),
+            ("WR", 5600, 5),
+            ("WR", 5000, 3),
+            ("WR", 4400, 1),
+            ("TE", 4200, 0),
+            ("DST", 2800, -2),
+        ):
+            rows.append(
+                _classic_player(
+                    pos,
+                    f"{team} {pos} {pid}",
+                    pid,
+                    team,
+                    salary,
+                    base + bump,
+                    game,
+                )
+            )
+            pid += 1
+    return pd.DataFrame(rows)
+
+
+def test_game_script_portfolio_stacks_caps_and_overlap():
+    pool = _game_script_pool()
+    assert games_from_pool(pool) == ["DET@ARI", "SF@SEA"]
+    assert even_lineup_counts(3, 20) == [7, 7, 6]
+
+    optimizer = NFLClassicOptimizer()
+    optimizer.jitter_pct = (0.0, 0.0)
+    optimizer.load_from_dataframe(pool)
+    buckets = [
+        GameScriptBucket("DET@ARI", 1, 49_000),
+        GameScriptBucket("SF@SEA", 0, 50_000),
+        GameScriptBucket("SF@SEA", 1, 47_000),
+    ]
+    lineups = optimize_game_scripts(optimizer, buckets, max_repeating_players=4)
+
+    assert [lineup.attrs["game_script"] for lineup in lineups] == ["DET@ARI", "SF@SEA"]
+    assert optimizer.flex_positions is None
+    assert optimizer.exclude_vs_dst is False
+    assert optimizer.enable_qb_stack is False
+    assert optimizer.max_salary_cap is None
+    assert optimizer.min_salary_cap is None
+
+    caps = {"DET@ARI": 49_000, "SF@SEA": 47_000}
+    for lineup in lineups:
+        game = lineup.attrs["game_script"]
+        away, home = game.split("@")
+        qb = lineup.loc[lineup["Slot"] == "QB"].iloc[0]
+        qb_team = str(qb["Team"])
+        assert qb_team in {away, home}
+        opponent = home if qb_team == away else away
+        same_team = lineup[
+            (lineup["Team"] == qb_team) & lineup["Position"].isin(["WR", "TE"])
+        ]
+        bring_back = lineup[
+            (lineup["Team"] == opponent) & lineup["Position"].isin(["RB", "WR", "TE"])
+        ]
+        assert len(same_team) >= 1
+        assert len(bring_back) >= 1
+        flex_pos = str(lineup.loc[lineup["Slot"] == "FLEX", "Position"].iloc[0])
+        assert flex_pos in {"RB", "WR"}
+        dst = lineup.loc[lineup["Position"] == "DST"].iloc[0]
+        facing = lineup[
+            (lineup["Team"] == dst["Opponent"])
+            & lineup["Position"].isin(["RB", "WR", "TE"])
+        ]
+        assert facing.empty
+        assert int(lineup["Salary"].sum()) <= caps[game]
+
+    shared = set(lineups[0]["ID"].astype(str)) & set(lineups[1]["ID"].astype(str))
+    assert len(shared) <= 4
+
+    summary = game_script_summary(lineups)
+    assert summary["Game"].tolist() == ["DET@ARI", "SF@SEA"]
+    assert summary["Lineups"].tolist() == [1, 1]
+    exposure = player_exposure_table(lineups)
+    assert list(exposure.columns) == [
+        "Name",
+        "Team",
+        "Position",
+        "Lineups",
+        "Exposure %",
+    ]
+    assert exposure["Lineups"].is_monotonic_decreasing
+    assert float(exposure["Exposure %"].max()) <= 100.0
+    assert int(exposure.iloc[0]["Lineups"]) == int(exposure["Lineups"].max())

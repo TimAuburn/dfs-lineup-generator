@@ -7,6 +7,7 @@ from typing import Optional
 import pandas as pd
 
 from .optimizer import SKILL_POSITIONS
+from .weather import apply_weather_projections
 
 HIGH_ITT = 26.0
 LOW_ITT = 18.0
@@ -125,6 +126,48 @@ def low_scoring_showdown(lines: dict, teams: Optional[set] = None) -> bool:
         if total is not None and total <= LOW_TOTAL:
             return True
     return False
+
+
+def projection_deltas(
+    pool: pd.DataFrame,
+    lines: dict,
+    weather_by_home: Optional[dict] = None,
+) -> pd.Series:
+    """Signed point change from Vegas ITT and wind, before captain scoring or jitter.
+
+    A positive value is a boost. A negative value is a cut. Quarterbacks,
+    kickers, and defenses stay at 0 unless outdoor wind applies to them.
+    """
+    if pool is None or pool.empty or "Projection" not in pool.columns:
+        return pd.Series(dtype="float64")
+    base = pd.to_numeric(pool["Projection"], errors="coerce")
+    adjusted = apply_vegas_projections(pool, lines or {})
+    adjusted = apply_weather_projections(adjusted, weather_by_home or {})
+    updated = pd.to_numeric(adjusted["Projection"], errors="coerce")
+    return (updated - base).round(2)
+
+
+def apply_projection_delta(
+    pool: pd.DataFrame,
+    lines: dict,
+    weather_by_home: Optional[dict] = None,
+) -> pd.DataFrame:
+    """Return a copy where Projection includes Delta and Sleeper stays original.
+
+    The base is the Sleeper weekly number when that cell is filled, otherwise
+    the current Projection (the DraftKings average for an unmatched player).
+    """
+    updated = pool.copy()
+    if updated.empty or "Projection" not in updated.columns:
+        return updated
+    deltas = projection_deltas(updated, lines, weather_by_home)
+    base = pd.to_numeric(updated["Projection"], errors="coerce")
+    if "Sleeper" in updated.columns:
+        sleeper = pd.to_numeric(updated["Sleeper"], errors="coerce")
+        base = sleeper.where(sleeper.notna(), base)
+    updated["Delta"] = deltas.to_numpy()
+    updated["Projection"] = (base + deltas).round(2).to_numpy()
+    return updated
 
 
 def projection_adjustment_labels(pool: pd.DataFrame, lines: dict) -> list:

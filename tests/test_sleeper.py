@@ -119,7 +119,10 @@ def test_apply_sleeper_replaces_projections_and_drops_inactive():
     by_id = updated.set_index("ID")
     assert matched == 6
     assert by_id.loc["1", "Projection"] == 24.5
+    assert by_id.loc["1", "Sleeper"] == 24.5
+    assert by_id.loc["1", "AvgPointsPerGame"] == 9.0
     assert by_id.loc["10", "Projection"] == 24.5
+    assert by_id.loc["10", "Sleeper"] == 24.5
     assert by_id.loc["2", "Injury"] == "OUT"
     assert is_inactive_injury(by_id.loc["2", "Injury"])
     # Sleeper says Cook is only questionable, so the DK OUT tag is cleared.
@@ -128,12 +131,33 @@ def test_apply_sleeper_replaces_projections_and_drops_inactive():
     assert by_id.loc["4", "Projection"] == 8.4
     assert by_id.loc["5", "Injury"] == "DOUBTFUL"
     assert by_id.loc["6", "Projection"] == 1.5
+    assert pd.isna(by_id.loc["6", "Sleeper"])
 
     active = drop_inactive_players(updated)
     assert "2" not in set(active["ID"])
     assert "5" not in set(active["ID"])
     assert "1" in set(active["ID"])
     assert "3" in set(active["ID"])
+
+
+def test_apply_sleeper_accepts_integer_draftkings_projections():
+    index = index_projections([_record("Josh", "Allen", "BUF", "QB", 21.92)])
+    pool = pd.DataFrame(
+        [
+            {
+                "ID": "1",
+                "Name": "Josh Allen",
+                "Position": "QB",
+                "TeamAbbrev": "BUF",
+                "Projection": 9,
+                "Injury": "",
+            }
+        ]
+    )
+    updated, matched = apply_sleeper_index(pool, index)
+    assert matched == 1
+    assert updated.loc[0, "Projection"] == 21.92
+    assert updated.loc[0, "Sleeper"] == 21.92
 
 
 def test_overlay_uses_cache_and_survives_errors(tmp_path, monkeypatch):
@@ -146,6 +170,27 @@ def test_overlay_uses_cache_and_survives_errors(tmp_path, monkeypatch):
             return {"season": "2026", "week": 4, "season_type": "regular"}
         if "/projections/nfl/2026/4" in url:
             return [_record("Josh", "Allen", "BUF", "QB", 21.0, "Questionable")]
+        if url.endswith("/players/nfl"):
+            return {
+                "1": {
+                    "first_name": "Josh",
+                    "last_name": "Allen",
+                    "position": "QB",
+                    "team": "BUF",
+                    "depth_chart_position": "QB",
+                    "depth_chart_order": 1,
+                    "injury_status": None,
+                },
+                "2": {
+                    "first_name": "Mitchell",
+                    "last_name": "Trubisky",
+                    "position": "QB",
+                    "team": "BUF",
+                    "depth_chart_position": "QB",
+                    "depth_chart_order": 2,
+                    "injury_status": None,
+                },
+            }
         raise AssertionError(url)
 
     monkeypatch.setattr("src.sleeper._http_get", _ok)
@@ -166,10 +211,13 @@ def test_overlay_uses_cache_and_survives_errors(tmp_path, monkeypatch):
         pool, force_refresh=True, cache_path=cache, now=now
     )
     assert updated.loc[0, "Projection"] == 21.0
+    assert updated.loc[0, "Sleeper"] == 21.0
+    assert updated.loc[0, "DepthOrder"] == 1
     assert summary["week"] == 4
     assert summary["matched"] == 1
+    assert summary["has_depth"] is True
     assert summary["ok"] is True
-    assert len(calls) == 2
+    assert len(calls) == 3
     saved = json.loads(cache.read_text(encoding="utf-8"))
     assert "josh allen|BUF" in saved["index"]
 

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 from pydfs_lineup_optimizer import Player, Site, Sport, get_optimizer
-from pydfs_lineup_optimizer.player import GameInfo
+from pydfs_lineup_optimizer.lineup import Lineup
+from pydfs_lineup_optimizer.player import GameInfo, LineupPlayer
 from pydfs_lineup_optimizer.settings import LineupPosition
 from pydfs_lineup_optimizer.stacks import PlayersGroup, PositionsStack
 
@@ -210,6 +212,99 @@ def stack_exposure_for_slate(n_games: int, slate_aware: bool) -> Optional[float]
     if int(n_games) <= SHORT_SLATE_GAME_LIMIT:
         return SHORT_SLATE_STACK_EXPOSURE
     return DEFAULT_STACK_EXPOSURE
+
+
+# Game-script portfolios share at most this many players across every bucket.
+GAME_SCRIPT_MAX_REPEATING = 4
+GAME_SCRIPT_FLEX = ("RB", "WR")
+
+
+@dataclass(frozen=True)
+class GameScriptBucket:
+    """One matchup's share of a Classic portfolio."""
+
+    game: str
+    lineups: int
+    salary_cap: int
+
+
+def games_from_pool(pool: Optional[pd.DataFrame]) -> List[str]:
+    """Distinct ``AWAY@HOME`` labels in first-seen order."""
+    if pool is None or pool.empty or "Game Info" not in pool.columns:
+        return []
+    labels: List[str] = []
+    seen = set()
+    cache: Dict[str, Optional[GameInfo]] = {}
+    for raw in pool["Game Info"].tolist():
+        info = _parse_game_info(raw, cache)
+        if info is None or not info.away_team or not info.home_team:
+            continue
+        label = f"{info.away_team}@{info.home_team}"
+        if label in seen:
+            continue
+        seen.add(label)
+        labels.append(label)
+    return labels
+
+
+def even_lineup_counts(n_games: int, total: int) -> List[int]:
+    """Split ``total`` across games. Remainder lands on the first games."""
+    n_games = int(n_games)
+    total = max(0, int(total))
+    if n_games < 1:
+        return []
+    base, extra = divmod(total, n_games)
+    return [base + (1 if index < extra else 0) for index in range(n_games)]
+
+
+def _teams_in_game(game: str) -> Tuple[str, str]:
+    parts = str(game).split("@")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ValueError(f"game label must look like AWAY@HOME, got {game!r}")
+    return parts[0].strip().upper(), parts[1].strip().upper()
+
+
+def _without_outside_quarterbacks(
+    players: Sequence[Player], teams: Tuple[str, str]
+) -> List[Player]:
+    """Drop quarterbacks who are not in this matchup. Everyone else stays."""
+    allowed = {team.upper() for team in teams}
+    kept: List[Player] = []
+    for player in players:
+        if "QB" in _player_positions(player) and str(player.team).upper() not in allowed:
+            continue
+        kept.append(player)
+    return kept
+
+
+def _lineups_for_overlap(
+    frames: Sequence[pd.DataFrame], players: Sequence[Player]
+) -> List[Lineup]:
+    """Rebuild prior lineups from this bucket's pool so overlap can cross games.
+
+    Players missing from the pool (the other game's quarterback) are skipped.
+    They cannot be rostered here, so leaving them out of the cap does not
+    let the remaining players overlap more than the limit.
+    """
+    by_id = {str(player.id): player for player in players}
+    built: List[Lineup] = []
+    for frame in frames:
+        if frame is None or frame.empty or "ID" not in frame.columns:
+            continue
+        slots = (
+            frame["Slot"].astype(str).tolist()
+            if "Slot" in frame.columns
+            else ["UTIL"] * len(frame)
+        )
+        chosen: List[LineupPlayer] = []
+        for player_id, slot in zip(frame["ID"].astype(str).tolist(), slots):
+            player = by_id.get(player_id)
+            if player is None:
+                continue
+            chosen.append(LineupPlayer(player, slot))
+        if chosen:
+            built.append(Lineup(chosen))
+    return built
 
 
 def _ownership_fraction(raw: object) -> Optional[float]:
@@ -584,6 +679,88 @@ class BaseNFLOptimizer:
         raise NotImplementedError
 
 
+def drop_backup_players(pool: pd.DataFrame) -> pd.DataFrame:
+    """Keep the top Sleeper depth-chart player at each spot.
+
+    Quarterback, running back, tight end, and kicker each keep their
+    depth-chart leader. Wide receivers keep the leader at left, right, and
+    slot. Defenses stay. When a team has no depth chart, every skill player
+    stays except extra quarterbacks, and the highest projection is the one
+    who remains.
+    """
+    if pool.empty or "Position" not in pool.columns or "TeamAbbrev" not in pool.columns:
+        return pool
+    positions = pool["Position"].map(_fantasy_position)
+    if "DepthOrder" not in pool.columns or not pd.to_numeric(pool["DepthOrder"], errors="coerce").notna().any():
+        return _one_quarterback_per_team(pool, positions)
+
+    depth_order = pd.to_numeric(pool["DepthOrder"], errors="coerce")
+    if "DepthPosition" in pool.columns:
+        depth_pos = pool["DepthPosition"].astype(str).str.strip().str.upper()
+    else:
+        depth_pos = pd.Series("", index=pool.index)
+    depth_pos = depth_pos.where(depth_order.notna(), "")
+    teams = pool["TeamAbbrev"].astype(str).str.strip().str.upper()
+    keep = positions.eq("DST").copy()
+    slotted = depth_pos.ne("") & depth_order.notna()
+    if slotted.any():
+        slotted_frame = pd.DataFrame(
+            {
+                "_team": teams.loc[slotted],
+                "_slot": depth_pos.loc[slotted],
+                "_order": depth_order.loc[slotted],
+            },
+            index=pool.index[slotted],
+        )
+        for _, group in slotted_frame.groupby(["_team", "_slot"], sort=False):
+            best = group["_order"].min()
+            keep.loc[group.index[group["_order"] == best]] = True
+    unslotted = ~slotted & ~positions.eq("DST")
+    for idx in pool.index[unslotted]:
+        charted = slotted & teams.eq(teams.loc[idx]) & positions.eq(positions.loc[idx])
+        if not bool(charted.any()):
+            keep.loc[idx] = True
+    return _one_quarterback_per_team(pool.loc[keep].copy(), positions.loc[keep])
+
+
+def _fantasy_position(value: object) -> str:
+    token = str(value or "").split("/")[0].strip().upper()
+    if token in {"DEF", "DST"}:
+        return "DST"
+    if token == "FB":
+        return "RB"
+    return token
+
+
+def _one_quarterback_per_team(pool: pd.DataFrame, positions: pd.Series) -> pd.DataFrame:
+    """Drop extra quarterbacks on teams that have no Sleeper depth chart."""
+    if pool.empty:
+        return pool
+    is_qb = positions.reindex(pool.index).eq("QB")
+    if not bool(is_qb.any()):
+        return pool
+    if "DepthOrder" in pool.columns:
+        depth = pd.to_numeric(pool["DepthOrder"], errors="coerce")
+    else:
+        depth = pd.Series(pd.NA, index=pool.index, dtype="Float64")
+    teams = pool["TeamAbbrev"].astype(str).str.strip().str.upper()
+    proj_col = "Projection" if "Projection" in pool.columns else "AvgPointsPerGame"
+    if proj_col not in pool.columns:
+        return pool
+    projection = pd.to_numeric(pool[proj_col], errors="coerce").fillna(0.0)
+    drop_indexes: list = []
+    quarterbacks = pool.loc[is_qb]
+    for _, group_indexes in quarterbacks.groupby(teams.loc[is_qb], sort=False).groups.items():
+        indexes = list(group_indexes)
+        if depth.loc[indexes].notna().any() or len(indexes) <= 1:
+            continue
+        best = max(indexes, key=lambda idx: (float(projection.loc[idx]), str(pool.loc[idx, "Name"])))
+        drop_indexes.extend(idx for idx in indexes if idx != best)
+    if not drop_indexes:
+        return pool
+    return pool.drop(index=drop_indexes)
+
+
 class NFLClassicOptimizer(BaseNFLOptimizer):
     """Configurable DraftKings NFL Classic lineup generator."""
 
@@ -738,20 +915,56 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
         optimizer.settings.positions = positions
         optimizer.player_pool._remaining_positions = list(positions)
 
-    def generate_lineups(self, n: Optional[int] = None) -> List[pd.DataFrame]:
-        """Generate lineups and return each as a DataFrame of rostered players."""
+    def _players_for_optimize(self) -> List[Player]:
+        original = self._player_df
+        if original is None:
+            return super()._players_for_optimize()
+        trimmed = drop_backup_players(original)
+        if trimmed.empty:
+            raise RuntimeError("No starters left after removing backup players.")
+        self._player_df = trimmed
+        try:
+            return super()._players_for_optimize()
+        finally:
+            self._player_df = original
+
+    def generate_lineups(
+        self,
+        n: Optional[int] = None,
+        *,
+        existing_lineups: Optional[Sequence[pd.DataFrame]] = None,
+        quarterback_teams: Optional[Tuple[str, str]] = None,
+        game_script: Optional[str] = None,
+    ) -> List[pd.DataFrame]:
+        """Generate lineups and return each as a DataFrame of rostered players.
+
+        ``existing_lineups`` are earlier lineups from this portfolio. Shared
+        players with those lineups stay at or under ``max_repeating_players``.
+        ``quarterback_teams`` keeps only that game's quarterbacks.
+        """
         count = self.lineup_count if n is None else int(n)
         if not 1 <= count <= 150:
             raise ValueError("lineup count must be between 1 and 150")
         players = self._players_for_optimize()
+        if quarterback_teams is not None:
+            players = _without_outside_quarterbacks(players, quarterback_teams)
+            if not any("QB" in _player_positions(player) for player in players):
+                label = game_script or "@".join(quarterback_teams)
+                raise RuntimeError(f"No quarterbacks left for {label}.")
         optimizer = self._build_optimizer(players)
+        exclude = _lineups_for_overlap(existing_lineups or [], players)
         raw_lineups = list(
             optimizer.optimize(
                 count,
                 max_exposure=self.max_exposure,
+                exclude_lineups=exclude or None,
             )
         )
-        return [self.format_lineup(lineup) for lineup in raw_lineups]
+        frames = [self.format_lineup(lineup) for lineup in raw_lineups]
+        if game_script:
+            for frame in frames:
+                frame.attrs["game_script"] = game_script
+        return frames
 
 
 class NFLShowdownOptimizer(BaseNFLOptimizer):
@@ -1373,6 +1586,115 @@ def optimize_tiered_salaries(
         optimizer.set_min_salary_cap(previous_min)
         optimizer.set_max_salary_cap(previous_max)
     return lineups
+
+
+_GAME_SCRIPT_FIELDS = (
+    "min_salary_cap",
+    "max_salary_cap",
+    "enable_qb_stack",
+    "stack_pass_catchers",
+    "enable_bring_back",
+    "bring_back_position",
+    "require_wr_in_stack",
+    "slate_aware_gpp",
+    "flex_positions",
+    "exclude_vs_dst",
+    "max_repeating_players",
+)
+
+
+def optimize_game_scripts(
+    optimizer: "NFLClassicOptimizer",
+    buckets: Sequence[GameScriptBucket],
+    max_repeating_players: int = GAME_SCRIPT_MAX_REPEATING,
+) -> List[pd.DataFrame]:
+    """Solve one Classic bucket per game, then cap overlap across the portfolio.
+
+    Each bucket uses that game's quarterback, one same-team pass catcher, an
+    opposing skill player, a WR/RB flex, no skill player against the defense,
+    and that bucket's salary cap. Salary, stack, flex, and overlap settings
+    are restored when the portfolio finishes.
+    """
+    if not isinstance(optimizer, NFLClassicOptimizer):
+        raise TypeError("Game-script allocation is for Classic lineups.")
+    repeating = int(max_repeating_players)
+    if repeating < 1:
+        raise ValueError("max repeating players must be at least 1")
+    saved = {name: getattr(optimizer, name) for name in _GAME_SCRIPT_FIELDS}
+    prior: List[pd.DataFrame] = []
+    try:
+        optimizer.set_qb_stack(
+            True, pass_catchers=1, bring_back=True, bring_back_position="SKILL"
+        )
+        optimizer.require_wr_in_stack = False
+        optimizer.slate_aware_gpp = False
+        optimizer.flex_positions = GAME_SCRIPT_FLEX
+        optimizer.exclude_vs_dst = True
+        optimizer.set_max_repeating_players(repeating)
+        optimizer.set_min_salary_cap(None)
+        for bucket in buckets:
+            count = int(bucket.lineups)
+            if count < 0:
+                raise ValueError("lineup count must be >= 0")
+            if count == 0:
+                continue
+            away, home = _teams_in_game(bucket.game)
+            optimizer.set_max_salary_cap(int(bucket.salary_cap))
+            prior.extend(
+                optimizer.generate_lineups(
+                    count,
+                    existing_lineups=prior,
+                    quarterback_teams=(away, home),
+                    game_script=f"{away}@{home}",
+                )
+            )
+        return prior
+    finally:
+        for name, value in saved.items():
+            setattr(optimizer, name, value)
+
+
+def game_script_summary(lineups: Sequence[pd.DataFrame]) -> pd.DataFrame:
+    """Lineup counts per game, in the order the games were solved."""
+    counts: Dict[str, int] = {}
+    order: List[str] = []
+    for lineup in lineups:
+        game = str(lineup.attrs.get("game_script") or "")
+        if game not in counts:
+            order.append(game)
+            counts[game] = 0
+        counts[game] += 1
+    if not order:
+        return pd.DataFrame(columns=["Game", "Lineups"])
+    return pd.DataFrame(
+        {"Game": order, "Lineups": [counts[game] for game in order]}
+    )
+
+
+def player_exposure_table(lineups: Sequence[pd.DataFrame]) -> pd.DataFrame:
+    """How often each player appears in the batch, highest exposure first."""
+    columns = ["Name", "Team", "Position", "Lineups", "Exposure %"]
+    total = len(lineups)
+    if total == 0:
+        return pd.DataFrame(columns=columns)
+    pieces = [
+        lineup[["ID", "Name", "Team", "Position"]].copy()
+        for lineup in lineups
+        if not lineup.empty
+    ]
+    if not pieces:
+        return pd.DataFrame(columns=columns)
+    stacked = pd.concat(pieces, ignore_index=True)
+    grouped = (
+        stacked.groupby(["ID", "Name", "Team", "Position"], as_index=False)
+        .size()
+        .rename(columns={"size": "Lineups"})
+    )
+    grouped["Exposure %"] = (grouped["Lineups"] / total * 100).round(1)
+    grouped = grouped.sort_values(
+        ["Lineups", "Name"], ascending=[False, True], kind="mergesort"
+    ).reset_index(drop=True)
+    return grouped.drop(columns=["ID"])
 
 
 def get_nfl_optimizer(contest_format: ContestFormat | str) -> BaseNFLOptimizer:

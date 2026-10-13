@@ -17,7 +17,7 @@ if str(ROOT) not in sys.path:
 
 from src.data_loader import (
     KICKER_CAPTAIN_MAX_EXPOSURE,
-    apply_vegas_projections,
+    apply_projection_delta,
     frame_to_lines,
     lines_to_frame,
     low_scoring_showdown,
@@ -34,10 +34,17 @@ from src.optimizer import (
     DK_SALARY_CAP,
     SHOWDOWN_QB_MIN_PROJECTION,
     STANDARD_TIER_FLOOR,
+    GameScriptBucket,
     classic_gpp_rule_check,
     default_starting_quarterbacks,
+    drop_backup_players,
+    even_lineup_counts,
+    game_script_summary,
+    games_from_pool,
     get_nfl_optimizer,
+    optimize_game_scripts,
     optimize_tiered_salaries,
+    player_exposure_table,
     quarterback_label,
     tiered_lineup_counts,
     unique_quarterbacks,
@@ -47,7 +54,6 @@ from src.sleeper import overlay_sleeper_projections, sleeper_status_caption
 from src.vegas_cache import fetch_vegas_lines, format_cache_status
 from src.weather import (
     WIND_THRESHOLD_MPH,
-    apply_weather_projections,
     fetch_slate_weather,
     format_weather_cache_status,
     weather_adjustment_labels,
@@ -146,16 +152,83 @@ def _extra_setting_rows(
     return rows
 
 
+def _game_script_buckets(preset: ContestPreset, lineup_count: int) -> List[GameScriptBucket]:
+    """Editable per-game lineup counts and salary caps for a loaded Classic pool."""
+    pool = st.session_state.get("player_pool")
+    games = games_from_pool(pool) if isinstance(pool, pd.DataFrame) else []
+    if not games:
+        st.caption("Upload a salary file to assign lineups to games.")
+        return []
+    signature = st.session_state.get("pool_signature") or "none"
+    default = pd.DataFrame(
+        {
+            "Game": games,
+            "Lineups": even_lineup_counts(len(games), int(lineup_count)),
+            "Salary cap": [DK_SALARY_CAP] * len(games),
+        }
+    )
+    edited = st.data_editor(
+        default,
+        hide_index=True,
+        width="stretch",
+        disabled=["Game"],
+        num_rows="fixed",
+        column_config={
+            "Game": st.column_config.TextColumn("Game"),
+            "Lineups": st.column_config.NumberColumn(
+                "Lineups",
+                min_value=0,
+                max_value=150,
+                step=1,
+                format="%d",
+            ),
+            "Salary cap": st.column_config.NumberColumn(
+                "Salary cap",
+                min_value=1,
+                max_value=DK_SALARY_CAP,
+                step=100,
+                format="$%d",
+                help=(
+                    "Maximum salary for lineups in this game. "
+                    "A lower cap is the discount tier."
+                ),
+            ),
+        },
+        key=f"game_script_alloc_{preset.value}_{signature}",
+    )
+    counts = pd.to_numeric(edited["Lineups"], errors="coerce")
+    caps = pd.to_numeric(edited["Salary cap"], errors="coerce")
+    if counts.isna().any() or caps.isna().any() or (caps.fillna(0) <= 0).any():
+        st.error("Enter a lineup count and a salary cap for every game.")
+        return [
+            GameScriptBucket(str(game), 0, DK_SALARY_CAP) for game in games
+        ]
+    assigned = int(counts.sum())
+    if assigned != int(lineup_count):
+        st.error(
+            f"Lineup counts add up to {assigned}. "
+            f"They need to add up to {int(lineup_count)}."
+        )
+    else:
+        st.caption("Lineups share at most 4 players across these games.")
+    return [
+        GameScriptBucket(str(game), int(count), int(cap))
+        for game, count, cap in zip(edited["Game"], counts, caps)
+    ]
+
+
 def _collect_strategy_overrides(
     contest_format: ContestFormat,
     preset: ContestPreset,
     preset_cfg: PresetConfig,
-) -> Tuple[Dict[str, Any], List[str]]:
+    lineup_count: int,
+) -> Tuple[Dict[str, Any], List[str], Optional[List[GameScriptBucket]]]:
     """
     Render editable strategy controls seeded from the active preset.
 
-    Returns a dict of override values to apply after ``apply_preset``, plus a
-    list of human-readable labels for fields that differ from preset defaults.
+    Returns override values to apply after ``apply_preset``, labels for fields
+    that differ from the preset, and game-script buckets when that allocation
+    is on. The bucket list is None when the toggle is off.
     """
     overrides: Dict[str, Any] = {}
     changed: List[str] = []
@@ -258,20 +331,18 @@ def _collect_strategy_overrides(
             value=preset_cfg.exclude_vs_dst,
             key=_preset_key(preset, "exclude_vs_dst"),
         )
-        flex_choice = None
-        if preset is ContestPreset.CLASSIC_LARGE_GPP:
-            flex_labels = [label for label, _positions in FLEX_POSITION_LABELS]
-            preset_flex = flex_position_label(preset_cfg.flex_positions)
-            flex_choice = st.radio(
-                "Flex position",
-                options=flex_labels,
-                index=flex_labels.index(preset_flex) if preset_flex in flex_labels else 0,
-                key=_preset_key(preset, "flex_position"),
-                help=(
-                    "WR or RB keeps the tight end in the TE spot. "
-                    "A lineup then cannot add another tight end in the flex."
-                ),
-            )
+        flex_labels = [label for label, _positions in FLEX_POSITION_LABELS]
+        preset_flex = flex_position_label(preset_cfg.flex_positions)
+        flex_choice = st.radio(
+            "Flex position",
+            options=flex_labels,
+            index=flex_labels.index(preset_flex) if preset_flex in flex_labels else 0,
+            key=_preset_key(preset, "flex_position"),
+            help=(
+                "WR or RB fills the flex with a running back or wide receiver. "
+                "The tight end stays in the TE spot."
+            ),
+        )
 
         overrides.update(
             enable_qb_stack=bool(enable_qb_stack),
@@ -477,7 +548,23 @@ def _collect_strategy_overrides(
     ) > 1e-9:
         changed.append("Ownership cap")
 
-    return overrides, changed
+    game_script_buckets: Optional[List[GameScriptBucket]] = None
+    if contest_format is ContestFormat.CLASSIC:
+        enable_game_script = st.checkbox(
+            "Enable Game-Script Portfolio Allocation",
+            value=False,
+            key=_preset_key(preset, "game_script_allocation"),
+            help=(
+                "Split this batch across games. Each game uses that game's "
+                "quarterback, one same-team pass catcher, and an opposing "
+                "skill player. Flex is WR or RB, and no skill player faces "
+                "the defense. Lineups share at most 4 players."
+            ),
+        )
+        if enable_game_script:
+            game_script_buckets = _game_script_buckets(preset, int(lineup_count))
+
+    return overrides, changed, game_script_buckets
 
 
 def _apply_strategy_overrides(optimizer: Any, overrides: Dict[str, Any]) -> None:
@@ -657,8 +744,10 @@ with st.sidebar:
         )
 
     with st.expander("Adjust strategy", expanded=True):
-        strategy_overrides, strategy_changed = _collect_strategy_overrides(
-            contest_format, preset, preset_cfg
+        strategy_overrides, strategy_changed, game_script_buckets = (
+            _collect_strategy_overrides(
+                contest_format, preset, preset_cfg, lineup_count=int(lineup_count)
+            )
         )
 
     st.markdown("### Salary settings")
@@ -700,7 +789,12 @@ with st.sidebar:
         key=_preset_key(preset, "discount_cap"),
         help="Maximum salary for lineups that leave money on the table.",
     )
-    if enable_tiered_salary:
+    if game_script_buckets is not None and enable_tiered_salary:
+        st.caption(
+            "Game-script allocation uses each game's salary cap. "
+            "Tiered salary is left off for this run."
+        )
+    if enable_tiered_salary and game_script_buckets is None:
         full_cap_n, discount_n = tiered_lineup_counts(
             int(lineup_count), float(leave_money_pct) / 100.0
         )
@@ -1032,6 +1126,26 @@ if sleeper_refresh:
     st.session_state.sleeper_force = True
     st.rerun()
 st.caption(sleeper_status_caption(st.session_state.sleeper_summary))
+if not is_showdown:
+    considered = pool
+    if exclude_inactive and "Injury" in pool.columns:
+        considered = pool.loc[~pool["Injury"].map(is_inactive_injury)].copy()
+    starters = drop_backup_players(considered)
+    starter_ids = set(starters["ID"].astype(str)) if "ID" in starters.columns else set()
+    backup_names = (
+        considered.loc[~considered["ID"].astype(str).isin(starter_ids), "Name"]
+        .astype(str)
+        .drop_duplicates()
+        .tolist()
+        if "ID" in considered.columns
+        else []
+    )
+    if backup_names:
+        preview = ", ".join(backup_names[:4])
+        extra = f" +{len(backup_names) - 4}" if len(backup_names) > 4 else ""
+        st.caption(f"Leaving out {len(backup_names)} backups: {preview}{extra}")
+    elif "DepthOrder" in pool.columns and pd.to_numeric(pool["DepthOrder"], errors="coerce").notna().any():
+        st.caption("No backup players in this pool.")
 injury_note = (
     f" · {inactive_in_pool} row(s) marked OUT/IR/Doubtful"
     if inactive_in_pool
@@ -1048,7 +1162,19 @@ st.caption(
     f"{len(pool)} rows loaded · {roster_n}-player roster · salary cap ${DK_SALARY_CAP:,}"
     f"{injury_note}.{lock_note} Check Exclude to drop a player."
 )
-editable_cols = ["Name", "Position", "TeamAbbrev", "Salary", "AvgPointsPerGame", "Projection"]
+if "Sleeper" not in pool.columns:
+    pool = pool.copy()
+    pool["Sleeper"] = pd.Series(pd.NA, index=pool.index, dtype="Float64")
+editable_cols = [
+    "Name",
+    "Position",
+    "TeamAbbrev",
+    "Salary",
+    "AvgPointsPerGame",
+    "Sleeper",
+    "Projection",
+    "Delta",
+]
 has_injury_status = (
     "Injury" in pool.columns and pool["Injury"].astype(str).str.strip().ne("").any()
 )
@@ -1057,6 +1183,11 @@ display_extra = [
     for c in ["ID", "Name + ID", "Roster Position", "RosterSlot", "Game Info", "Ownership", "Injury"]
     if c in pool.columns and (c != "Injury" or has_injury_status)
 ]
+if "DepthOrder" in pool.columns and pd.to_numeric(pool["DepthOrder"], errors="coerce").notna().any():
+    display_extra.append("DepthOrder")
+if "DepthPosition" in pool.columns and pool["DepthPosition"].astype(str).str.strip().ne("").any():
+    display_extra.append("DepthPosition")
+pool = apply_projection_delta(pool, vegas_lines, weather_by_home)
 editor_frame = pool[editable_cols + display_extra].copy()
 editor_frame.insert(0, "Exclude", False)
 editor_frame.insert(0, "Lock", False)
@@ -1077,13 +1208,52 @@ edited = st.data_editor(
             "Exclude",
             help="Leave this player out. On Showdown, both the captain and flex rows are dropped.",
         ),
+        "AvgPointsPerGame": st.column_config.NumberColumn(
+            "DraftKings",
+            format="%.2f",
+            help="Average points per game from the DraftKings salary file.",
+        ),
+        "Sleeper": st.column_config.NumberColumn(
+            "Sleeper",
+            format="%.2f",
+            help="Original Sleeper weekly PPR projection. This column does not include Delta.",
+        ),
         "Projection": st.column_config.NumberColumn(
             "Projection",
-            help="Sleeper PPR projection for the current NFL week. Edit to override.",
+            format="%.2f",
+            help=(
+                "Sleeper, or the DraftKings average when Sleeper is blank, plus Delta. "
+                "This is the number the optimizer uses. Edit to override."
+            ),
+        ),
+        "Delta": st.column_config.NumberColumn(
+            "Delta",
+            format="%+.2f",
+            help=(
+                "Points already added to or removed from Projection. "
+                "Vegas implied team total moves RB, WR, and TE by +5% at 26 or above, "
+                "or -5% at 18 or below. Outdoor wind can cut the number further. "
+                "Sleeper stays the original weekly value."
+            ),
         ),
         "Salary": st.column_config.NumberColumn("Salary", format="$%d"),
+        "DepthOrder": st.column_config.NumberColumn(
+            "Depth",
+            format="%d",
+            help="Sleeper depth chart order. 1 is the top player at that spot.",
+        ),
+        "DepthPosition": st.column_config.TextColumn(
+            "Depth spot",
+            help="Sleeper depth chart spot, such as QB, RB, LWR, RWR, or SWR.",
+        ),
     },
-    key=f"player_editor_{contest_format.value}_{int(st.session_state.sleeper_version)}",
+    key=(
+        f"player_editor_{contest_format.value}_"
+        f"{(st.session_state.sleeper_summary or {}).get('season')}-"
+        f"{(st.session_state.sleeper_summary or {}).get('week')}-"
+        f"{(st.session_state.sleeper_summary or {}).get('matched')}-"
+        f"{int(st.session_state.sleeper_version)}-projection-plus-delta"
+    ),
 )
 
 working_pool = pool.copy().reset_index(drop=True)
@@ -1125,9 +1295,8 @@ if generate:
             force_refresh=False,
         )
         st.session_state.weather_by_home = solve_weather
-        # Vegas ITT first, then wind downgrades, then optimize.
-        solve_pool = apply_vegas_projections(working_pool, solve_lines)
-        solve_pool = apply_weather_projections(solve_pool, solve_weather)
+        # Projection in the player pool already includes Delta, so do not apply it again.
+        solve_pool = working_pool
         optimizer = get_nfl_optimizer(contest_format)
         optimizer.set_exclude_inactive(exclude_inactive)
         optimizer.load_from_dataframe(solve_pool)
@@ -1159,7 +1328,19 @@ if generate:
             max_exposure_pct=float(max_exposure_pct) if use_max_exposure else None,
         )
         progress.progress(30, text=f"Generating {lineup_count} lineups…")
-        if enable_tiered_salary:
+        if game_script_buckets is not None:
+            if not game_script_buckets:
+                raise RuntimeError(
+                    "Upload a Classic salary file before assigning lineups to games."
+                )
+            assigned = sum(bucket.lineups for bucket in game_script_buckets)
+            if assigned != int(lineup_count):
+                raise RuntimeError(
+                    f"Game-script lineup counts add up to {assigned}. "
+                    f"Set them to {int(lineup_count)}."
+                )
+            generated = optimize_game_scripts(optimizer, game_script_buckets)
+        elif enable_tiered_salary:
             generated = optimize_tiered_salaries(
                 optimizer,
                 total_n=int(lineup_count),
@@ -1172,7 +1353,7 @@ if generate:
             generated = optimizer.generate_lineups()
         progress.progress(100, text="Done")
         rule_check = None
-        if preset is ContestPreset.CLASSIC_LARGE_GPP:
+        if preset is ContestPreset.CLASSIC_LARGE_GPP and game_script_buckets is None:
             rule_check = {
                 "overlap_cap": optimizer.last_overlap_cap,
                 "game_count": optimizer.last_game_count,
@@ -1216,6 +1397,25 @@ if lineups:
             _render_settings_comparison(used["rows"])
 
     st.subheader(f"Generated lineups ({len(lineups)})")
+    if any(lineup.attrs.get("game_script") for lineup in lineups):
+        st.markdown("#### Lineups per game")
+        st.dataframe(
+            game_script_summary(lineups),
+            width="stretch",
+            hide_index=True,
+        )
+        st.markdown("#### Player exposure")
+        st.dataframe(
+            player_exposure_table(lineups),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Lineups": st.column_config.NumberColumn("Lineups", format="%d"),
+                "Exposure %": st.column_config.NumberColumn(
+                    "Exposure %", format="%.1f"
+                ),
+            },
+        )
 
     options = list(range(len(lineups)))
 
@@ -1297,6 +1497,9 @@ if lineups:
     selected = st.selectbox("View lineup", options=options, format_func=_lineup_label)
     lineup = lineups[selected]
     lineup_view = lineup[["Slot", "Name", "Team", "Salary", "Projection"]].copy()
+    if "ID" in lineup.columns and "ID" in pool.columns and "Delta" in pool.columns:
+        delta_by_id = dict(zip(pool["ID"].astype(str), pool["Delta"]))
+        lineup_view["Delta"] = lineup["ID"].astype(str).map(delta_by_id)
     lineup_view["Salary Remaining ($)"] = _remaining(lineup)
     st.dataframe(
         lineup_view,
@@ -1310,5 +1513,10 @@ if lineups:
                 format="$%d",
             ),
             "Projection": st.column_config.NumberColumn("Projection", format="%.2f"),
+            "Delta": st.column_config.NumberColumn(
+                "Delta",
+                format="%+.2f",
+                help="Points added or removed from the player-pool projection by Vegas and wind.",
+            ),
         },
     )

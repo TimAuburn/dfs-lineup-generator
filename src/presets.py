@@ -284,7 +284,7 @@ def flex_positions_for_label(label: str) -> Tuple[str, ...]:
 
 
 def flex_position_label(positions: Optional[Tuple[str, ...]]) -> str:
-    """Label for a flex-position tuple. Missing values mean the full DraftKings flex."""
+    """Label for a flex-position tuple. An empty value means the full DraftKings flex."""
     if not positions:
         return "Any"
     wanted = frozenset(str(pos).upper() for pos in positions)
@@ -332,8 +332,7 @@ def format_preset_summary(config: PresetConfig) -> List[Tuple[str, str]]:
             rows.append(("Stacks", stack))
         else:
             rows.append(("Stacks", "None"))
-        if config.flex_positions:
-            rows.append(("Flex", flex_position_label(config.flex_positions)))
+        rows.append(("Flex", flex_position_label(config.flex_positions)))
         if config.min_skill_salary is not None:
             rows.append(("Skill salary floor", f"${config.min_skill_salary:,}"))
         rows.append(("Exclude vs DST", "Yes" if config.exclude_vs_dst else "No"))
