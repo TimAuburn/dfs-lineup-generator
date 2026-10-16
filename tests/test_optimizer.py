@@ -23,6 +23,7 @@ from src.optimizer import (
     apply_projection_jitter,
     classic_gpp_rule_check,
     default_starting_quarterbacks,
+    unique_quarterbacks,
     drop_backup_players,
     even_lineup_counts,
     game_script_summary,
@@ -665,6 +666,57 @@ def test_default_starting_quarterbacks_picks_one_per_team():
     rows += _showdown_pair("QB", "Mitchell Trubisky", 210, "BUF", 4500, 8.0)
     starters = default_starting_quarterbacks(pd.DataFrame(rows))
     assert starters == [("Josh Allen", "BUF"), ("Patrick Mahomes", "KC")]
+
+
+def test_default_starting_quarterbacks_uses_sleeper_depth_chart():
+    rows = pd.DataFrame(
+        [
+            {
+                "Name": "Sam Darnold",
+                "Position": "QB",
+                "TeamAbbrev": "SEA",
+                "Projection": 14.50,
+                "Sleeper": 14.13,
+                "DepthOrder": 1,
+                "DepthPosition": "QB",
+            },
+            {
+                "Name": "Drew Lock",
+                "Position": "QB",
+                "TeamAbbrev": "SEA",
+                "Projection": 18.40,
+                "Sleeper": 8.20,
+                "DepthOrder": 2,
+                "DepthPosition": "QB",
+            },
+            {
+                "Name": "Bo Nix",
+                "Position": "QB",
+                "TeamAbbrev": "DEN",
+                "Projection": 20.00,
+                "Sleeper": 14.28,
+                "DepthOrder": 1,
+                "DepthPosition": "QB",
+            },
+            {
+                "Name": "Jarrett Stidham",
+                "Position": "QB",
+                "TeamAbbrev": "DEN",
+                "Projection": 16.00,
+                "Sleeper": pd.NA,
+                "DepthOrder": 2,
+                "DepthPosition": "QB",
+            },
+        ]
+    )
+    table = unique_quarterbacks(rows)
+    by_name = dict(zip(table["Name"], table["Projection"]))
+    assert by_name["Sam Darnold"] == pytest.approx(14.13)
+    assert by_name["Jarrett Stidham"] == pytest.approx(0.0)
+    assert default_starting_quarterbacks(rows) == [
+        ("Bo Nix", "DEN"),
+        ("Sam Darnold", "SEA"),
+    ]
 
 
 def test_drop_backup_players_keeps_the_leader_at_each_spot():

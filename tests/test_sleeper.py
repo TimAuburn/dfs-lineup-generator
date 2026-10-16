@@ -160,6 +160,74 @@ def test_apply_sleeper_accepts_integer_draftkings_projections():
     assert updated.loc[0, "Sleeper"] == 21.92
 
 
+def test_matched_qb_without_weekly_points_drops_the_draftkings_average():
+    index = {
+        "drew lock|SEA": {
+            "projection": None,
+            "injury": "",
+            "position": "QB",
+            "depth_order": 2,
+            "depth_position": "QB",
+        },
+        "sam darnold|SEA": {
+            "projection": 14.13,
+            "injury": "",
+            "position": "QB",
+            "depth_order": 1,
+            "depth_position": "QB",
+        },
+    }
+    pool = pd.DataFrame(
+        [
+            {
+                "ID": "1",
+                "Name": "Drew Lock",
+                "Position": "QB",
+                "TeamAbbrev": "SEA",
+                "AvgPointsPerGame": 17.10,
+                "Projection": 17.10,
+            },
+            {
+                "ID": "2",
+                "Name": "Drew Lock",
+                "Position": "QB",
+                "TeamAbbrev": "SEA",
+                "Roster Position": "CPT",
+                "AvgPointsPerGame": 17.10,
+                "Projection": 17.10,
+            },
+            {
+                "ID": "3",
+                "Name": "Sam Darnold",
+                "Position": "QB",
+                "TeamAbbrev": "SEA",
+                "AvgPointsPerGame": 14.50,
+                "Projection": 14.50,
+            },
+            {
+                "ID": "4",
+                "Name": "Unknown Backup",
+                "Position": "QB",
+                "TeamAbbrev": "SEA",
+                "AvgPointsPerGame": 9.0,
+                "Projection": 9.0,
+            },
+        ]
+    )
+    updated, matched = apply_sleeper_index(pool, index)
+    lock = updated.loc[updated["Name"] == "Drew Lock"]
+    assert matched == 3
+    assert set(lock["Projection"]) == {0.0}
+    assert set(lock["Sleeper"]) == {0.0}
+    assert set(lock["AvgPointsPerGame"]) == {17.10}
+    darnold = updated.loc[updated["Name"] == "Sam Darnold"].iloc[0]
+    assert darnold["Projection"] == 14.13
+    assert darnold["Sleeper"] == 14.13
+    unknown = updated.loc[updated["Name"] == "Unknown Backup"].iloc[0]
+    assert unknown["Projection"] == 9.0
+    assert pd.isna(unknown["Sleeper"])
+
+
 def test_overlay_uses_cache_and_survives_errors(tmp_path, monkeypatch):
     cache = tmp_path / "sleeper_cache.json"
     calls: list[str] = []

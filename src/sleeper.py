@@ -214,6 +214,7 @@ def apply_sleeper_index(pool: pd.DataFrame, index: dict) -> tuple[pd.DataFrame, 
     ``AvgPointsPerGame`` stays the DraftKings average. ``Sleeper`` stores the
     weekly number, blank when Sleeper has no match. ``Projection`` is what the
     optimizer uses: the Sleeper number when present, otherwise the DraftKings
+    average. A matched quarterback with no weekly points is 0, not that
     average. Matched rows take Sleeper's status even when it is blank, so a
     healthy player is not left OUT from a stale DK tag.
     """
@@ -245,6 +246,12 @@ def apply_sleeper_index(pool: pd.DataFrame, index: dict) -> tuple[pd.DataFrame, 
             points = float(hit["projection"])
             updated.at[idx, "Projection"] = points
             updated.at[idx, "Sleeper"] = points
+        elif position == "QB" or str(hit.get("position") or "").upper() == "QB":
+            # A depth-chart quarterback with no weekly Sleeper points is 0.
+            # Leaving the DraftKings season average in place makes a backup
+            # look like a starter.
+            updated.at[idx, "Projection"] = 0.0
+            updated.at[idx, "Sleeper"] = 0.0
         updated.at[idx, "Injury"] = hit.get("injury") or ""
         order = _depth_order(hit.get("depth_order"))
         if order is not None:
