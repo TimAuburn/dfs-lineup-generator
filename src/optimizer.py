@@ -112,8 +112,8 @@ def _position_tokens(value: object) -> set[str]:
 
 
 def unique_quarterbacks(df: pd.DataFrame) -> pd.DataFrame:
-    """One row per quarterback, using the higher listed projection of CPT and FLEX."""
-    empty = pd.DataFrame(columns=["Name", "TeamAbbrev", "Projection"])
+    """One row per quarterback. Projection is the Sleeper weekly number when present."""
+    empty = pd.DataFrame(columns=["Name", "TeamAbbrev", "Projection", "DepthOrder"])
     if df is None or df.empty or "Position" not in df.columns or "Name" not in df.columns:
         return empty
     is_qb = df["Position"].map(lambda value: "QB" in _position_tokens(value))
@@ -125,10 +125,39 @@ def unique_quarterbacks(df: pd.DataFrame) -> pd.DataFrame:
         return empty
     qbs["Name"] = qbs["Name"].astype(str).str.strip()
     qbs["TeamAbbrev"] = qbs["TeamAbbrev"].astype(str).str.strip().str.upper()
-    qbs["Projection"] = pd.to_numeric(qbs[proj_col], errors="coerce").fillna(0.0)
+    listed = pd.to_numeric(qbs[proj_col], errors="coerce")
+    if "Sleeper" in qbs.columns:
+        sleeper = pd.to_numeric(qbs["Sleeper"], errors="coerce")
+        qbs["Projection"] = sleeper.where(sleeper.notna(), listed)
+    else:
+        sleeper = pd.Series(pd.NA, index=qbs.index, dtype="Float64")
+        qbs["Projection"] = listed
+    if "DepthOrder" in qbs.columns:
+        charted = pd.to_numeric(qbs["DepthOrder"], errors="coerce").notna()
+    else:
+        charted = pd.Series(False, index=qbs.index)
+    # Depth-chart QBs with no Sleeper weekly number are 0, not the DK average.
+    qbs.loc[charted & sleeper.isna(), "Projection"] = 0.0
+    qbs["Projection"] = pd.to_numeric(qbs["Projection"], errors="coerce").fillna(0.0)
+    # When one CPT/FLEX row has a Sleeper number, ignore the other row's DK average.
+    if "Sleeper" in qbs.columns:
+        has_sleeper = (
+            sleeper.notna()
+            .groupby([qbs["Name"], qbs["TeamAbbrev"]])
+            .transform("any")
+        )
+        qbs.loc[has_sleeper.to_numpy() & sleeper.isna().to_numpy(), "Projection"] = pd.NA
+        qbs["Projection"] = pd.to_numeric(qbs["Projection"], errors="coerce")
+    if "DepthOrder" in qbs.columns:
+        qbs["DepthOrder"] = pd.to_numeric(qbs["DepthOrder"], errors="coerce")
+    else:
+        qbs["DepthOrder"] = pd.Series(pd.NA, index=qbs.index, dtype="Float64")
+    if "DepthPosition" in qbs.columns:
+        depth_pos = qbs["DepthPosition"].astype(str).str.strip().str.upper()
+        qbs.loc[~depth_pos.eq("QB"), "DepthOrder"] = pd.NA
     grouped = (
-        qbs.groupby(["Name", "TeamAbbrev"], as_index=False)["Projection"]
-        .max()
+        qbs.groupby(["Name", "TeamAbbrev"], as_index=False)
+        .agg(Projection=("Projection", "max"), DepthOrder=("DepthOrder", "min"))
         .sort_values(["Projection", "Name"], ascending=[False, True])
         .reset_index(drop=True)
     )
@@ -145,15 +174,22 @@ def default_starting_quarterbacks(
     *,
     limit: int = 2,
 ) -> List[Tuple[str, str]]:
-    """Highest-projected quarterback on each team, then the top ``limit`` of those.
+    """Depth-chart QB1 on each team, otherwise the highest Sleeper projection.
 
     A Showdown slate is one game, so this is one starter from each team.
+    The points used to break ties are the Sleeper weekly number when present.
     """
     qbs = unique_quarterbacks(df)
     if qbs.empty:
         return []
+    ranked = qbs.copy()
+    depth = pd.to_numeric(ranked["DepthOrder"], errors="coerce")
+    ranked["_starter"] = depth.eq(1)
     leaders = (
-        qbs.sort_values(["Projection", "Name"], ascending=[False, True])
+        ranked.sort_values(
+            ["_starter", "Projection", "Name"],
+            ascending=[False, False, True],
+        )
         .drop_duplicates("TeamAbbrev", keep="first")
         .sort_values(["Projection", "Name"], ascending=[False, True])
         .head(max(0, int(limit)))
@@ -1085,11 +1121,10 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         }
 
     def _without_backup_quarterbacks(self, pool: pd.DataFrame) -> pd.DataFrame:
-        """Drop Showdown QBs whose listed projection is under 12.0.
+        """Drop Showdown QBs whose weekly projection is under 12.0.
 
-        The check uses the projection on the salary file, before jitter and
-        before the 1.5x captain boost, so a 10-point backup cannot survive as
-        a 15-point captain row.
+        The check uses Projection, which is the Sleeper number when that player
+        matched, before jitter and before the 1.5x captain boost.
         """
         if pool.empty or "Position" not in pool.columns:
             return pool

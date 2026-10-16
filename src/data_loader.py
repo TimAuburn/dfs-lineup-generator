@@ -156,15 +156,18 @@ def apply_projection_delta(
 
     The base is the Sleeper weekly number when that cell is filled, otherwise
     the current Projection (the DraftKings average for an unmatched player).
+    Delta is only the Vegas and wind point change on that base.
     """
     updated = pool.copy()
     if updated.empty or "Projection" not in updated.columns:
         return updated
-    deltas = projection_deltas(updated, lines, weather_by_home)
     base = pd.to_numeric(updated["Projection"], errors="coerce")
     if "Sleeper" in updated.columns:
         sleeper = pd.to_numeric(updated["Sleeper"], errors="coerce")
         base = sleeper.where(sleeper.notna(), base)
+    working = updated.copy()
+    working["Projection"] = base.to_numpy()
+    deltas = projection_deltas(working, lines, weather_by_home)
     updated["Delta"] = deltas.to_numpy()
     updated["Projection"] = (base + deltas).round(2).to_numpy()
     return updated

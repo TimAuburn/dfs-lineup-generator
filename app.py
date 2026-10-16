@@ -703,9 +703,9 @@ with st.sidebar:
                 key=f"starting_qbs_{slate_key}",
                 label_visibility="collapsed",
                 help=(
-                    "Starts with the highest-projected quarterback on each team. "
-                    "Any quarterback you leave out is excluded. "
-                    "Quarterbacks under 12.0 points are removed automatically."
+                    "Starts with the Sleeper depth-chart QB1 on each team, using that "
+                    "player's Sleeper projection. Any quarterback you leave out is excluded. "
+                    "Quarterbacks under 12.0 Sleeper points are removed automatically."
                 ),
             )
             confirmed_qb_keys = [label_to_key[label] for label in selected_labels]
