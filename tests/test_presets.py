@@ -29,7 +29,7 @@ def test_format_preset_summary_classic_cash():
     ].startswith("None")
     assert rows["Stacks"] == "None"
     assert rows["Flex"] == "WR or RB"
-    assert rows["Skill salary floor"] == "$3,800"
+    assert rows["Skill salary floor"] == "$4,200"
     assert rows["Exclude vs DST"] == "No"
     assert rows["Max repeating players"] == "No limit"
     assert rows["Ownership cap"] == "None"
@@ -56,6 +56,7 @@ def test_format_preset_summary_showdown_cash_limits_same_team_rbs():
     cfg = get_preset_config(ContestPreset.SHOWDOWN_CASH)
     rows = dict(format_preset_summary(cfg))
     assert rows["Same-team RBs"] == "At most 1"
+    assert rows["Starting core"] == "Both starting QBs and RBs"
     gpp = dict(format_preset_summary(get_preset_config(ContestPreset.SHOWDOWN_GPP)))
     assert "Same-team RBs" not in gpp
 

@@ -104,6 +104,8 @@ class PresetConfig:
     below_salary_threshold: Optional[int] = None
     # Showdown cash: at most this many running backs from one team. None = no cap.
     max_rbs_per_team: Optional[int] = None
+    # Showdown cash tries to roster both starting QBs and both starting RBs.
+    require_starting_core: bool = False
     allow_kicker_captain: bool = False
     # Showdown cash captain pool. None keeps the default CPT positions.
     captain_positions: Optional[Tuple[str, ...]] = None
@@ -121,12 +123,12 @@ PRESET_CONFIGS: Dict[ContestPreset, PresetConfig] = {
         jitter_pct=(0.0, 0.0),
         enable_qb_stack=False,
         flex_positions=("RB", "WR"),
-        min_skill_salary=3_800,
+        min_skill_salary=4_200,
         exclude_vs_dst=False,
         max_repeating_players=None,
         description=(
             "Single deterministic cash lineup. No stacks. FLEX is WR or RB. "
-            "WR, RB, and TE under $3,800 are excluded unless locked."
+            "WR, RB, and TE under $4,200 are excluded unless locked."
         ),
     ),
     ContestPreset.CLASSIC_SMALL_GPP: PresetConfig(
@@ -213,10 +215,12 @@ PRESET_CONFIGS: Dict[ContestPreset, PresetConfig] = {
         max_below_salary_players=1,
         below_salary_threshold=4_500,
         max_rbs_per_team=1,
+        require_starting_core=True,
         description=(
             "Showdown Cash: spend $49,600–$50,000, no defense, at most one kicker, "
             "at most one running back from each team, FLEX at $3,500+, "
-            "and at most one player under $4,500."
+            "at most one player under $4,500, and both starting quarterbacks "
+            "and running backs when they fit."
         ),
     ),
 }
@@ -403,6 +407,8 @@ def format_preset_summary(config: PresetConfig) -> List[Tuple[str, str]]:
             )
         if config.max_rbs_per_team is not None:
             rows.append(("Same-team RBs", f"At most {config.max_rbs_per_team}"))
+        if config.require_starting_core:
+            rows.append(("Starting core", "Both starting QBs and RBs"))
         rows.append(
             (
                 "Max K+DST combined",
@@ -553,6 +559,7 @@ def apply_preset(
             max_below_salary_players=config.max_below_salary_players,
             below_salary_threshold=config.below_salary_threshold,
             max_rbs_per_team=config.max_rbs_per_team,
+            require_starting_core=config.require_starting_core,
         )
 
     return config

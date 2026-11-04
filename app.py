@@ -15,6 +15,19 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.contest_parser import (
+    contest_id_from_filename,
+    fetch_dk_contest_metadata,
+    open_contest_standings,
+    parse_dk_contest_csv,
+)
+from src.database import (
+    get_chalk_and_cutline_summary,
+    get_recent_slates,
+    save_contest,
+    save_salary_pool_if_new,
+    search_player_performance,
+)
 from src.data_loader import (
     KICKER_CAPTAIN_MAX_EXPOSURE,
     apply_projection_delta,
@@ -46,10 +59,23 @@ from src.optimizer import (
     optimize_tiered_salaries,
     player_exposure_table,
     quarterback_label,
+    showdown_lineup_grid,
     tiered_lineup_counts,
     unique_quarterbacks,
 )
 from src.parser import DKCSVValidationError, is_inactive_injury, parse_dk_csv
+from src.player_pool import (
+    apply_pool_edits,
+    carry_choices,
+    collapse_for_editor,
+    filter_editor_frame,
+    game_choices,
+    generation_pool,
+    locked_player_ids,
+    position_choices,
+    set_captain,
+    set_included,
+)
 from src.sleeper import overlay_sleeper_projections, sleeper_status_caption
 from src.vegas_cache import fetch_vegas_lines, format_cache_status
 from src.weather import (
@@ -142,6 +168,9 @@ def _extra_setting_rows(
     max_exposure_pct: int,
     use_min_exposure: bool,
     min_exposure_pct: int,
+    at_most_one_qb: bool = False,
+    team_split: Tuple[int, int] | None = None,
+    team_split_team: str | None = None,
 ) -> List[Tuple[str, str, str]]:
     """UI-only settings that are not part of a contest preset."""
     rows: List[Tuple[str, str, str]] = []
@@ -149,6 +178,13 @@ def _extra_setting_rows(
         rows.append(("Jitter seed", "42", str(int(jitter_seed))))
     if use_min_exposure:
         rows.append(("Min exposure", "Off", f"{int(min_exposure_pct)}%"))
+    if at_most_one_qb:
+        rows.append(("Quarterbacks", "No limit", "At most 1"))
+    if team_split is not None:
+        label = f"{int(team_split[0])}-{int(team_split[1])}"
+        if team_split[0] != team_split[1]:
+            label = f"{label}, {team_split_team or 'either team'}"
+        rows.append(("Team split", "Any", label))
     return rows
 
 
@@ -440,6 +476,55 @@ def _collect_strategy_overrides(
             key=_preset_key(preset, "limit_kickers"),
             help="Checked lineups include at most one kicker, so both teams' kickers cannot be paired.",
         )
+        at_most_one_qb = False
+        team_split: Tuple[int, int] | None = None
+        team_split_team: str | None = None
+        if preset is ContestPreset.SHOWDOWN_GPP:
+            at_most_one_qb = st.toggle(
+                "At most one quarterback",
+                value=False,
+                key=_preset_key(preset, "at_most_one_qb"),
+                help=(
+                    "A lineup includes one quarterback at most, so both teams' "
+                    "quarterbacks cannot be paired. The captain counts as that quarterback."
+                ),
+            )
+            split_labels = ("Any", "3-3", "4-2", "5-1")
+            split_choice = st.segmented_control(
+                "Players from each team",
+                options=split_labels,
+                default="Any",
+                required=True,
+                width="stretch",
+                wrap=True,
+                key=_preset_key(preset, "team_split"),
+                help=(
+                    "Counts include the captain. 4-2 is four players from one team "
+                    "and two from the other. DraftKings allows at most 5 from one team."
+                ),
+            )
+            split_label = str(split_choice or "Any")
+            if split_label != "Any":
+                high_s, low_s = split_label.split("-")
+                team_split = (int(high_s), int(low_s))
+            if team_split is not None and team_split[0] != team_split[1]:
+                slate_teams = _showdown_team_abbrevs()
+                heavy_choice = st.selectbox(
+                    "More players from",
+                    options=["Either team", *slate_teams],
+                    key=_preset_key(
+                        preset,
+                        "team_split_side_" + ("-".join(slate_teams) or "none"),
+                    ),
+                    help=(
+                        "The first number comes from this team. Either team lets "
+                        "the optimizer choose the side."
+                    ),
+                )
+                if heavy_choice and heavy_choice != "Either team":
+                    team_split_team = str(heavy_choice)
+                if not slate_teams:
+                    st.caption("Upload a salary file to choose which team gets the larger side.")
 
         overrides.update(
             min_salary_cap=int(salary_lo) if use_salary_window else None,
@@ -458,6 +543,9 @@ def _collect_strategy_overrides(
             max_below_salary_players=preset_cfg.max_below_salary_players,
             below_salary_threshold=preset_cfg.below_salary_threshold,
             max_rbs_per_team=preset_cfg.max_rbs_per_team,
+            max_quarterbacks=1 if at_most_one_qb else None,
+            team_split=team_split,
+            team_split_team=team_split_team,
         )
         preset_uses_window = (
             preset_cfg.min_salary_cap is not None or preset_cfg.max_salary_cap is not None
@@ -485,6 +573,10 @@ def _collect_strategy_overrides(
             changed.append("Kicker captain")
         if bool(limit_kickers) != (preset_cfg.max_kickers == 1):
             changed.append("Max kickers")
+        if at_most_one_qb:
+            changed.append("Quarterbacks")
+        if team_split is not None:
+            changed.append("Team split")
 
     limit_repeating = st.checkbox(
         "Limit max repeating players",
@@ -567,6 +659,19 @@ def _collect_strategy_overrides(
     return overrides, changed, game_script_buckets
 
 
+def _showdown_team_abbrevs() -> List[str]:
+    """Team abbreviations on the loaded salary file, once a Showdown pool exists."""
+    pool = st.session_state.get("player_pool")
+    if pool is None or "TeamAbbrev" not in pool.columns:
+        return []
+    teams = {
+        str(team).strip().upper()
+        for team in pool["TeamAbbrev"]
+        if str(team).strip() and str(team).strip().lower() != "nan"
+    }
+    return sorted(teams)
+
+
 def _apply_strategy_overrides(optimizer: Any, overrides: Dict[str, Any]) -> None:
     """Apply UI strategy deviations on top of ``apply_preset``."""
     if "jitter_pct" in overrides:
@@ -603,13 +708,170 @@ def _apply_strategy_overrides(optimizer: Any, overrides: Dict[str, Any]) -> None
             max_below_salary_players=overrides.get("max_below_salary_players"),
             below_salary_threshold=overrides.get("below_salary_threshold"),
             max_rbs_per_team=overrides.get("max_rbs_per_team"),
+            max_quarterbacks=overrides.get("max_quarterbacks"),
+            team_split=overrides.get("team_split"),
+            team_split_team=overrides.get("team_split_team"),
         )
 
     optimizer.set_max_repeating_players(overrides.get("max_repeating_players"))
     optimizer.max_cumulative_ownership = overrides.get("max_cumulative_ownership")
 
 
+def _archive_salaries(pool: pd.DataFrame | None, slate_type: str) -> str:
+    """Save this salary file once. A second generate of the same file does not write again."""
+    signature = str(st.session_state.get("pool_signature") or "").strip()
+    if pool is None or pool.empty or not signature:
+        return ""
+    try:
+        saved = save_salary_pool_if_new(
+            pool,
+            slate_type,
+            signature,
+            slate_name=str(st.session_state.get("pool_source_name") or "DK salaries"),
+        )
+    except Exception as exc:  # noqa: BLE001 - lineup generation still stands
+        return f" Salaries were not saved: {exc}"
+    if saved:
+        return " Saved player salaries."
+    return " Salaries were already saved for this file."
+
+
+def render_archive_view() -> None:
+    """Import DraftKings contest exports and browse the local SQLite archive."""
+    st.header("Historical archive")
+    st.caption(
+        "Upload a Game Center file named like contest-standings-197055070.csv or .zip. "
+        "Contest name, date, entry fee, and contest type come from DraftKings. "
+        "Player salaries are saved when you generate lineups."
+    )
+
+    with st.form("contest_archive_import"):
+        standings_file = st.file_uploader(
+            "Contest standings CSV",
+            type=["csv", "zip"],
+            help="DraftKings CSV, or a zip that contains that CSV.",
+        )
+        submitted = st.form_submit_button("Import and archive contest")
+
+    if submitted:
+        if standings_file is None:
+            st.error("Upload a contest standings CSV or zip.")
+        else:
+            filename = str(getattr(standings_file, "name", "") or "")
+            try:
+                standings_text, id_name = open_contest_standings(standings_file, filename)
+                contest_id = contest_id_from_filename(id_name)
+                metadata = fetch_dk_contest_metadata(contest_id)
+                note = ""
+                if not contest_id:
+                    note = "The file name has no contest id, so DraftKings metadata was not loaded."
+                elif not str(metadata.get("slate_name") or "").strip():
+                    note = "DraftKings did not return contest details. The archive used default metadata."
+                parsed = parse_dk_contest_csv(
+                    standings_text,
+                    contest_id,
+                    metadata,
+                )
+                save_contest(parsed["slate"], parsed["players"], parsed["standings"])
+            except Exception as exc:  # noqa: BLE001 - show the import error in the page
+                st.error(str(exc))
+            else:
+                owned = sorted(
+                    parsed["players"],
+                    key=lambda player: float(player.get("ownership_pct") or -1),
+                    reverse=True,
+                )[:5]
+                st.session_state["last_import"] = {
+                    "contest_id": parsed["slate"]["contest_id"],
+                    "slate_name": parsed["slate"]["slate_name"],
+                    "slate_type": parsed["slate"]["slate_type"],
+                    "contest_date": parsed["slate"]["contest_date"],
+                    "entry_fee": parsed["slate"]["entry_fee"],
+                    "total_entries": parsed["slate"]["total_entries"],
+                    "cash_cutline": parsed["slate"]["cash_cutline"],
+                    "note": note,
+                    "top_owned": [
+                        {
+                            "Player": player["player_name"],
+                            "Ownership %": None
+                            if player.get("ownership_pct") is None
+                            else round(float(player["ownership_pct"]) * 100, 2),
+                            "Actual FPTS": player.get("actual_fpts"),
+                        }
+                        for player in owned
+                    ],
+                }
+
+    last_import = st.session_state.get("last_import")
+    if last_import:
+        slate_name = str(last_import.get("slate_name") or "").strip() or last_import["contest_id"]
+        st.success(
+            f"Imported {last_import.get('slate_type', 'Classic')} contest {slate_name}."
+        )
+        if last_import.get("note"):
+            st.warning(str(last_import["note"]))
+        fee = last_import.get("entry_fee")
+        metric_date, metric_fee, metric_cash = st.columns(3)
+        metric_date.metric("Contest date", str(last_import.get("contest_date") or "—"))
+        metric_fee.metric("Entry fee", "—" if fee is None else f"${float(fee):g}")
+        cash_line = last_import.get("cash_cutline")
+        metric_cash.metric(
+            "Cash line",
+            "—" if cash_line is None else f"{float(cash_line):.2f}",
+        )
+        st.caption("Top chalk plays")
+        st.dataframe(
+            pd.DataFrame(last_import["top_owned"]),
+            width="stretch",
+            hide_index=True,
+        )
+
+    st.subheader("Recent slates")
+    recent = get_recent_slates()
+    st.dataframe(recent, width="stretch", hide_index=True)
+
+    st.subheader("Player archive")
+    name_filter = st.text_input("Player name", key="archive_player_name")
+    slate_labels = ["All slates"]
+    slate_ids = [""]
+    if not recent.empty:
+        for _, slate in recent.iterrows():
+            slate_ids.append(str(slate["Contest ID"]))
+            slate_labels.append(
+                f"{slate['Date']} {slate['Slate Name']} ({slate['Contest ID']})"
+            )
+    slate_choice = st.selectbox(
+        "Slate",
+        options=list(range(len(slate_labels))),
+        format_func=lambda index: slate_labels[index],
+        key="archive_slate",
+    )
+    players = search_player_performance(
+        player_name=name_filter,
+        contest_id=slate_ids[int(slate_choice)],
+    )
+    st.dataframe(players, width="stretch", hide_index=True)
+
+    st.subheader("Summary")
+    st.caption(
+        "Cash line is the lowest score that finished in the money. Chalk average "
+        "is the mean actual points of players owned at 15% or more."
+    )
+    st.dataframe(get_chalk_and_cutline_summary(), width="stretch", hide_index=True)
+
+
 _init_state()
+
+view = st.segmented_control(
+    "View",
+    ["Player pool", "Optimizer", "Historical archive"],
+    default="Optimizer",
+    label_visibility="collapsed",
+    key="app_view",
+)
+if view == "Historical archive":
+    render_archive_view()
+    st.stop()
 
 # None until a Showdown pool is loaded. An empty list excludes every quarterback.
 confirmed_qb_keys: List[Tuple[str, str]] | None = None
@@ -960,6 +1222,9 @@ extra_setting_rows = _extra_setting_rows(
     max_exposure_pct=int(max_exposure_pct),
     use_min_exposure=bool(use_min_exposure),
     min_exposure_pct=int(min_exposure_pct),
+    at_most_one_qb=strategy_overrides.get("max_quarterbacks") == 1,
+    team_split=strategy_overrides.get("team_split"),
+    team_split_team=strategy_overrides.get("team_split_team"),
 )
 extra_setting_rows.append(
     (
@@ -996,28 +1261,9 @@ settings_match_run = bool(
 )
 
 # ---------------------------------------------------------------------------
-# Main — title + primary action bar (upload / generate / download)
+# Main — Player pool, or the optimizer action bar
 # ---------------------------------------------------------------------------
 is_showdown = contest_format is ContestFormat.SHOWDOWN
-title = (
-    "DraftKings NFL Showdown Optimizer"
-    if is_showdown
-    else "DraftKings NFL Classic Lineup Optimizer"
-)
-st.title(title)
-upload_help = (
-    "Official DraftKings NFL Showdown / Captain Mode DKSalaries.csv "
-    "(CPT + FLEX rows per player)."
-    if is_showdown
-    else "Official DraftKings NFL Classic salary export (DKSalaries.csv)."
-)
-st.caption(
-    "Load a DK salary CSV, pick a contest preset, and export multi-entry lineups."
-)
-
-export_headers = ",".join(upload_columns_for(contest_format))
-st.caption(f"Export template: `{export_headers}`")
-
 lineups = st.session_state.lineups
 csv_text = (
     lineups_to_dk_upload_csv(lineups, contest_format=contest_format) if lineups else ""
@@ -1025,25 +1271,313 @@ csv_text = (
 download_name = (
     "dk_nfl_showdown_upload.csv" if is_showdown else "dk_nfl_classic_upload.csv"
 )
+pool: pd.DataFrame | None = st.session_state.player_pool
 
-upload_col, generate_col, download_col = st.columns([3, 1.2, 1.6], gap="medium")
-with upload_col:
+if view == "Player pool":
+    st.title("Player pool")
+    upload_help = (
+        "Official DraftKings NFL Showdown / Captain Mode DKSalaries.csv "
+        "(CPT + FLEX rows per player)."
+        if is_showdown
+        else "Official DraftKings NFL Classic salary export (DKSalaries.csv)."
+    )
+    st.caption(
+        "Load the salary file here. Include, captain, ownership, lock, and projection "
+        "are saved with the pool and used when you generate lineups."
+    )
     uploaded = st.file_uploader(
         "DraftKings player pool CSV",
         type=["csv"],
         help=upload_help,
         key=f"uploader_{contest_format.value}",
     )
+    if uploaded is not None:
+        try:
+            parsed_pool = parse_dk_csv(uploaded, contest_format=contest_format)
+            force_sleeper = bool(st.session_state.pop("sleeper_force", False))
+            parsed_pool, sleeper_summary = overlay_sleeper_projections(
+                parsed_pool,
+                force_refresh=force_sleeper,
+            )
+            if force_sleeper:
+                st.session_state.sleeper_version = int(st.session_state.sleeper_version) + 1
+            signature = hashlib.sha1(uploaded.getvalue()).hexdigest()
+            pool_changed = st.session_state.get("pool_signature") != signature
+            if not pool_changed:
+                parsed_pool = carry_choices(st.session_state.player_pool, parsed_pool)
+            st.session_state.player_pool = parsed_pool
+            st.session_state.sleeper_summary = sleeper_summary
+            st.session_state.pool_signature = signature
+            st.session_state.pool_source_name = str(getattr(uploaded, "name", "") or "DK salaries")
+            st.session_state.error = None
+            pool = parsed_pool
+            # Sidebar reads the pool before this upload runs, so refresh once.
+            if pool_changed:
+                st.rerun()
+        except DKCSVValidationError as exc:
+            st.session_state.error = str(exc)
+            st.session_state.player_pool = None
+            pool = None
+
+    if st.session_state.error:
+        st.error(st.session_state.error)
+
+    if pool is None:
+        st.info(
+            "Upload a DraftKings NFL Showdown DKSalaries.csv (CPT/FLEX rows) to begin."
+            if is_showdown
+            else "Upload a DraftKings NFL Classic DKSalaries.csv to begin."
+        )
+        st.stop()
+
+    roster_n = 6 if is_showdown else 9
+    inactive_in_pool = (
+        int(pool["Injury"].map(is_inactive_injury).sum())
+        if "Injury" in pool.columns
+        else 0
+    )
+    sleeper_refresh = st.button("Refresh Sleeper projections", key="refresh_sleeper")
+    if sleeper_refresh:
+        st.session_state.sleeper_force = True
+        st.rerun()
+    st.caption(sleeper_status_caption(st.session_state.sleeper_summary))
+    if not is_showdown:
+        considered = pool
+        if exclude_inactive and "Injury" in pool.columns:
+            considered = pool.loc[~pool["Injury"].map(is_inactive_injury)].copy()
+        starters = drop_backup_players(considered)
+        starter_ids = set(starters["ID"].astype(str)) if "ID" in starters.columns else set()
+        backup_names = (
+            considered.loc[~considered["ID"].astype(str).isin(starter_ids), "Name"]
+            .astype(str)
+            .drop_duplicates()
+            .tolist()
+            if "ID" in considered.columns
+            else []
+        )
+        if backup_names:
+            preview = ", ".join(backup_names[:4])
+            extra = f" +{len(backup_names) - 4}" if len(backup_names) > 4 else ""
+            st.caption(f"Leaving out {len(backup_names)} backups: {preview}{extra}")
+        elif "DepthOrder" in pool.columns and pd.to_numeric(pool["DepthOrder"], errors="coerce").notna().any():
+            st.caption("No backup players in this pool.")
+    injury_note = (
+        f" · {inactive_in_pool} row(s) marked OUT/IR/Doubtful"
+        if inactive_in_pool
+        else ""
+    )
+    player_count = pool["Name"].astype(str).str.strip().str.casefold().nunique()
+    st.caption(
+        f"{player_count} players · {len(pool)} salary rows · {roster_n}-player roster · "
+        f"salary cap ${DK_SALARY_CAP:,}{injury_note}."
+    )
+    if is_showdown:
+        st.caption(
+            "One row per player, priced at the flex salary. "
+            "Uncheck Include to drop both the captain and flex rows. "
+            "Uncheck Captain to keep the player at flex only. "
+            "Set Captain % to the share of lineups where this player is the captain."
+        )
+    else:
+        st.caption("Uncheck Include to leave a player out of lineups.")
+    if "Sleeper" not in pool.columns:
+        pool = pool.copy()
+        pool["Sleeper"] = pd.Series(pd.NA, index=pool.index, dtype="Float64")
+    adjusted = apply_projection_delta(pool, vegas_lines, weather_by_home)
+    if "ProjectionOverride" in adjusted.columns:
+        adjusted = adjusted.drop(columns=["ProjectionOverride"])
+    computed = collapse_for_editor(adjusted, showdown=is_showdown)
+    shown = adjusted
+    if "ProjectionOverride" in pool.columns:
+        shown = adjusted.copy()
+        shown["ProjectionOverride"] = pd.to_numeric(
+            pool["ProjectionOverride"], errors="coerce"
+        ).to_numpy()
+    editor_frame = collapse_for_editor(shown, showdown=is_showdown)
+    pool_signature = str(st.session_state.get("pool_signature") or "pool")
+    name_key = f"pool_name_{pool_signature}"
+    position_key = f"pool_position_{pool_signature}"
+    game_key = f"pool_game_{pool_signature}"
+    if st.session_state.pop("pool_clear_filters", False):
+        for filter_state_key in (name_key, position_key, game_key):
+            st.session_state.pop(filter_state_key, None)
+    name_query = st.text_input(
+        "Player name",
+        placeholder="Search by name",
+        key=name_key,
+    )
+    available_positions = position_choices(editor_frame)
+    selected_positions = st.pills(
+        "Position",
+        available_positions,
+        selection_mode="multi",
+        key=position_key,
+        help="Leave every position unselected to show all of them. Flex is RB, WR, and TE.",
+        width="stretch",
+    ) if available_positions else []
+    available_games = game_choices(editor_frame)
+    selected_games = st.pills(
+        "Game",
+        available_games,
+        selection_mode="multi",
+        key=game_key,
+        help="Leave every game unselected to show the whole slate.",
+        width="stretch",
+    ) if available_games else []
+    visible_players = filter_editor_frame(
+        editor_frame,
+        name_query=name_query,
+        positions=list(selected_positions or []),
+        games=list(selected_games or []),
+    )
+    st.caption(f"Showing {len(visible_players)} of {len(editor_frame)} players.")
+    with st.container(horizontal=True):
+        include_shown = st.button("Include shown", key="pool_include_shown")
+        remove_shown = st.button("Remove shown", key="pool_remove_shown")
+        include_captain_shown = False
+        remove_captain_shown = False
+        if is_showdown:
+            include_captain_shown = st.button(
+                "Include captain shown",
+                key="pool_include_captain_shown",
+            )
+            remove_captain_shown = st.button(
+                "Remove captain shown",
+                key="pool_remove_captain_shown",
+            )
+        clear_filters = st.button("Clear filters", key="pool_clear_filters_button")
+    if include_shown or remove_shown:
+        st.session_state.player_pool = set_included(pool, visible_players, include_shown)
+        st.rerun()
+    if include_captain_shown or remove_captain_shown:
+        st.session_state.player_pool = set_captain(
+            pool, visible_players, include_captain_shown
+        )
+        st.rerun()
+    if clear_filters:
+        st.session_state.pool_clear_filters = True
+        st.rerun()
+    if visible_players.empty:
+        st.info("No players match these filters.")
+        st.stop()
+    editable = {"Include", "Lock", "Projection", "Ownership %"}
+    if is_showdown:
+        editable.update({"Captain", "Captain %"})
+    edited_players = st.data_editor(
+        visible_players,
+        width="stretch",
+        hide_index=True,
+        height=480,
+        disabled=[column for column in editor_frame.columns if column not in editable],
+        column_config={
+            "Include": st.column_config.CheckboxColumn(
+                "Include",
+                help="Uncheck to leave this player out of lineups. On Showdown, both rows are removed.",
+                default=True,
+            ),
+            "Captain": st.column_config.CheckboxColumn(
+                "Captain",
+                help="Uncheck to keep this player at flex only. Captain position rules still apply.",
+                default=True,
+            ),
+            "Captain %": st.column_config.NumberColumn(
+                "Captain %",
+                format="%.0f",
+                min_value=0.0,
+                max_value=100.0,
+                help=(
+                    "Share of the lineups you generate where this player is the captain. "
+                    "Leave blank to let the optimizer choose. "
+                    "The percentages together need to add up to 100% or less, "
+                    "and the Captain box still has to be checked."
+                ),
+            ),
+            "Lock": st.column_config.CheckboxColumn(
+                "Lock",
+                help="Force this player into the lineup, including a cash punt under the salary floor.",
+            ),
+            "Ownership %": st.column_config.NumberColumn(
+                "Ownership %",
+                format="%.1f",
+                min_value=0.0,
+                max_value=100.0,
+                help="Leave blank when you do not want an ownership number for this player.",
+            ),
+            "AvgPointsPerGame": st.column_config.NumberColumn(
+                "DraftKings",
+                format="%.2f",
+                help="Average points per game from the DraftKings salary file.",
+            ),
+            "Sleeper": st.column_config.NumberColumn(
+                "Sleeper",
+                format="%.2f",
+                help="Original Sleeper weekly PPR projection. This column does not include Delta.",
+            ),
+            "Projection": st.column_config.NumberColumn(
+                "Projection",
+                format="%.2f",
+                help=(
+                    "Sleeper, or the DraftKings average when Sleeper is blank, plus Delta. "
+                    "This is the number the optimizer uses. Edit to override."
+                ),
+            ),
+            "Delta": st.column_config.NumberColumn(
+                "Delta",
+                format="%+.2f",
+                help=(
+                    "Points already added to or removed from Projection. "
+                    "Vegas implied team total moves RB, WR, and TE by +5% at 26 or above, "
+                    "or -5% at 18 or below. Outdoor wind can cut the number further. "
+                    "Sleeper stays the original weekly value."
+                ),
+            ),
+            "Salary": st.column_config.NumberColumn("Salary", format="$%d"),
+            "DepthOrder": st.column_config.NumberColumn(
+                "Depth",
+                format="%d",
+                help="Sleeper depth chart order. 1 is the top player at that spot.",
+            ),
+            "DepthPosition": st.column_config.TextColumn(
+                "Depth spot",
+                help="Sleeper depth chart spot, such as QB, RB, LWR, RWR, or SWR.",
+            ),
+        },
+        key=(
+            f"player_editor_{contest_format.value}_"
+            f"{pool_signature}_"
+            f"{int(st.session_state.sleeper_version)}_"
+            f"{name_query}_"
+            f"{','.join(selected_positions or [])}_"
+            f"{','.join(selected_games or [])}"
+        ),
+    )
+    st.session_state.player_pool = apply_pool_edits(
+        pool,
+        edited_players,
+        computed,
+        showdown=is_showdown,
+    )
+    st.stop()
+
+title = (
+    "DraftKings NFL Showdown Optimizer"
+    if is_showdown
+    else "DraftKings NFL Classic Lineup Optimizer"
+)
+st.title(title)
+st.caption("Pick a contest preset and export multi-entry lineups from the player pool.")
+export_headers = ",".join(upload_columns_for(contest_format))
+st.caption(f"Export template: `{export_headers}`")
+
+generate_col, download_col = st.columns([1.2, 1.6], gap="medium")
 with generate_col:
-    st.write("")
     generate = st.button(
         "Generate Lineups",
         type="primary",
         width="stretch",
-        disabled=st.session_state.player_pool is None and uploaded is None,
+        disabled=pool is None,
     )
 with download_col:
-    st.write("")
     st.download_button(
         "Download DK Upload CSV",
         data=csv_text,
@@ -1053,29 +1587,6 @@ with download_col:
         width="stretch",
         disabled=not bool(lineups),
     )
-
-if uploaded is not None:
-    try:
-        parsed_pool = parse_dk_csv(uploaded, contest_format=contest_format)
-        force_sleeper = bool(st.session_state.pop("sleeper_force", False))
-        parsed_pool, sleeper_summary = overlay_sleeper_projections(
-            parsed_pool,
-            force_refresh=force_sleeper,
-        )
-        if force_sleeper:
-            st.session_state.sleeper_version = int(st.session_state.sleeper_version) + 1
-        signature = hashlib.sha1(uploaded.getvalue()).hexdigest()
-        pool_changed = st.session_state.get("pool_signature") != signature
-        st.session_state.player_pool = parsed_pool
-        st.session_state.sleeper_summary = sleeper_summary
-        st.session_state.pool_signature = signature
-        st.session_state.error = None
-        # Sidebar reads the pool before this upload runs, so refresh once.
-        if pool_changed:
-            st.rerun()
-    except DKCSVValidationError as exc:
-        st.session_state.error = str(exc)
-        st.session_state.player_pool = None
 
 if st.session_state.error:
     st.error(st.session_state.error)
@@ -1104,189 +1615,18 @@ with st.container(border=True):
         )
     _render_settings_comparison(live_setting_rows)
 
-pool: pd.DataFrame | None = st.session_state.player_pool
-
 if pool is None:
-    st.info(
-        "Upload a DraftKings NFL Showdown DKSalaries.csv (CPT/FLEX rows) to begin."
-        if is_showdown
-        else "Upload a DraftKings NFL Classic DKSalaries.csv to begin."
-    )
+    st.info("Open Player pool and upload a DraftKings salary file before generating lineups.")
     st.stop()
 
-roster_n = 6 if is_showdown else 9
-inactive_in_pool = (
-    int(pool["Injury"].map(is_inactive_injury).sum())
-    if "Injury" in pool.columns
-    else 0
-)
-st.subheader("Player pool")
-sleeper_refresh = st.button("Refresh Sleeper projections", key="refresh_sleeper")
-if sleeper_refresh:
-    st.session_state.sleeper_force = True
-    st.rerun()
-st.caption(sleeper_status_caption(st.session_state.sleeper_summary))
-if not is_showdown:
-    considered = pool
-    if exclude_inactive and "Injury" in pool.columns:
-        considered = pool.loc[~pool["Injury"].map(is_inactive_injury)].copy()
-    starters = drop_backup_players(considered)
-    starter_ids = set(starters["ID"].astype(str)) if "ID" in starters.columns else set()
-    backup_names = (
-        considered.loc[~considered["ID"].astype(str).isin(starter_ids), "Name"]
-        .astype(str)
-        .drop_duplicates()
-        .tolist()
-        if "ID" in considered.columns
-        else []
-    )
-    if backup_names:
-        preview = ", ".join(backup_names[:4])
-        extra = f" +{len(backup_names) - 4}" if len(backup_names) > 4 else ""
-        st.caption(f"Leaving out {len(backup_names)} backups: {preview}{extra}")
-    elif "DepthOrder" in pool.columns and pd.to_numeric(pool["DepthOrder"], errors="coerce").notna().any():
-        st.caption("No backup players in this pool.")
-injury_note = (
-    f" · {inactive_in_pool} row(s) marked OUT/IR/Doubtful"
-    if inactive_in_pool
-    else ""
-)
-lock_note = ""
-if preset is ContestPreset.CLASSIC_CASH:
-    lock_note = " Lock a skill player under $3,800 to force that punt in."
-elif preset is ContestPreset.SHOWDOWN_CASH:
-    lock_note = " Lock a FLEX player under $3,500 to force that punt in."
-elif is_showdown:
-    lock_note = " Lock a FLEX player under $1,200 to force that punt in."
-st.caption(
-    f"{len(pool)} rows loaded · {roster_n}-player roster · salary cap ${DK_SALARY_CAP:,}"
-    f"{injury_note}.{lock_note} Check Exclude to drop a player."
-)
-if "Sleeper" not in pool.columns:
-    pool = pool.copy()
-    pool["Sleeper"] = pd.Series(pd.NA, index=pool.index, dtype="Float64")
-editable_cols = [
-    "Name",
-    "Position",
-    "TeamAbbrev",
-    "Salary",
-    "AvgPointsPerGame",
-    "Sleeper",
-    "Projection",
-    "Delta",
-]
-has_injury_status = (
-    "Injury" in pool.columns and pool["Injury"].astype(str).str.strip().ne("").any()
-)
-display_extra = [
-    c
-    for c in ["ID", "Name + ID", "Roster Position", "RosterSlot", "Game Info", "Ownership", "Injury"]
-    if c in pool.columns and (c != "Injury" or has_injury_status)
-]
-if "DepthOrder" in pool.columns and pd.to_numeric(pool["DepthOrder"], errors="coerce").notna().any():
-    display_extra.append("DepthOrder")
-if "DepthPosition" in pool.columns and pool["DepthPosition"].astype(str).str.strip().ne("").any():
-    display_extra.append("DepthPosition")
-pool = apply_projection_delta(pool, vegas_lines, weather_by_home)
-editor_frame = pool[editable_cols + display_extra].copy()
-editor_frame.insert(0, "Exclude", False)
-editor_frame.insert(0, "Lock", False)
-edited = st.data_editor(
-    editor_frame,
-    width="stretch",
-    hide_index=True,
-    height=320,
-    disabled=[
-        c for c in editor_frame.columns if c not in {"Projection", "Lock", "Exclude"}
-    ],
-    column_config={
-        "Lock": st.column_config.CheckboxColumn(
-            "Lock",
-            help="Force this player into the lineup, including a cash punt under the salary floor.",
-        ),
-        "Exclude": st.column_config.CheckboxColumn(
-            "Exclude",
-            help="Leave this player out. On Showdown, both the captain and flex rows are dropped.",
-        ),
-        "AvgPointsPerGame": st.column_config.NumberColumn(
-            "DraftKings",
-            format="%.2f",
-            help="Average points per game from the DraftKings salary file.",
-        ),
-        "Sleeper": st.column_config.NumberColumn(
-            "Sleeper",
-            format="%.2f",
-            help="Original Sleeper weekly PPR projection. This column does not include Delta.",
-        ),
-        "Projection": st.column_config.NumberColumn(
-            "Projection",
-            format="%.2f",
-            help=(
-                "Sleeper, or the DraftKings average when Sleeper is blank, plus Delta. "
-                "This is the number the optimizer uses. Edit to override."
-            ),
-        ),
-        "Delta": st.column_config.NumberColumn(
-            "Delta",
-            format="%+.2f",
-            help=(
-                "Points already added to or removed from Projection. "
-                "Vegas implied team total moves RB, WR, and TE by +5% at 26 or above, "
-                "or -5% at 18 or below. Outdoor wind can cut the number further. "
-                "Sleeper stays the original weekly value."
-            ),
-        ),
-        "Salary": st.column_config.NumberColumn("Salary", format="$%d"),
-        "DepthOrder": st.column_config.NumberColumn(
-            "Depth",
-            format="%d",
-            help="Sleeper depth chart order. 1 is the top player at that spot.",
-        ),
-        "DepthPosition": st.column_config.TextColumn(
-            "Depth spot",
-            help="Sleeper depth chart spot, such as QB, RB, LWR, RWR, or SWR.",
-        ),
-    },
-    key=(
-        f"player_editor_{contest_format.value}_"
-        f"{(st.session_state.sleeper_summary or {}).get('season')}-"
-        f"{(st.session_state.sleeper_summary or {}).get('week')}-"
-        f"{(st.session_state.sleeper_summary or {}).get('matched')}-"
-        f"{int(st.session_state.sleeper_version)}-projection-plus-delta"
-    ),
-)
-
-working_pool = pool.copy().reset_index(drop=True)
-edited = edited.reset_index(drop=True)
-working_pool["Projection"] = pd.to_numeric(edited["Projection"], errors="coerce").fillna(
-    working_pool["AvgPointsPerGame"]
-).to_numpy()
-excluded_keys: set[Tuple[str, str]] = set()
-if "Exclude" in edited.columns and "Name" in edited.columns:
-    excluded_mask = edited["Exclude"].fillna(False).astype(bool)
-    if excluded_mask.any() and "TeamAbbrev" in edited.columns:
-        excluded_keys = {
-            (str(name).strip(), str(team).strip().upper())
-            for name, team in zip(
-                edited.loc[excluded_mask, "Name"],
-                edited.loc[excluded_mask, "TeamAbbrev"],
-            )
-        }
-        person = list(
-            zip(
-                working_pool["Name"].astype(str).str.strip(),
-                working_pool["TeamAbbrev"].astype(str).str.strip().str.upper(),
-            )
-        )
-        working_pool = working_pool.loc[
-            [pair not in excluded_keys for pair in person]
-        ].copy()
+working_pool = generation_pool(pool, showdown=is_showdown).reset_index(drop=True)
+locked_ids = locked_player_ids(working_pool, showdown=is_showdown)
 
 if generate:
     progress = st.progress(0, text="Building optimizer…")
     try:
         if working_pool.empty:
-            raise RuntimeError("Every player is excluded.")
+            raise RuntimeError("Every player is removed from the pool.")
         solve_lines = frame_to_lines(edited_vegas)
         solve_teams = set(working_pool["TeamAbbrev"].astype(str).str.strip().str.upper())
         solve_low_total = is_showdown and low_scoring_showdown(solve_lines, solve_teams)
@@ -1295,21 +1635,11 @@ if generate:
             force_refresh=False,
         )
         st.session_state.weather_by_home = solve_weather
-        # Projection in the player pool already includes Delta, so do not apply it again.
+        # Projection already includes Delta from the Player pool page.
         solve_pool = working_pool
         optimizer = get_nfl_optimizer(contest_format)
         optimizer.set_exclude_inactive(exclude_inactive)
         optimizer.load_from_dataframe(solve_pool)
-        locked_ids = []
-        if "Lock" in edited.columns and "ID" in edited.columns:
-            locked_mask = edited["Lock"].fillna(False).astype(bool)
-            if excluded_keys and "Name" in edited.columns and "TeamAbbrev" in edited.columns:
-                keep_lock = [
-                    (str(name).strip(), str(team).strip().upper()) not in excluded_keys
-                    for name, team in zip(edited["Name"], edited["TeamAbbrev"])
-                ]
-                locked_mask = locked_mask & pd.Series(keep_lock, index=edited.index)
-            locked_ids = edited.loc[locked_mask, "ID"].astype(str).tolist()
         optimizer.set_locked_players(locked_ids)
         apply_preset(
             optimizer,
@@ -1372,9 +1702,13 @@ if generate:
         override_note = (
             f" (overrides: {', '.join(all_changed)})" if all_changed else ""
         )
+        salary_note = _archive_salaries(
+            st.session_state.player_pool,
+            "Showdown" if is_showdown else "Classic",
+        )
         st.session_state.flash_success = (
             f"Generated {len(generated)} lineup(s) with preset "
-            f"{PRESET_LABELS[preset]}{override_note}."
+            f"{PRESET_LABELS[preset]}{override_note}.{salary_note}"
         )
         st.rerun()
     except Exception as exc:  # noqa: BLE001 - show optimizer failures in UI
@@ -1427,31 +1761,40 @@ if lineups:
             return int(lu.attrs["salary_remaining"])
         return DK_SALARY_CAP - _spent(lu)
 
-    preview = pd.DataFrame(
-        {
-            "Lineup": [i + 1 for i in options],
-            "Salary": [_spent(lu) for lu in lineups],
-            "Salary Remaining ($)": [_remaining(lu) for lu in lineups],
-            "Projection": [
-                float(lu.attrs.get("projection", float(lu["Projection"].sum())))
-                for lu in lineups
-            ],
-        }
-    )
-    st.dataframe(
-        preview,
-        width="stretch",
-        hide_index=True,
-        column_config={
-            "Salary": st.column_config.NumberColumn("Salary", format="$%d"),
-            "Salary Remaining ($)": st.column_config.NumberColumn(
-                "Salary Remaining ($)",
-                format="$%d",
-                help="Dollars left under the $50,000 DraftKings cap.",
-            ),
-            "Projection": st.column_config.NumberColumn("Projection", format="%.2f"),
-        },
-    )
+    salary_columns = {
+        "Salary": st.column_config.NumberColumn("Salary", format="$%d"),
+        "Salary Remaining ($)": st.column_config.NumberColumn(
+            "Salary Remaining ($)",
+            format="$%d",
+            help="Dollars left under the $50,000 DraftKings cap.",
+        ),
+        "Projection": st.column_config.NumberColumn("Projection", format="%.2f"),
+    }
+    if is_showdown:
+        st.dataframe(
+            showdown_lineup_grid(lineups),
+            width="stretch",
+            hide_index=True,
+            column_config=salary_columns,
+        )
+    else:
+        preview = pd.DataFrame(
+            {
+                "Lineup": [i + 1 for i in options],
+                "Salary": [_spent(lu) for lu in lineups],
+                "Salary Remaining ($)": [_remaining(lu) for lu in lineups],
+                "Projection": [
+                    float(lu.attrs.get("projection", float(lu["Projection"].sum())))
+                    for lu in lineups
+                ],
+            }
+        )
+        st.dataframe(
+            preview,
+            width="stretch",
+            hide_index=True,
+            column_config=salary_columns,
+        )
     rule_meta = (used or {}).get("rule_check") if used else None
     if rule_meta:
         games = rule_meta.get("game_count")
@@ -1494,29 +1837,30 @@ if lineups:
             f"${_remaining(lu):,} left · {projection:.2f} proj"
         )
 
-    selected = st.selectbox("View lineup", options=options, format_func=_lineup_label)
-    lineup = lineups[selected]
-    lineup_view = lineup[["Slot", "Name", "Team", "Salary", "Projection"]].copy()
-    if "ID" in lineup.columns and "ID" in pool.columns and "Delta" in pool.columns:
-        delta_by_id = dict(zip(pool["ID"].astype(str), pool["Delta"]))
-        lineup_view["Delta"] = lineup["ID"].astype(str).map(delta_by_id)
-    lineup_view["Salary Remaining ($)"] = _remaining(lineup)
-    st.dataframe(
-        lineup_view,
-        width="stretch",
-        hide_index=True,
-        height=320,
-        column_config={
-            "Salary": st.column_config.NumberColumn("Salary", format="$%d"),
-            "Salary Remaining ($)": st.column_config.NumberColumn(
-                "Salary Remaining ($)",
-                format="$%d",
-            ),
-            "Projection": st.column_config.NumberColumn("Projection", format="%.2f"),
-            "Delta": st.column_config.NumberColumn(
-                "Delta",
-                format="%+.2f",
-                help="Points added or removed from the player-pool projection by Vegas and wind.",
-            ),
-        },
-    )
+    if not is_showdown:
+        selected = st.selectbox("View lineup", options=options, format_func=_lineup_label)
+        lineup = lineups[selected]
+        lineup_view = lineup[["Slot", "Name", "Team", "Salary", "Projection"]].copy()
+        if "ID" in lineup.columns and "ID" in pool.columns and "Delta" in pool.columns:
+            delta_by_id = dict(zip(pool["ID"].astype(str), pool["Delta"]))
+            lineup_view["Delta"] = lineup["ID"].astype(str).map(delta_by_id)
+        lineup_view["Salary Remaining ($)"] = _remaining(lineup)
+        st.dataframe(
+            lineup_view,
+            width="stretch",
+            hide_index=True,
+            height=320,
+            column_config={
+                "Salary": st.column_config.NumberColumn("Salary", format="$%d"),
+                "Salary Remaining ($)": st.column_config.NumberColumn(
+                    "Salary Remaining ($)",
+                    format="$%d",
+                ),
+                "Projection": st.column_config.NumberColumn("Projection", format="%.2f"),
+                "Delta": st.column_config.NumberColumn(
+                    "Delta",
+                    format="%+.2f",
+                    help="Points added or removed from the player-pool projection by Vegas and wind.",
+                ),
+            },
+        )
