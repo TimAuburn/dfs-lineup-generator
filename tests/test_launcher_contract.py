@@ -94,18 +94,26 @@ def test_launch_commands_resolve_root_then_update_then_start():
     main = text.split("\n:start_server", 1)[0]
     assert 'cd /d "%LAUNCHER_DIR%\\.."' in main
     assert "%~dp0" in main
-    assert r".venv\Scripts\python.exe" in main
-    assert main.index('cd /d "%LAUNCHER_DIR%\\.."') < main.index(r".venv\Scripts\python.exe")
+    assert main.index("call :select_python") < main.index('if not "%PYTHON_OK%"=="1" goto :missing_venv')
+    assert main.index('if not "%PYTHON_OK%"=="1" goto :missing_venv') < main.index('call :log "Using Python: %PY%"')
+    assert main.index('call :log "Using Python: %PY%"') < main.index("call :git_update")
     assert main.index("call :git_update") < main.index("call :maybe_pip")
     assert main.index("call :maybe_pip") < main.index("goto :start_server")
-    assert main.index('if not exist "%PY%" goto :missing_venv') < main.index("call :git_update")
+    assert 'if not exist "%PY%" goto :missing_venv' not in text
     git_body = text.split("\n:git_update", 1)[1].split("\n:git_cd_failed", 1)[0]
     assert git_body.index("git fetch origin main") < git_body.index("git pull --ff-only origin main")
     assert "git status --porcelain" in git_body
     pip_body = text.split("\n:maybe_pip", 1)[1]
     assert pip_body.index("-m pip install -r requirements.txt") < pip_body.index("\n:no_req")
     start = text.split("\n:start_server", 1)[1].split("\n:open_and_exit", 1)[0]
-    assert "-m streamlit run app.py" in start
+    assert '"%PY%" -m streamlit run app.py' in start
+    pip_cmd = text.split("\n:pip_needed", 1)[1].split("\n:no_req", 1)[0]
+    assert '"%PY%" -m pip install -r requirements.txt' in pip_cmd
+    missing = text.split("\n:missing_venv", 1)[1].split("\n:port_blocked", 1)[0]
+    assert r"%ROOT%\.venv\Scripts\python.exe" in missing
+    assert r"%ROOT%\venv\Scripts\python.exe" in missing
+    select = text.split("\n:select_python", 1)[1].split("\n:acquire_or_wait", 1)[0]
+    assert "-Command resolve-python" in select
     assert len(re.findall(r"(?m)^git pull --ff-only origin main >>", text)) == 1
     assert len(re.findall(r"(?m)^git fetch origin main >>", text)) == 1
     assert 'mkdir "%LOCKDIR%"' in text
@@ -233,6 +241,7 @@ def test_requirements_stamp_snippets_round_trip(tmp_path: Path):
     req.write_text("streamlit\n", encoding="utf-8")
     env = os.environ.copy()
     env["DFS_ROOT"] = str(project)
+    env["DFS_PYTHON"] = r"C:\proj\.venv\Scripts\python.exe"
 
     def run(snippet: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -255,6 +264,12 @@ def test_requirements_stamp_snippets_round_trip(tmp_path: Path):
 
     same = run(compare)
     assert same.returncode == 0, same.stderr
+    assert r"C:\proj\.venv\Scripts\python.exe" in stamp.read_text(encoding="utf-8")
+
+    env["DFS_PYTHON"] = r"C:\proj\venv\Scripts\python.exe"
+    switched = run(compare)
+    assert switched.returncode == 20, switched.stderr
+    assert r"C:\proj\.venv\Scripts\python.exe" in stamp.read_text(encoding="utf-8")
 
     req.write_text("streamlit\npandas\n", encoding="utf-8")
     changed = run(compare)
@@ -274,6 +289,7 @@ def test_requirements_stamp_compare_fails_closed_without_requirements(tmp_path: 
     project.mkdir()
     env = os.environ.copy()
     env["DFS_ROOT"] = str(project)
+    env["DFS_PYTHON"] = r"C:\proj\venv\Scripts\python.exe"
     result = subprocess.run(
         [sys.executable, "-c", compare],
         cwd=project,
@@ -285,8 +301,7 @@ def test_requirements_stamp_compare_fails_closed_without_requirements(tmp_path: 
     assert result.returncode == 1
 
 
-def test_helper_self_test_when_powershell_exists():
-    executable = None
+def _powershell() -> str | None:
     for candidate in ("pwsh", "powershell", "powershell.exe"):
         found = subprocess.run(
             ["bash", "-lc", f"command -v {candidate}"],
@@ -295,8 +310,83 @@ def test_helper_self_test_when_powershell_exists():
             check=False,
         )
         if found.returncode == 0 and found.stdout.strip():
-            executable = found.stdout.strip()
-            break
+            return found.stdout.strip()
+    bundled = Path("/tmp/pwsh/pwsh")
+    if bundled.is_file() and os.access(bundled, os.X_OK):
+        return str(bundled)
+    return None
+
+
+def _env_folder(selected: str) -> str:
+    parts = selected.replace("\\", "/").split("/")
+    assert parts[-1] == "python.exe"
+    assert parts[-2] == "Scripts"
+    return parts[-3]
+
+
+def _resolve_python(root: Path, out: Path) -> str:
+    executable = _powershell()
+    if executable is None:
+        pytest.skip("PowerShell is not installed; interpreter selection was not executed")
+    result = subprocess.run(
+        [
+            executable,
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(LAUNCHER / "windows_helpers.ps1"),
+            "-Command",
+            "resolve-python",
+            "-ProjectRoot",
+            str(root),
+            "-OutFile",
+            str(out),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return out.read_text(encoding="utf-8").strip()
+
+
+def test_resolve_python_dot_venv_venv_both_and_neither(tmp_path: Path):
+    """Run the helper the bat calls. This does not execute launch_dfs.bat."""
+    root = tmp_path / "Python Scripts" / "dfs-lineup-generator"
+    out = tmp_path / "python-path.txt"
+
+    assert _resolve_python(root, out) == "MISSING"
+
+    dot = root / ".venv" / "Scripts" / "python.exe"
+    dot.parent.mkdir(parents=True)
+    dot.write_bytes(b"")
+    assert _env_folder(_resolve_python(root, out)) == ".venv"
+
+    dot.unlink()
+    plain = root / "venv" / "Scripts" / "python.exe"
+    plain.parent.mkdir(parents=True)
+    plain.write_bytes(b"")
+    selected = _resolve_python(root, out)
+    assert _env_folder(selected) == "venv"
+    assert Path(selected).is_file()
+
+    dot.write_bytes(b"")
+    assert _env_folder(_resolve_python(root, out)) == ".venv"
+
+
+def test_venv_and_dot_venv_are_gitignored():
+    for rel in (".venv/Scripts/python.exe", "venv/Scripts/python.exe"):
+        result = subprocess.run(
+            ["git", "check-ignore", "-q", rel],
+            cwd=ROOT,
+            check=False,
+        )
+        assert result.returncode == 0, rel
+
+
+def test_helper_self_test_when_powershell_exists():
+    executable = _powershell()
     if executable is None:
         pytest.skip("PowerShell is not installed; self-test was not executed")
     result = subprocess.run(

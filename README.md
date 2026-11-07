@@ -23,8 +23,9 @@ cp .env.example .env   # fill ODDS_API_KEY
 streamlit run app.py
 ```
 
-API keys are read from `.env` only (not from the Streamlit UI). `.venv/` is the
-virtualenv — do not store secrets there. See `.env.example` for variable names.
+API keys are read from `.env` only (not from the Streamlit UI). `.venv/` or
+`venv/` is the virtualenv — do not store secrets there. See `.env.example` for
+variable names. The desktop launcher uses `.venv` when both folders exist.
 
 Windows can start this same local app from a Desktop shortcut. See below.
 
@@ -45,12 +46,19 @@ contacted only after a CSV is loaded or a lineup is generated.
 ### One-time setup
 
 1. Install Git for Windows and Python 3, with `git` and the `py` launcher on `PATH`.
-2. In the project folder (the directory that contains `app.py`), create the
-   virtualenv this repo already uses and install dependencies:
+2. In the project folder (the directory that contains `app.py`), create a
+   virtualenv and install dependencies. Either folder name works:
 
    ```bat
    py -3 -m venv .venv
    .venv\Scripts\python.exe -m pip install -r requirements.txt
+   ```
+
+   or:
+
+   ```bat
+   py -3 -m venv venv
+   venv\Scripts\python.exe -m pip install -r requirements.txt
    ```
 
 3. Optional: `copy .env.example .env` and fill `ODDS_API_KEY`.
@@ -77,21 +85,24 @@ contacted only after a CSV is loaded or a lineup is generated.
 
 Double-click **DFS Lineup Generator**.
 
-1. The launcher `cd /d`s to the project root and requires
-   `.venv\Scripts\python.exe`. If the virtualenv is missing, the window prints
-   the setup commands and waits. It does not create the virtualenv for you.
+1. The launcher `cd /d`s to the project root and looks for Python in this
+   order: `.venv\Scripts\python.exe`, then `venv\Scripts\python.exe`. When both
+   exist, `.venv` is used for pip and Streamlit. The chosen path is written to
+   `launcher\logs\launch.log`. If neither file exists, the window names both
+   paths and waits. It does not create a virtualenv for you.
 2. It runs `git fetch origin main`.
 3. It runs `git pull --ff-only origin main` only when that fetch succeeded, the
    working tree is clean, and the current branch is `main`. A dirty tree,
    any other branch, a failed fetch (including no network), or a failed pull
    is a warning. The copy already on disk still starts. The launcher does not
    stash, reset, or discard local work.
-4. If `requirements.txt` differs from the last successful install, it runs
-   `.venv\Scripts\python.exe -m pip install -r requirements.txt` without
-   activating the virtualenv. The stamp is `launcher\logs\requirements.sha256`.
-   A failed install does not update the stamp, so the next launch tries again,
-   and the app still attempts to start.
-5. It runs `.venv\Scripts\python.exe -m streamlit run app.py` on port 8501,
+4. If `requirements.txt` changed, or the selected Python is not the one
+   recorded for the last successful install, it runs that Python with
+   `-m pip install -r requirements.txt` and does not activate the virtualenv.
+   The stamp is `launcher\logs\requirements.sha256` and includes the
+   interpreter path. A failed install does not update the stamp, so the next
+   launch tries again, and the app still attempts to start.
+5. It runs the selected Python with `-m streamlit run app.py` on port 8501,
    bound to localhost. If this app is already listening there, the launcher
    opens the browser and does not start a second server. If something else is
    listening, or the owner cannot be confirmed, it warns and leaves that
@@ -117,9 +128,10 @@ Closing the window stops the server because Streamlit is running in it.
 The stop shortcut ends a process only when all of these are true:
 
 - it is listening on port 8501
-- its command line is this project's `streamlit run app.py` (the project path
-  has to match as a whole folder, so a similarly named folder is not treated
-  as this app)
+- its command line is this project's `streamlit run app.py` using
+  `.venv\Scripts\python.exe` or `venv\Scripts\python.exe`, or the command line
+  otherwise contains this project folder as a whole path (a similarly named
+  folder is not treated as this app)
 
 It then stops that process tree only. It does not kill other Python programs.
 If port 8501 is free, it reports that and exits. If the listener is some other

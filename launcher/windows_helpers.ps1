@@ -6,6 +6,7 @@
     parent-pid       Print the parent process id (the cmd window that called us).
     port-state       Write FREE, "OURS <pid>", "OTHER <pid>", or UNKNOWN.
     wait-and-open    Open the app URL once Streamlit's health check answers.
+    resolve-python   Write .venv\Scripts\python.exe, else venv\Scripts\python.exe, else MISSING.
     self-test        Check path matching. Does not start a server or create shortcuts.
 
   port-state never stops a process. UNKNOWN and OTHER both mean "not confirmed
@@ -14,7 +15,7 @@
 #>
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('parent-pid', 'port-state', 'wait-and-open', 'self-test')]
+    [ValidateSet('parent-pid', 'port-state', 'wait-and-open', 'resolve-python', 'self-test')]
     [string]$Command,
 
     [string]$ProjectRoot,
@@ -86,11 +87,37 @@ function Test-CommandIsOurApp {
     if (-not [string]::IsNullOrWhiteSpace($ExecutablePath)) {
         $exeNorm = $ExecutablePath.Replace('/', '\').ToLowerInvariant()
     }
-    $venvPy = $rootLower + '\.venv\scripts\python.exe'
-    if ($exeNorm -eq $venvPy) { return $true }
+    $dotVenv = $rootLower + '\.venv\scripts\python.exe'
+    $plainVenv = $rootLower + '\venv\scripts\python.exe'
+    if ($exeNorm -eq $dotVenv -or $exeNorm -eq $plainVenv) { return $true }
     if (Test-PathHasRootBoundary -Haystack $cmdNorm -RootLower $rootLower) { return $true }
     if (Test-PathHasRootBoundary -Haystack $exeNorm -RootLower $rootLower) { return $true }
     return $false
+}
+
+function Resolve-LauncherPython([string]$AppRoot) {
+    if ([string]::IsNullOrWhiteSpace($AppRoot)) { return $null }
+    $root = $AppRoot.Trim().TrimEnd('\').TrimEnd('/')
+    # .venv wins when both folders exist. venv is the fallback.
+    foreach ($folder in @('.venv', 'venv')) {
+        $candidate = Join-Path (Join-Path (Join-Path $root $folder) 'Scripts') 'python.exe'
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+    return $null
+}
+
+function Write-AsciiFile([string]$Path, [string]$Text) {
+    $line = $Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        [Console]::Out.WriteLine($line)
+        return
+    }
+    $parentDir = Split-Path -Parent $Path
+    if ($parentDir -and -not (Test-Path -LiteralPath $parentDir)) {
+        New-Item -ItemType Directory -Path $parentDir -Force | Out-Null
+    }
+    $enc = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($Path, $line + "`r`n", $enc)
 }
 
 function Write-PortState([string]$Text) {
@@ -270,10 +297,22 @@ function Invoke-SelfTest {
     $venv = $root + '\.venv\Scripts\python.exe'
     $cases = @(
         @{
-            Name = 'venv streamlit'
+            Name = 'dot venv streamlit'
             Expect = $true
             CommandLine = ($venv + ' -m streamlit run app.py --server.port=8501')
             ExecutablePath = $venv
+        },
+        @{
+            Name = 'plain venv streamlit'
+            Expect = $true
+            CommandLine = (($root + '\venv\Scripts\python.exe') + ' -m streamlit run app.py')
+            ExecutablePath = ($root + '\venv\Scripts\python.exe')
+        },
+        @{
+            Name = 'sibling plain venv'
+            Expect = $false
+            CommandLine = 'C:\OneDrive\Python Scripts\dfs-lineup-generator-other\venv\Scripts\python.exe -m streamlit run app.py'
+            ExecutablePath = 'C:\OneDrive\Python Scripts\dfs-lineup-generator-other\venv\Scripts\python.exe'
         },
         @{
             Name = 'quoted path with spaces'
@@ -345,6 +384,17 @@ switch ($Command) {
     }
     'wait-and-open' {
         Invoke-WaitAndOpen
+        exit 0
+    }
+    'resolve-python' {
+        $chosen = Resolve-LauncherPython $ProjectRoot
+        if ([string]::IsNullOrWhiteSpace($chosen)) {
+            Write-AsciiFile $OutFile 'MISSING'
+            Write-LaunchLog 'No .venv\Scripts\python.exe or venv\Scripts\python.exe was found.'
+        } else {
+            Write-AsciiFile $OutFile $chosen
+            Write-LaunchLog ("Selected Python: " + $chosen)
+        }
         exit 0
     }
     'self-test' {

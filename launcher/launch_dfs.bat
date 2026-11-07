@@ -15,7 +15,7 @@ set "ROOT=%CD%"
 set "LOGDIR=%ROOT%\launcher\logs"
 set "LOG=%LOGDIR%\launch.log"
 set "LOCKDIR=%LOGDIR%\launch.lockdir"
-set "PY=%ROOT%\.venv\Scripts\python.exe"
+set "PY="
 set "HELPER=%ROOT%\launcher\windows_helpers.ps1"
 set "LOCK_HELD=0"
 set "LAUNCH_PID="
@@ -41,7 +41,10 @@ if "%LAUNCH_ACTION%"=="browser" goto :open_and_exit
 if "%LAUNCH_ACTION%"=="busy" goto :peer_busy
 if not "%LAUNCH_ACTION%"=="owner" goto :lock_failed
 
-if not exist "%PY%" goto :missing_venv
+call :select_python
+if not "%PYTHON_OK%"=="1" goto :missing_venv
+set "DFS_PYTHON=%PY%"
+call :log "Using Python: %PY%"
 
 call :git_update
 call :maybe_pip
@@ -85,14 +88,20 @@ call :release_lock
 exit /b 0
 
 :missing_venv
-call :log "Python virtual environment was not found: %PY%"
+call :log "Python virtual environment was not found. Checked .venv\Scripts\python.exe and venv\Scripts\python.exe."
 echo.
-echo The DFS Lineup Generator virtual environment is missing:
-echo   %PY%
+echo The DFS Lineup Generator virtual environment was not found.
+echo Checked both of these:
+echo   %ROOT%\.venv\Scripts\python.exe
+echo   %ROOT%\venv\Scripts\python.exe
 echo.
-echo From this project folder, create it and install dependencies:
+echo From this project folder, create one of them and install dependencies.
+echo When both exist, .venv is used:
 echo   py -3 -m venv .venv
 echo   .venv\Scripts\python.exe -m pip install -r requirements.txt
+echo or:
+echo   py -3 -m venv venv
+echo   venv\Scripts\python.exe -m pip install -r requirements.txt
 echo.
 echo Then start DFS Lineup Generator again. Setup steps are in README.md.
 echo.
@@ -194,6 +203,22 @@ if not exist "%PIDFILE%" goto :eof
 for /f "usebackq delims=" %%P in ("%PIDFILE%") do set "LAUNCH_PID=%%P"
 call :digits_only "%LAUNCH_PID%"
 if not "%DIGITS_OK%"=="1" set "LAUNCH_PID="
+goto :eof
+
+:select_python
+set "PYTHON_OK=0"
+set "PY="
+set "PYFILE=%LOGDIR%\python-path.txt"
+if exist "%PYFILE%" del /q "%PYFILE%"
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%HELPER%" -Command resolve-python -ProjectRoot "%ROOT%" -OutFile "%PYFILE%" -LogPath "%LOG%"
+if not exist "%PYFILE%" goto :eof
+set "PYLINE="
+for /f "usebackq delims=" %%P in ("%PYFILE%") do set "PYLINE=%%P"
+if not defined PYLINE goto :eof
+if /I "%PYLINE%"=="MISSING" goto :eof
+set "PY=%PYLINE%"
+if not exist "%PY%" goto :eof
+set "PYTHON_OK=1"
 goto :eof
 
 :acquire_or_wait
@@ -339,17 +364,17 @@ goto :eof
 if not exist "%ROOT%\requirements.txt" goto :no_req
 cd /d "%ROOT%"
 if errorlevel 1 goto :pip_cd_failed
-"%PY%" -c "import hashlib,os,pathlib,sys; root=pathlib.Path(os.environ['DFS_ROOT']); req=root/'requirements.txt'; stamp=root/'launcher'/'logs'/'requirements.sha256'; digest=hashlib.sha256(req.read_bytes()).hexdigest(); old=stamp.read_text(encoding='utf-8').strip() if stamp.is_file() else ''; sys.exit(0 if digest==old else 20)"
+"%PY%" -c "import hashlib,os,pathlib,sys; root=pathlib.Path(os.environ['DFS_ROOT']); py=os.environ['DFS_PYTHON']; req=root/'requirements.txt'; stamp=root/'launcher'/'logs'/'requirements.sha256'; digest=hashlib.sha256(req.read_bytes()).hexdigest(); lines=[line.strip() for line in (stamp.read_text(encoding='utf-8').splitlines() if stamp.is_file() else []) if line.strip()]; sys.exit(0 if len(lines)>=2 and lines[0]==digest and lines[1]==py else 20)"
 if errorlevel 20 goto :pip_needed
 if errorlevel 1 goto :pip_hash_failed
-call :log "requirements.txt is unchanged since the last successful install."
+call :log "requirements.txt is unchanged for this Python since the last successful install."
 goto :eof
 
 :pip_needed
-call :log "requirements.txt changed or has not been installed yet. Running: python -m pip install -r requirements.txt"
+call :log "requirements.txt changed or this Python has not been installed yet. Running: %PY% -m pip install -r requirements.txt"
 "%PY%" -m pip install -r requirements.txt >>"%LOG%" 2>&1
 if errorlevel 1 goto :pip_failed
-"%PY%" -c "import hashlib,os,pathlib; root=pathlib.Path(os.environ['DFS_ROOT']); req=root/'requirements.txt'; stamp=root/'launcher'/'logs'/'requirements.sha256'; stamp.parent.mkdir(parents=True, exist_ok=True); tmp=stamp.with_suffix('.sha256.tmp'); tmp.write_text(hashlib.sha256(req.read_bytes()).hexdigest()+'\n', encoding='utf-8'); tmp.replace(stamp)"
+"%PY%" -c "import hashlib,os,pathlib; root=pathlib.Path(os.environ['DFS_ROOT']); py=os.environ['DFS_PYTHON']; req=root/'requirements.txt'; stamp=root/'launcher'/'logs'/'requirements.sha256'; stamp.parent.mkdir(parents=True, exist_ok=True); tmp=stamp.with_suffix('.sha256.tmp'); tmp.write_text(hashlib.sha256(req.read_bytes()).hexdigest()+'\n'+py+'\n', encoding='utf-8'); tmp.replace(stamp)"
 if errorlevel 1 goto :pip_stamp_failed
 call :log "Dependencies installed. Recorded the requirements stamp under launcher\logs."
 goto :eof
