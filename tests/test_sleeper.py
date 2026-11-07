@@ -125,9 +125,9 @@ def test_apply_sleeper_replaces_projections_and_drops_inactive():
     assert by_id.loc["10", "Sleeper"] == 24.5
     assert by_id.loc["2", "Injury"] == "OUT"
     assert is_inactive_injury(by_id.loc["2", "Injury"])
-    # Sleeper says Cook is only questionable, so the DK OUT tag is cleared.
-    assert by_id.loc["3", "Injury"] == "QUESTIONABLE"
-    assert not is_inactive_injury(by_id.loc["3", "Injury"])
+    # DraftKings OUT stays OUT when Sleeper only says questionable.
+    assert by_id.loc["3", "Injury"] == "OUT"
+    assert is_inactive_injury(by_id.loc["3", "Injury"])
     assert by_id.loc["4", "Projection"] == 8.4
     assert by_id.loc["5", "Injury"] == "DOUBTFUL"
     assert by_id.loc["6", "Projection"] == 1.5
@@ -137,7 +137,7 @@ def test_apply_sleeper_replaces_projections_and_drops_inactive():
     assert "2" not in set(active["ID"])
     assert "5" not in set(active["ID"])
     assert "1" in set(active["ID"])
-    assert "3" in set(active["ID"])
+    assert "3" not in set(active["ID"])
 
 
 def test_apply_sleeper_accepts_integer_draftkings_projections():
@@ -163,13 +163,34 @@ def test_apply_sleeper_accepts_integer_draftkings_projections():
 def test_overlay_uses_cache_and_survives_errors(tmp_path, monkeypatch):
     cache = tmp_path / "sleeper_cache.json"
     calls: list[str] = []
+    schedule = [
+        {
+            "game_date": "2025-09-07",
+            "season": "2025",
+            "week": 1,
+            "season_type": "regular",
+            "away": "KC",
+            "home": "BUF",
+        }
+    ]
 
     def _ok(url: str, timeout: float = 30):
         calls.append(url)
-        if url.endswith("/state/nfl"):
-            return {"season": "2026", "week": 4, "season_type": "regular"}
-        if "/projections/nfl/2026/4" in url:
-            return [_record("Josh", "Allen", "BUF", "QB", 21.0, "Questionable")]
+        if "/state/nfl" in url:
+            raise AssertionError("current week endpoint")
+        if "/projections/nfl/2025/1" in url and "season_type=regular" in url:
+            row = _record("Josh", "Allen", "BUF", "QB", 21.0, "Questionable")
+            row.update(
+                {
+                    "season": "2025",
+                    "week": 1,
+                    "season_type": "regular",
+                    "date": "2025-09-07",
+                    "opponent": "KC",
+                    "updated_at": 1759765502622,
+                }
+            )
+            return [row]
         if url.endswith("/players/nfl"):
             return {
                 "1": {
@@ -180,6 +201,7 @@ def test_overlay_uses_cache_and_survives_errors(tmp_path, monkeypatch):
                     "depth_chart_position": "QB",
                     "depth_chart_order": 1,
                     "injury_status": None,
+                    "player_id": "1",
                 },
                 "2": {
                     "first_name": "Mitchell",
@@ -189,6 +211,7 @@ def test_overlay_uses_cache_and_survives_errors(tmp_path, monkeypatch):
                     "depth_chart_position": "QB",
                     "depth_chart_order": 2,
                     "injury_status": None,
+                    "player_id": "2",
                 },
             }
         raise AssertionError(url)
@@ -203,33 +226,48 @@ def test_overlay_uses_cache_and_survives_errors(tmp_path, monkeypatch):
                 "TeamAbbrev": "BUF",
                 "Projection": 1.0,
                 "Injury": "",
+                "Game Info": "KC@BUF 09/07/2025 01:00PM ET",
             }
         ]
     )
     now = datetime(2026, 10, 5, 18, 0)
     updated, summary = overlay_sleeper_projections(
-        pool, force_refresh=True, cache_path=cache, now=now
+        pool,
+        force_refresh=True,
+        cache_path=cache,
+        now=now,
+        schedule_games=schedule,
     )
     assert updated.loc[0, "Projection"] == 21.0
     assert updated.loc[0, "Sleeper"] == 21.0
     assert updated.loc[0, "DepthOrder"] == 1
-    assert summary["week"] == 4
+    # Blank depth injury does not clear the projection-feed questionable tag.
+    assert updated.loc[0, "Injury"] == "QUESTIONABLE"
+    assert updated.loc[0, "PreLock"] == "Q"
+    assert summary["week"] == 1
+    assert summary["season"] == "2025"
     assert summary["matched"] == 1
     assert summary["has_depth"] is True
     assert summary["ok"] is True
-    assert len(calls) == 3
+    assert summary["injury_updated_at"] is None
+    assert not any("/state/nfl" in url for url in calls)
+    assert len(calls) == 2
     saved = json.loads(cache.read_text(encoding="utf-8"))
-    assert "josh allen|BUF" in saved["index"]
+    assert saved["match_schema"] == 1
+    assert saved["index"]["projections"][0]["name"] == "josh allen"
 
     def _boom(url: str, timeout: float = 30):
         raise URLError("down")
 
     monkeypatch.setattr("src.sleeper._http_get", _boom)
     cached_index, meta = load_sleeper_index(
+        pool=pool,
         force_refresh=True,
         cache_path=cache,
         now=datetime(2026, 10, 5, 20, 0),
+        schedule_games=schedule,
     )
-    assert "josh allen|BUF" in cached_index
+    assert cached_index["projections"][0]["name"] == "josh allen"
     assert meta["from_cache"] is True
     assert str(meta["error"]).startswith("fetch_failed")
+    assert meta["week"] == 1
