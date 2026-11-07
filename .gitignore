@@ -222,3 +222,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Desktop launcher runtime (log, lock, requirements stamp). Not project data.
+launcher/logs/
