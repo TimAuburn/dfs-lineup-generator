@@ -440,3 +440,143 @@ def test_optimizer_and_export_apply_captain_multiplier_once():
     exported = lineups_to_dk_upload_csv([lineup], contest_format=ContestFormat.SHOWDOWN)
     assert exported.splitlines()[0] == "CPT,FLEX,FLEX,FLEX,FLEX,FLEX"
     assert str(captain["ID"]) in exported.splitlines()[1].split(",")
+
+
+# Real Sleeper stat lines. These formula totals are not official DraftKings
+# contest results. Provenance:
+# https://api.sleeper.app/v1/stats/nfl/regular/2025/3  player 12497 Tory Horton
+# https://api.sleeper.app/v1/stats/nfl/regular/2025/12 player 12540 Chimere Dike
+# https://api.sleeper.app/v1/stats/nfl/regular/2025/1  team CHI
+# https://api.sleeper.app/projections/nfl/2026/9?season_type=regular  NO and DAL
+
+
+def test_realized_return_td_uses_st_td_once_for_horton_and_dike():
+    horton = score_realized(
+        {"rec": 3, "rec_yd": 32, "rec_td": 1, "st_td": 1},
+        position="WR",
+        contest="classic",
+    )
+    # 3 receptions + 3.2 receiving yards + 6 receiving TD + 6 return TD.
+    assert horton.basis == "draftkings"
+    assert horton.points == pytest.approx(18.2)
+    dike = score_realized(
+        {"rec": 5, "rec_yd": 44, "rec_td": 1, "st_td": 1},
+        position="WR",
+        contest="showdown",
+    )
+    assert dike.points == pytest.approx(21.4)
+
+
+def test_return_td_aliases_are_not_summed_and_inconsistent_totals_are_refused():
+    aliased = score_realized(
+        {"rec": 0, "rec_yd": 0, "rec_td": 0, "st_td": 1, "kr_td": 1, "pr_td": 1},
+        position="WR",
+        contest="classic",
+    )
+    assert aliased.points == pytest.approx(6.0)
+    partitioned = score_realized(
+        {"rec": 0, "rec_yd": 0, "rec_td": 0, "st_td": 2, "kr_td": 1, "pr_td": 1},
+        position="WR",
+        contest="classic",
+    )
+    assert partitioned.points == pytest.approx(12.0)
+    inconsistent = score_realized(
+        {"rec": 0, "rec_yd": 0, "rec_td": 0, "st_td": 1, "kr_td": 1, "pr_td": 0.4},
+        position="WR",
+        contest="classic",
+    )
+    assert inconsistent.basis == "unavailable"
+    assert inconsistent.points is None
+
+
+def test_dst_does_not_drop_special_teams_or_triple_count_aliases():
+    """2026 week-9 projection fields. NO repeats one ST TD three ways. DAL's def_td is only the defensive TD."""
+    counting = {
+        "sack": 2.98,
+        "int": 0.76,
+        "fum_rec": 0.61,
+        "pts_allow": 19.75,
+        "blk_kick": 0.08,
+    }
+    once = score_projection({**counting, "st_td": 0.08}, position="DST", contest="classic")
+    aliased = score_projection(
+        {**counting, "st_td": 0.08, "def_kr_td": 0.08, "def_pr_td": 0.08},
+        position="DST",
+        contest="classic",
+    )
+    assert once.basis == "draftkings"
+    assert aliased.points == pytest.approx(once.points)
+
+    defense_only = {
+        "sack": 2.48,
+        "int": 0.71,
+        "fum_rec": 0.53,
+        "pts_allow": 23.5,
+        "blk_kick": 0.06,
+        "def_td": 0.06,
+        "pass_int_td": 0.06,
+    }
+    with_st = score_projection(
+        {**defense_only, "st_td": 0.06, "def_kr_td": 0.06, "def_pr_td": 0.06},
+        position="DST",
+        contest="showdown",
+    )
+    without_st = score_projection(defense_only, position="DST", contest="showdown")
+    assert with_st.points == pytest.approx(without_st.points + 0.36)
+
+
+def test_dst_ignores_team_td_total_and_refuses_a_def_td_that_disagrees_with_parts():
+    chi = score_realized(
+        {"sack": 3, "int": 1, "def_td": 1, "pts_allow": 27, "td": 3},
+        position="DST",
+        contest="classic",
+    )
+    # Sack 3 + interception 2 + one defensive TD 6 + 21-27 points allowed 0.
+    # The team ``td`` of 3 includes offense and is not added.
+    assert chi.points == pytest.approx(11.0)
+    broken = score_projection(
+        {
+            "sack": 1,
+            "int": 1,
+            "fum_rec": 0,
+            "pts_allow": 20,
+            "def_td": 0.19,
+            "pass_int_td": 0.10,
+            "def_fum_td": 0.10,
+        },
+        position="DST",
+        contest="classic",
+    )
+    assert broken.basis == "unavailable"
+    assert broken.points is None
+
+
+def test_points_allowed_weights_must_be_finite_and_between_zero_and_one():
+    scored = score_projection(
+        {
+            "sack": 0,
+            "int": 0,
+            "fum_rec": 0,
+            "pts_allow": 21,
+            "pts_allow_0": -1,
+            "pts_allow_35p": 2,
+        },
+        position="DST",
+        contest="classic",
+    )
+    assert scored.basis == "draftkings"
+    assert -4.0 <= scored.bonuses["points_allowed"] <= 10.0
+    assert scored.bonuses["points_allowed"] != pytest.approx(-18.0)
+    nonsense = score_projection(
+        {
+            "sack": 0,
+            "int": 0,
+            "fum_rec": 0,
+            "pts_allow": 21,
+            "pts_allow_0": float("nan"),
+            "pts_allow_14_20": 1,
+        },
+        position="DST",
+        contest="classic",
+    )
+    assert -4.0 <= nonsense.bonuses["points_allowed"] <= 10.0

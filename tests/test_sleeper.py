@@ -233,7 +233,7 @@ def test_overlay_uses_cache_and_survives_errors(tmp_path, monkeypatch):
     assert "josh allen|BUF" in cached_index
     assert meta["from_cache"] is True
     assert str(meta["error"]).startswith("fetch_failed")
-    assert saved["scoring"] == "dk-component-v1"
+    assert saved["scoring"] == "dk-component-v2"
 
 
 def test_cache_without_scoring_version_is_not_reused(tmp_path, monkeypatch):

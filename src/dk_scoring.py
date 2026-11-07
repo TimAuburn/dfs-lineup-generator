@@ -43,17 +43,31 @@ Choices that were rejected:
 Choice used for the bonus and, unless a real bucket distribution is present,
 for points allowed: a normal approximation. The mean is the Sleeper component.
 The scale is the median within-player (or within-team) week-to-week sample
-standard deviation from Sleeper actuals for the 2025 regular season, weeks
-1-18, among players or defenses with at least 8 games:
+standard deviation from Sleeper actuals for the 2025 regular season only
+(weeks 1-18), so the current season is not in the fit. ``scripts/fit_bonus_scales.py``
+recomputes it. A player needs at least 8 qualifying weeks. Sample SD uses
+``n - 1``. When the player count is even, the median is the average of the
+two central values. Sleeper omits a zero stat, so a missing yardage key on a
+qualifying week is 0. Team aggregate ids are excluded. Position comes from
+``/v1/players/nfl``.
 
-- Passing yards: 65 quarterbacks with at least 15 attempts in a game,
-  median SD 64.24.
-- Rushing yards: 44 players with at least 8 rushes and fewer than 5 pass
-  attempts, median SD 31.66.
-- Receiving yards for WR and TE: 82 players with at least 3 receptions and
-  fewer than 5 rushes, median SD 27.48.
-- Receiving yards for RB: 75 players with at least 8 rushes, median SD 24.42.
-- Points allowed: 32 defenses, median within-team SD 8.90.
+An earlier fit counted team aggregates as quarterbacks (65 players, SD 64.24)
+and kept only weeks where a receiving-yard key was present (75 players, SD
+24.42). Those counts are not reproducible from the rules below. The rerun on
+2026-11-07 produced:
+
+- Passing yards: position QB, weeks with at least 15 pass attempts. 33 players,
+  median SD 63.27.
+- Rushing yards: position RB, weeks with at least 8 rushes. 44 players,
+  median SD 31.57.
+- Receiving yards, WR: position WR, weeks with at least 3 receptions.
+  53 players, median SD 28.57.
+- Receiving yards, TE: position TE, weeks with at least 3 receptions.
+  29 players, median SD 24.01.
+- Receiving yards, RB: the same RB rush weeks, missing receiving yards as 0.
+  44 players, median SD 16.94.
+- Points allowed: team defense ids with ``pts_allow``. 32 defenses,
+  median SD 9.28.
 
 Yards are treated as discrete. P(Y >= threshold) uses a continuity correction,
 1 - Phi((threshold - 0.5 - mean) / sd). The bonus expectation is 3 times that
@@ -62,13 +76,19 @@ renormalized, then the official tier of each integer. This scale is the
 week-to-week spread around a player's own season, which is wider than the
 error of a matchup projection. It is not a betting probability.
 
-When the feed has two or more points-allowed bucket weights that sum to about
-1, those weights are used instead of the normal approximation.
+When the feed has two or more points-allowed bucket weights that are finite,
+each between 0 and 1, and sum to about 1, those weights are used instead of
+the normal approximation. A weight of -1 or 2 is not a probability, so that
+record uses the normal approximation.
 
-A defense's yards allowed are on the Sleeper record and are not on either
-DraftKings table, so they are reported as unused. ``def_td`` is the total of
-the component touchdown fields when both are present, so the components are
-not added a second time.
+Return touchdowns are one group. ``st_td`` (and ``def_st_td`` on a defense)
+is the total. Kick-return and punt-return fields are parts when they add up
+to that total, and aliases when each of them equals the total. Aliases are
+counted once. A total that matches neither the sum nor the alias pattern is
+not scored. ``def_td`` is the defensive touchdown total (interception and
+fumble returns). It does not include special-teams touchdowns, and the team
+``td`` field includes offense, so that field is not a defense score. A
+defense's yards allowed are not on either DraftKings table.
 
 Sleeper omits zeroes. A projection is scored only when the position's required
 keys are present. Optional keys that are absent count as zero and are listed
@@ -103,21 +123,23 @@ from typing import Mapping, Optional
 
 CLASSIC_RULES_URL = "https://www.draftkings.com/help/rules/nfl/classic"
 SHOWDOWN_RULES_URL = "https://www.draftkings.com/help/rules/nfl/showdown-captain-mode"
-SCORING_VERSION = "dk-component-v1"
+SCORING_VERSION = "dk-component-v2"
 HISTORICAL_RECONCILIATION = "unverified"
 
-PASS_YARDS_SD = 64.24
-RUSH_YARDS_SD = 31.66
-REC_YARDS_SD = 27.48
-REC_YARDS_RB_SD = 24.42
-POINTS_ALLOWED_SD = 8.90
+PASS_YARDS_SD = 63.27
+RUSH_YARDS_SD = 31.57
+REC_YARDS_SD = 28.57
+REC_YARDS_TE_SD = 24.01
+REC_YARDS_RB_SD = 16.94
+POINTS_ALLOWED_SD = 9.28
 KICKER_SPLIT_TOLERANCE = 0.05
 
 _QB_REQUIRED = ("pass_yd", "pass_td", "pass_int")
 _RB_REQUIRED = ("rush_yd", "rush_td")
 _RECEIVING_REQUIRED = ("rec", "rec_yd", "rec_td")
 _WR_REQUIRED = _RECEIVING_REQUIRED
-_DST_REQUIRED = ("sack", "int", "fum_rec", "pts_allow")
+_DST_REQUIRED = ("sack", "int", "pts_allow")
+_TD_TOLERANCE = 1e-4
 _KICKER_REQUIRED = ("xpm",)
 
 _PA_BUCKETS = (
@@ -129,14 +151,6 @@ _PA_BUCKETS = (
     ("pts_allow_28_34", 28),
     ("pts_allow_35", 35),
     ("pts_allow_35p", 35),
-)
-_DST_TD_PARTS = (
-    "def_fum_td",
-    "pass_int_td",
-    "def_pr_td",
-    "def_kr_td",
-    "def_st_td",
-    "st_td",
 )
 _SHORT_FG = ("fgm_0_19", "fgm_20_29", "fgm_30_39")
 _NOT_SCORED_WHEN_PRESENT = (
@@ -321,10 +335,22 @@ def _score_skill(
     points += _optional(stats, "fum_lost", omitted) * -1.0
     for key in ("pass_2pt", "rush_2pt", "rec_2pt"):
         points += _optional(stats, key, omitted) * 2.0
-    for key in ("pr_td", "kr_td", "fum_rec_td"):
-        points += _optional(stats, key, omitted) * 6.0
+    returned, conflict = _touchdown_count(
+        stats,
+        totals=("st_td",),
+        parts=(("kr_td",), ("pr_td",)),
+    )
+    if conflict:
+        return _conflict(conflict)
+    points += returned * 6.0
+    points += _optional(stats, "fum_rec_td", omitted) * 6.0
 
-    rec_scale = REC_YARDS_RB_SD if position == "RB" else REC_YARDS_SD
+    if position == "RB":
+        rec_scale = REC_YARDS_RB_SD
+    elif position == "TE":
+        rec_scale = REC_YARDS_TE_SD
+    else:
+        rec_scale = REC_YARDS_SD
     bonuses["pass_300"] = _bonus(pass_yd, 300, PASS_YARDS_SD, realized)
     bonuses["rush_100"] = _bonus(rush_yd, 100, RUSH_YARDS_SD, realized)
     bonuses["rec_100"] = _bonus(rec_yd, 100, rec_scale, realized)
@@ -346,8 +372,22 @@ def _score_dst(stats: Mapping[str, object], *, realized: bool) -> ScoreResult:
     unavailable: list[str] = list(_unused(stats))
     points = _required_num(stats, "sack") * 1.0
     points += _required_num(stats, "int") * 2.0
-    points += _required_num(stats, "fum_rec") * 2.0
-    points += _dst_touchdowns(stats) * 6.0
+    points += _optional(stats, "fum_rec", omitted) * 2.0
+    defensive, conflict = _touchdown_count(
+        stats,
+        totals=("def_td",),
+        parts=(("pass_int_td",), ("def_fum_td",)),
+    )
+    if conflict:
+        return _conflict(conflict)
+    special, conflict = _touchdown_count(
+        stats,
+        totals=("st_td", "def_st_td"),
+        parts=(("def_kr_td", "kr_td"), ("def_pr_td", "pr_td")),
+    )
+    if conflict:
+        return _conflict(conflict)
+    points += (defensive + special) * 6.0
     points += _optional(stats, "safe", omitted) * 2.0
     points += _optional(stats, "blk_kick", omitted) * 2.0
     points += _optional(stats, "def_2pt", omitted) * 2.0
@@ -431,9 +471,11 @@ def _expected_points_allowed(mean: float, scale: float) -> float:
 def _bucket_weights(stats: Mapping[str, object]) -> Optional[list[tuple[int, float]]]:
     present: list[tuple[int, float]] = []
     for key, bucket in _PA_BUCKETS:
-        number = _number(stats.get(key)) if key in stats else None
-        if number is None:
+        if key not in stats:
             continue
+        number = _number(stats.get(key))
+        if number is None or not math.isfinite(number) or number < 0.0 or number > 1.0:
+            return None
         present.append((bucket, number))
     if len(present) < 2:
         return None
@@ -443,11 +485,70 @@ def _bucket_weights(stats: Mapping[str, object]) -> Optional[list[tuple[int, flo
     return present
 
 
-def _dst_touchdowns(stats: Mapping[str, object]) -> float:
-    total = _number(stats.get("def_td")) if "def_td" in stats else None
+def _conflict(warning: str) -> ScoreResult:
+    return ScoreResult(
+        points=None,
+        basis="unavailable",
+        warning=warning,
+        missing=("touchdowns",),
+    )
+
+
+def _touchdown_count(
+    stats: Mapping[str, object],
+    *,
+    totals: tuple[str, ...],
+    parts: tuple[tuple[str, ...], ...],
+) -> tuple[float, Optional[str]]:
+    """One touchdown group.
+
+    Keys in one part tuple are aliases of each other. Different parts are
+    different events and add. A total that equals the sum of the parts is a
+    partition. A total that equals every part is the same event stored more
+    than once. Anything else is refused.
+    """
+    total_vals: list[tuple[str, float]] = []
+    for key in totals:
+        if key not in stats:
+            continue
+        number = _number(stats.get(key))
+        if number is None:
+            return 0.0, f"{key} is not a number"
+        total_vals.append((key, number))
+    if total_vals and any(abs(value - total_vals[0][1]) > _TD_TOLERANCE for _, value in total_vals[1:]):
+        names = ", ".join(key for key, _ in total_vals)
+        return 0.0, f"Touchdown totals disagree: {names}"
+
+    part_values: list[float] = []
+    for aliases in parts:
+        present: list[tuple[str, float]] = []
+        for key in aliases:
+            if key not in stats:
+                continue
+            number = _number(stats.get(key))
+            if number is None:
+                return 0.0, f"{key} is not a number"
+            present.append((key, number))
+        if not present:
+            continue
+        if any(abs(value - present[0][1]) > _TD_TOLERANCE for _, value in present[1:]):
+            names = ", ".join(key for key, _ in present)
+            return 0.0, f"Touchdown aliases disagree: {names}"
+        part_values.append(present[0][1])
+
+    total = total_vals[0][1] if total_vals else None
+    part_sum = sum(part_values) if part_values else None
+    if total is not None and part_sum is not None:
+        if abs(part_sum - total) <= _TD_TOLERANCE:
+            return total, None
+        if all(abs(value - total) <= _TD_TOLERANCE for value in part_values):
+            return total, None
+        return 0.0, "Touchdown total does not match its parts"
     if total is not None:
-        return total
-    return sum(_number(stats.get(key)) or 0.0 for key in _DST_TD_PARTS if key in stats)
+        return total, None
+    if part_sum is not None:
+        return part_sum, None
+    return 0.0, None
 
 
 def _field_goals(

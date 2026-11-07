@@ -282,6 +282,13 @@ def apply_sleeper_index(pool: pd.DataFrame, index: dict) -> tuple[pd.DataFrame, 
     stale DK tag. Captain rows are stored at 1x.
     """
     updated = pool.copy()
+    if "PPR" not in updated.columns:
+        updated["PPR"] = pd.Series(pd.NA, index=updated.index, dtype="Float64")
+    if "Scoring" not in updated.columns:
+        updated["Scoring"] = ""
+    if "ScoringNote" not in updated.columns:
+        updated["ScoringNote"] = ""
+    updated.attrs["scoring_version"] = SCORING_VERSION
     if updated.empty or not index:
         return updated, 0
     if "Projection" not in updated.columns:
@@ -506,8 +513,61 @@ def scoring_approximation_lines(pool: pd.DataFrame) -> str:
     )
 
 
-def sleeper_status_caption(summary: Optional[dict]) -> str:
+# Visible scoring metadata. A retained pool that loses any of these, including
+# through an editor whitelist that copies only a subset of columns, is not a
+# current DraftKings score.
+SCORING_COLUMNS = ("PPR", "Scoring", "ScoringNote")
+
+
+def scoring_metadata_current(pool: object, summary: object) -> bool:
+    """True when this pool was scored by the current DraftKings adapter."""
+    if not isinstance(pool, pd.DataFrame):
+        return False
+    if any(column not in pool.columns for column in SCORING_COLUMNS):
+        return False
+    if pool.attrs.get("scoring_version") != SCORING_VERSION:
+        return False
+    return isinstance(summary, dict) and summary.get("scoring") == SCORING_VERSION
+
+
+def drop_stale_scoring_session(state: dict) -> bool:
+    """Clear a pool and its lineups when their scoring version is missing or old.
+
+    The stored numbers cannot be rescored: the component stats are not on the
+    frame. Leaving them up would let a PPR total sit under a DraftKings caption.
+    A pool stamped with the current version is kept, including its lineups.
+    """
+    pool = state.get("player_pool")
+    summary = state.get("sleeper_summary")
+    lineups = state.get("lineups") or []
+    generated = state.get("generated_run")
+    has_work = (
+        isinstance(pool, pd.DataFrame)
+        or bool(lineups)
+        or generated is not None
+        or summary is not None
+    )
+    if not has_work or scoring_metadata_current(pool, summary):
+        return False
+    state["player_pool"] = None
+    state["lineups"] = []
+    state["generated_run"] = None
+    state["sleeper_summary"] = None
+    return True
+
+
+def sleeper_status_caption(summary: Optional[dict], pool: object = None) -> str:
     """One line for the player-pool caption."""
+    if pool is not None and not scoring_metadata_current(pool, summary):
+        return (
+            "Stored projections are missing current DraftKings scoring metadata "
+            "and were not used."
+        )
+    if isinstance(summary, dict) and summary.get("ok") and summary.get("scoring") != SCORING_VERSION:
+        return (
+            "Stored Sleeper projections do not match the current DraftKings "
+            "scoring version and were not used."
+        )
     if not summary or not summary.get("ok"):
         detail = (summary or {}).get("error") or "unavailable"
         return f"Sleeper projections unavailable ({detail}). Using DraftKings averages."

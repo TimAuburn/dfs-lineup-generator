@@ -53,9 +53,12 @@ from src.optimizer import (
 from src.parser import DKCSVValidationError, is_inactive_injury, parse_dk_csv
 from src.dk_scoring import SCORING_VERSION
 from src.sleeper import (
+    SCORING_COLUMNS,
+    drop_stale_scoring_session,
     overlay_sleeper_projections,
     scoring_approximation_lines,
     scoring_fallback_lines,
+    scoring_metadata_current,
     sleeper_status_caption,
 )
 from src.vegas_cache import (
@@ -132,6 +135,8 @@ def _init_state() -> None:
     )
     for key, value in migrated.items():
         st.session_state[key] = value
+    if drop_stale_scoring_session(st.session_state):
+        st.session_state.sleeper_version = int(st.session_state.get("sleeper_version") or 0) + 1
 
 
 def _on_format_change() -> None:
@@ -1078,6 +1083,8 @@ st.caption(
 export_headers = ",".join(upload_columns_for(contest_format))
 st.caption(f"Export template: `{export_headers}`")
 
+if drop_stale_scoring_session(st.session_state):
+    st.session_state.sleeper_version = int(st.session_state.get("sleeper_version") or 0) + 1
 lineups = st.session_state.lineups
 csv_text = (
     lineups_to_dk_upload_csv(lineups, contest_format=contest_format) if lineups else ""
@@ -1185,7 +1192,14 @@ sleeper_refresh = st.button("Refresh Sleeper projections", key="refresh_sleeper"
 if sleeper_refresh:
     st.session_state.sleeper_force = True
     st.rerun()
-st.caption(sleeper_status_caption(st.session_state.sleeper_summary))
+if not scoring_metadata_current(pool, st.session_state.sleeper_summary):
+    drop_stale_scoring_session(st.session_state)
+    st.session_state.sleeper_version = int(st.session_state.get("sleeper_version") or 0) + 1
+    st.error(
+        "Stored projections are missing current DraftKings scoring metadata and were not used."
+    )
+    st.stop()
+st.caption(sleeper_status_caption(st.session_state.sleeper_summary, pool))
 fallback_line = scoring_fallback_lines(pool)
 if fallback_line:
     st.warning(fallback_line)
@@ -1379,6 +1393,15 @@ if "Exclude" in edited.columns and "Name" in edited.columns:
         ].copy()
 
 if generate:
+    if not scoring_metadata_current(
+        st.session_state.player_pool, st.session_state.sleeper_summary
+    ) or any(column not in working_pool.columns for column in SCORING_COLUMNS):
+        drop_stale_scoring_session(st.session_state)
+        st.session_state.sleeper_version = int(st.session_state.get("sleeper_version") or 0) + 1
+        st.error(
+            "Stored projections are missing current DraftKings scoring metadata and were not used."
+        )
+        st.stop()
     progress = st.progress(0, text="Building optimizer…")
     try:
         if working_pool.empty:
