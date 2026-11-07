@@ -156,6 +156,33 @@ def _init_state() -> None:
         st.session_state[key] = value
 
 
+def _player_editor_key(
+    contest_format: ContestFormat,
+    pool_signature: str,
+    sleeper_version: int,
+    automatic_key: str,
+    name_query: str,
+    selected_positions: list[str] | None,
+    selected_games: list[str] | None,
+    generation: int,
+) -> str:
+    """One identity for the player table.
+
+    Filters and odds are part of it. Reset bumps ``generation`` so a retained
+    projection edit is not replayed. Lock and include already live on the pool.
+    """
+    return (
+        f"player_editor_{contest_format.value}_"
+        f"{pool_signature}_"
+        f"{int(sleeper_version)}_"
+        f"{automatic_key}_"
+        f"{name_query}_"
+        f"{','.join(selected_positions or [])}_"
+        f"{','.join(selected_games or [])}_"
+        f"{int(generation)}"
+    )
+
+
 def _automatic_projection_key(frame: pd.DataFrame) -> str:
     """Editor identity for the current automatic projections.
 
@@ -1542,6 +1569,12 @@ if view == "Player pool":
         st.rerun()
     if reset_shown:
         st.session_state.player_pool = clear_projection_overrides(pool, visible_players)
+        # The editor widget will not accept a rewritten edited_rows payload.
+        # A new generation drops the replayed projection cells. Include, lock,
+        # and captain edits are already stored on the pool rows.
+        st.session_state["player_editor_generation"] = (
+            int(st.session_state.get("player_editor_generation", 0)) + 1
+        )
         st.rerun()
     if visible_players.empty:
         st.info("No players match these filters.")
@@ -1630,14 +1663,15 @@ if view == "Player pool":
                 help="Sleeper depth chart spot, such as QB, RB, LWR, RWR, or SWR.",
             ),
         },
-        key=(
-            f"player_editor_{contest_format.value}_"
-            f"{pool_signature}_"
-            f"{int(st.session_state.sleeper_version)}_"
-            f"{_automatic_projection_key(computed)}_"
-            f"{name_query}_"
-            f"{','.join(selected_positions or [])}_"
-            f"{','.join(selected_games or [])}"
+        key=_player_editor_key(
+            contest_format,
+            pool_signature,
+            int(st.session_state.sleeper_version),
+            _automatic_projection_key(computed),
+            name_query,
+            list(selected_positions or []),
+            list(selected_games or []),
+            int(st.session_state.get("player_editor_generation", 0)),
         ),
     )
     st.session_state.player_pool = apply_pool_edits(

@@ -579,6 +579,220 @@ def test_pinned_worthy_survives_odds_removal_editor_remount_and_generate():
     assert _worthy_lineup_projections(at) == pytest.approx([10.93])
 
 
+def _override_value(pool: pd.DataFrame, name: str, team: str):
+    rows = pool.loc[
+        pool["Name"].astype(str).eq(name) & pool["TeamAbbrev"].astype(str).eq(team),
+        "ProjectionOverride",
+    ]
+    assert len(rows) >= 1, (name, team)
+    return rows.iloc[0]
+
+
+def _pool_with_hidden_kelce_pins() -> pd.DataFrame:
+    """Detroit cash slate plus two Travis Kelce pins the Worthy filter must not clear."""
+    pool = _clean_det_pool()
+    game = "MIN@DET 11/08/2026 01:00PM ET"
+    extra = pd.DataFrame(
+        [
+            {
+                "ID": "kc-te",
+                "Name": "Travis Kelce",
+                "Position": "TE",
+                "TeamAbbrev": "KC",
+                "Salary": 5000,
+                "AvgPointsPerGame": 8.0,
+                "Projection": 8.0,
+                "ProjectionOverride": 9.50,
+                "Game Info": game,
+            },
+            {
+                "ID": "dal-te",
+                "Name": "Travis Kelce",
+                "Position": "TE",
+                "TeamAbbrev": "DAL",
+                "Salary": 4800,
+                "AvgPointsPerGame": 8.0,
+                "Projection": 8.0,
+                "ProjectionOverride": 8.25,
+                "Game Info": game,
+            },
+        ]
+    )
+    return pd.concat([pool, extra], ignore_index=True)
+
+
+def _open_pool(at, pool: pd.DataFrame, lines: dict, *, name_query: str = "") -> None:
+    from src.data_loader import lines_to_frame
+    from src.vegas_cache import CACHE_SCHEMA_VERSION
+
+    empty_fetch = json.dumps({}, sort_keys=True, default=str)
+    at.session_state["app_view"] = "Player pool"
+    at.session_state["contest_preset"] = "classic_cash"
+    at.session_state["contest_format"] = "classic"
+    at.session_state["player_pool"] = pool
+    at.session_state["pool_signature"] = "pool"
+    if name_query:
+        at.session_state["pool_name_pool"] = name_query
+    at.session_state["vegas_schema"] = CACHE_SCHEMA_VERSION
+    at.session_state["vegas_source_json"] = empty_fetch
+    at.session_state["vegas_editor_version"] = 1
+    at.session_state["vegas_frame"] = lines_to_frame(lines)
+    at.session_state["weather_by_home"] = {}
+    at.session_state["weather_source_json"] = empty_fetch
+
+
+def _pin_projection(at, name: str, value: float, *, also: dict | None = None) -> None:
+    editor = _player_editor(at)
+    table = editor.value.reset_index(drop=True)
+    row = int(table.index[table["Name"].eq(name)][0])
+    edits = {"Projection": value}
+    if also:
+        edits.update(also)
+    at.session_state[editor.key] = {
+        "edited_rows": {row: edits},
+        "added_rows": [],
+        "deleted_rows": [],
+    }
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+
+
+def _generate_worthy(at) -> list[float]:
+    at.session_state["app_view"] = "Optimizer"
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    button = next(item for item in at.button if item.label == "Generate Lineups")
+    button.click()
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    found = _worthy_lineup_projections(at)
+    assert found, "Xavier Worthy was not in the solved lineup"
+    return found
+
+
+def test_immediate_reset_on_the_same_editor_restores_12_07():
+    """Edit 11.50, then Reset with no odds or filter change. Solve must use 12.07."""
+    app_test = pytest.importorskip("streamlit.testing.v1")
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    at = app_test.AppTest.from_file(str(app_path))
+    _open_pool(at, _pool_with_hidden_kelce_pins(), _det_lines(50.0, -10.0))
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    editor = _player_editor(at)
+    table = editor.value.reset_index(drop=True)
+    assert float(table.loc[table["Name"].eq("Xavier Worthy"), "Projection"].iloc[0]) == pytest.approx(
+        12.07
+    )
+    _pin_projection(at, "Xavier Worthy", 11.50, also={"Lock": True})
+    assert _worthy_override(at.session_state["player_pool"]) == pytest.approx(11.50)
+
+    reset = next(item for item in at.button if item.label == "Reset to automatic")
+    reset.click()
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    pool = at.session_state["player_pool"]
+    assert pd.isna(_override_value(pool, "Xavier Worthy", "DET"))
+    assert bool(pool.loc[pool["Name"].eq("Xavier Worthy"), "Lock"].iloc[0])
+    assert _generate_worthy(at) == pytest.approx([12.07])
+
+
+def test_filtered_immediate_reset_restores_10_93_and_keeps_other_pins():
+    """A Worthy-only filter at ITT 10 resets that row and leaves both Kelce pins."""
+    app_test = pytest.importorskip("streamlit.testing.v1")
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    at = app_test.AppTest.from_file(str(app_path))
+    _open_pool(
+        at,
+        _pool_with_hidden_kelce_pins(),
+        _det_lines(40.0, 20.0),
+        name_query="Worthy",
+    )
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    editor = _player_editor(at)
+    assert list(editor.value["Name"]) == ["Xavier Worthy"]
+    assert float(editor.value["Projection"].iloc[0]) == pytest.approx(10.93)
+    _pin_projection(at, "Xavier Worthy", 11.50, also={"Include": True})
+    assert _worthy_override(at.session_state["player_pool"]) == pytest.approx(11.50)
+
+    reset = next(item for item in at.button if item.label == "Reset to automatic")
+    reset.click()
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    pool = at.session_state["player_pool"]
+    assert pd.isna(_override_value(pool, "Xavier Worthy", "DET"))
+    assert _override_value(pool, "Travis Kelce", "KC") == pytest.approx(9.50)
+    assert _override_value(pool, "Travis Kelce", "DAL") == pytest.approx(8.25)
+    assert _generate_worthy(at) == pytest.approx([10.93])
+
+
+def test_showdown_immediate_reset_clears_captain_and_flex_together():
+    """One editor row's reset clears both salary rows and the solver sees the automatic number."""
+    app_test = pytest.importorskip("streamlit.testing.v1")
+    from src.data_loader import lines_to_frame
+    from src.vegas_cache import CACHE_SCHEMA_VERSION
+
+    pool = pd.DataFrame(
+        [
+            {
+                "ID": "cpt",
+                "Name": "Xavier Worthy",
+                "Position": "WR",
+                "Roster Position": "CPT",
+                "RosterSlot": "CPT",
+                "TeamAbbrev": "DET",
+                "Salary": 16800,
+                "AvgPointsPerGame": 11.50,
+                "Projection": 11.50,
+                "Game Info": "MIN@DET 11/08/2026 01:00PM ET",
+            },
+            {
+                "ID": "flex",
+                "Name": "Xavier Worthy",
+                "Position": "WR",
+                "Roster Position": "FLEX",
+                "RosterSlot": "FLEX",
+                "TeamAbbrev": "DET",
+                "Salary": 11200,
+                "AvgPointsPerGame": 11.50,
+                "Projection": 11.50,
+                "Game Info": "MIN@DET 11/08/2026 01:00PM ET",
+            },
+        ]
+    )
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    at = app_test.AppTest.from_file(str(app_path))
+    empty_fetch = json.dumps({}, sort_keys=True, default=str)
+    at.session_state["app_view"] = "Player pool"
+    at.session_state["contest_format"] = "showdown"
+    at.session_state["contest_preset"] = "showdown_cash"
+    at.session_state["player_pool"] = pool
+    at.session_state["vegas_schema"] = CACHE_SCHEMA_VERSION
+    at.session_state["vegas_source_json"] = empty_fetch
+    at.session_state["vegas_editor_version"] = 1
+    at.session_state["vegas_frame"] = lines_to_frame(_det_lines(50.0, -10.0))
+    at.session_state["weather_by_home"] = {}
+    at.session_state["weather_source_json"] = empty_fetch
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    _pin_projection(at, "Xavier Worthy", 11.50, also={"Lock": True})
+    pinned = at.session_state["player_pool"]
+    assert list(pinned["ProjectionOverride"]) == pytest.approx([11.50, 11.50])
+
+    reset = next(item for item in at.button if item.label == "Reset to automatic")
+    reset.click()
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    cleared = at.session_state["player_pool"]
+    assert cleared["ProjectionOverride"].isna().all()
+    assert list(cleared["Lock"]) == [True, True]
+    solved = projections_for_solve(cleared, _det_lines(50.0, -10.0), {})
+    assert list(solved["Projection"]) == pytest.approx([12.07, 12.07])
+    fppg = _solver_fppg(solved, showdown=True)
+    assert fppg["flex"] == pytest.approx(12.07)
+    assert fppg["cpt"] == pytest.approx(18.105)
+
+
 def test_showdown_pin_stays_on_captain_and_flex_until_reset():
     """One editor row pins both salary rows, and reset restores the current automatic number."""
     pool = pd.DataFrame(
