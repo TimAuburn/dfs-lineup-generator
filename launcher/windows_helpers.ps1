@@ -7,6 +7,7 @@
     port-state       Write FREE, "OURS <pid>", "OTHER <pid>", or UNKNOWN.
     wait-and-open    Open the app URL once Streamlit's health check answers.
     resolve-python   Write .venv\Scripts\python.exe, else venv\Scripts\python.exe, else MISSING.
+    append-log       Append DFS_LOG_MSG to -LogPath. Retries briefly, then gives up quietly.
     self-test        Check path matching. Does not start a server or create shortcuts.
 
   port-state never stops a process. UNKNOWN and OTHER both mean "not confirmed
@@ -15,7 +16,7 @@
 #>
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('parent-pid', 'port-state', 'wait-and-open', 'resolve-python', 'self-test')]
+    [ValidateSet('parent-pid', 'port-state', 'wait-and-open', 'resolve-python', 'append-log', 'self-test')]
     [string]$Command,
 
     [string]$ProjectRoot,
@@ -29,18 +30,42 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-function Write-LaunchLog([string]$Message) {
-    if ([string]::IsNullOrWhiteSpace($LogPath)) { return }
-    try {
-        $dir = Split-Path -Parent $LogPath
-        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
-            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+function Add-LogLine([string]$Path, [string]$Message) {
+    # Share the file for concurrent appends. A few short retries cover a
+    # transient OneDrive lock. A long-lived holder (Streamlit's launch log)
+    # is not waited out: logging gives up and the caller still prints status.
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = '[' + $stamp + '] ' + $Message + [Environment]::NewLine
+    $enc = New-Object System.Text.UTF8Encoding $false
+    $bytes = $enc.GetBytes($line)
+    $maxAttempts = 4
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $stream = $null
+        try {
+            $parentDir = Split-Path -Parent $Path
+            if ($parentDir -and -not (Test-Path -LiteralPath $parentDir)) {
+                New-Item -ItemType Directory -Path $parentDir -Force | Out-Null
+            }
+            $stream = New-Object System.IO.FileStream(
+                $Path,
+                [System.IO.FileMode]::Append,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::ReadWrite)
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush()
+            return
+        } catch {
+            if ($attempt -ge $maxAttempts) { return }
+            Start-Sleep -Milliseconds 200
+        } finally {
+            if ($null -ne $stream) { $stream.Dispose() }
         }
-        $line = '[{0}] {1}{2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message, [Environment]::NewLine
-        $enc = New-Object System.Text.UTF8Encoding $false
-        [System.IO.File]::AppendAllText($LogPath, $line, $enc)
-    } catch {
     }
+}
+
+function Write-LaunchLog([string]$Message) {
+    Add-LogLine -Path $LogPath -Message $Message
 }
 
 function Get-NormalizedRoot([string]$PathText) {
@@ -384,6 +409,11 @@ switch ($Command) {
     }
     'wait-and-open' {
         Invoke-WaitAndOpen
+        exit 0
+    }
+    'append-log' {
+        $text = [string]$env:DFS_LOG_MSG
+        Add-LogLine -Path $LogPath -Message $text
         exit 0
     }
     'resolve-python' {

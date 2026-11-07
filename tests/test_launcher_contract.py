@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -19,10 +20,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = ROOT / "launcher"
 
-BAT_FILES = (
-    "launch_dfs.bat",
-    "stop_dfs.bat",
-)
+BAT_FILES = ("launch_dfs.bat",)
 PS1_FILES = (
     "create_shortcut.ps1",
     "windows_helpers.ps1",
@@ -43,7 +41,6 @@ FORBIDDEN = (
     r"stop-process\b",
     r"activate\.bat\b",
     r"activate\.ps1\b",
-    r"remove-item\b",
 )
 
 
@@ -140,26 +137,11 @@ def test_launcher_does_not_destroy_work_or_kill_broadly():
         for pattern in FORBIDDEN:
             assert re.search(pattern, code) is None, f"{name} matches {pattern}"
     launch = _read("launch_dfs.bat").lower()
-    stop = _read("stop_dfs.bat").lower()
     helper = _read("windows_helpers.ps1").lower()
     assert "taskkill" not in launch
     assert "taskkill" not in helper
-    assert "taskkill /pid" in stop
-    assert "taskkill /f /pid" in stop
-    assert "/im " not in stop
     assert "del /s" not in launch
-    assert "del /s" not in stop
-
-
-def test_stop_identifies_our_server_before_taskkill():
-    text = _read("stop_dfs.bat")
-    ours = text.index('if /I "%PORT_STATE%"=="OURS" goto :do_stop')
-    validate = text.index('call :digits_only "%OLD_PID%"')
-    kill = text.index("taskkill /PID %OLD_PID% /T")
-    assert ours < validate < kill
-    assert "Nothing was stopped." in text
-    assert "different program" in text
-    assert "Other Python programs were not stopped." in text
+    assert not (LAUNCHER / "stop_dfs.bat").exists()
 
 
 def test_port_helper_refuses_prefix_and_unrelated_listeners():
@@ -179,15 +161,16 @@ def test_shortcut_script_uses_known_desktop_and_only_its_names():
     text = _read("create_shortcut.ps1")
     assert "[Environment]::GetFolderPath('Desktop')" in text
     assert "DFS Lineup Generator.lnk" in text
-    assert "Stop DFS Lineup Generator.lnk" in text
     assert "-WindowStyle 7" in text
-    assert "-WindowStyle 1" in text
+    assert "-WindowStyle 1" not in text
     assert "WScript.Shell" in text
     assert "WorkingDirectory" in text
     assert "dfs.ico" in text
+    assert "Remove-Item -LiteralPath $legacyStop" in text
+    assert "$legacyStop = Join-Path $desktop 'Stop DFS Lineup Generator.lnk'" in text
     lowered = text.lower()
     assert "get-childitem" not in lowered
-    assert "remove-item" not in lowered
+    assert "*.lnk" not in lowered
     assert "gvandeveer" not in lowered
 
 
@@ -201,6 +184,7 @@ def test_no_hardcoded_user_path_or_env_writes():
 def test_launcher_runtime_is_gitignored_and_scripts_are_not():
     ignored = (
         "launcher/logs/launch.log",
+        "launcher/logs/idle-shutdown.txt",
         "launcher/logs/requirements.sha256",
         "launcher/logs/launch.lockdir/owner.pid",
         "launcher/logs/port-state.txt",
@@ -383,6 +367,146 @@ def test_venv_and_dot_venv_are_gitignored():
             check=False,
         )
         assert result.returncode == 0, rel
+
+
+def test_launch_logging_and_idle_exit_release_the_lock():
+    launch = _read("launch_dfs.bat")
+    assert 'set "LOG=%LOGDIR%\\launch.log"' in launch
+    assert '>>"%LOG%" echo' not in launch
+    assert "-Command append-log" in launch
+    assert "idle_watch.py" in launch
+    assert '"%PY%" -m streamlit run app.py' in launch
+    assert "--output-log" in launch
+    assert "DFS_IDLE_SECONDS=7200" in launch
+    idle = launch.split("\n:idle_exit", 1)[1].split("\n:open_and_exit", 1)[0]
+    assert 'call :log "Idle shutdown: %IDLE_REASON%"' in idle
+    assert "call :release_lock" in idle
+    assert "exit /b 0" in idle
+    for line in launch.splitlines():
+        if "wait-and-open" in line:
+            assert "-LogPath" not in line
+
+
+_RAW_IO_ERRORS = (
+    "being used by another process",
+    "cannot access the file",
+    "IOException",
+    "UnauthorizedAccess",
+)
+
+
+def _append_log(log: Path, message: str) -> subprocess.CompletedProcess[str]:
+    executable = _powershell()
+    if executable is None:
+        pytest.skip("PowerShell is not installed; log append was not executed")
+    env = os.environ.copy()
+    env["DFS_LOG_MSG"] = message
+    return subprocess.run(
+        [
+            executable,
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(LAUNCHER / "windows_helpers.ps1"),
+            "-Command",
+            "append-log",
+            "-LogPath",
+            str(log),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _assert_log_io_stays_off_console(result: subprocess.CompletedProcess[str]) -> None:
+    assert result.returncode == 0, result.stderr
+    blob = result.stdout + result.stderr
+    for marker in _RAW_IO_ERRORS:
+        assert marker not in blob
+
+
+def _hold_log(log: Path, seconds: float) -> subprocess.Popen[str]:
+    executable = _powershell()
+    assert executable is not None
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.touch()
+    script = (
+        "$fs = New-Object System.IO.FileStream("
+        "$env:LOCK_PATH, "
+        "[System.IO.FileMode]::OpenOrCreate, "
+        "[System.IO.FileAccess]::ReadWrite, "
+        "[System.IO.FileShare]::None); "
+        "[Console]::Out.WriteLine('HELD'); "
+        "[Console]::Out.Flush(); "
+        f"Start-Sleep -Milliseconds {int(seconds * 1000)}; "
+        "$fs.Dispose()"
+    )
+    env = os.environ.copy()
+    env["LOCK_PATH"] = str(log)
+    holder = subprocess.Popen(
+        [executable, "-NoProfile", "-NonInteractive", "-Command", script],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert holder.stdout is not None
+    ready = holder.stdout.readline()
+    assert "HELD" in ready, holder.stderr.read() if holder.stderr else ready
+    return holder
+
+
+def test_append_log_writes_when_the_file_is_free(tmp_path: Path):
+    log = tmp_path / "Python Scripts" / "stop.log"
+    first = _append_log(log, "No listener on port 8501. Nothing was stopped.")
+    _assert_log_io_stays_off_console(first)
+    second = _append_log(log, "Stopped the DFS Lineup Generator Streamlit server.")
+    _assert_log_io_stays_off_console(second)
+    text = log.read_text(encoding="utf-8")
+    assert "Nothing was stopped." in text
+    assert "Stopped the DFS Lineup Generator Streamlit server." in text
+
+
+def test_append_log_locked_file_degrades_without_raw_errors(tmp_path: Path):
+    """A long-lived exclusive holder must not surface a sharing violation.
+
+    PowerShell's file APIs are what the bats call. This is not cmd.exe.
+    """
+    log = tmp_path / "launch.log"
+    holder = _hold_log(log, 3.0)
+    try:
+        started = time.monotonic()
+        result = _append_log(log, "---- stop ----")
+        elapsed = time.monotonic() - started
+        _assert_log_io_stays_off_console(result)
+        assert elapsed < 2.5
+        assert "---- stop ----" not in log.read_text(encoding="utf-8")
+    finally:
+        holder.wait(timeout=5)
+    recovered = _append_log(log, "---- stop ----")
+    _assert_log_io_stays_off_console(recovered)
+    assert "---- stop ----" in log.read_text(encoding="utf-8")
+
+
+def test_append_log_retries_a_brief_lock(tmp_path: Path):
+    log = tmp_path / "stop.log"
+    holder = _hold_log(log, 0.35)
+    try:
+        result = _append_log(log, "port check finished")
+    finally:
+        holder.wait(timeout=5)
+    _assert_log_io_stays_off_console(result)
+    assert "port check finished" in log.read_text(encoding="utf-8")
+
+
+def test_append_log_unavailable_path_degrades_quietly(tmp_path: Path):
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("x", encoding="utf-8")
+    result = _append_log(blocker / "stop.log", "should not crash")
+    _assert_log_io_stays_off_console(result)
+    assert not (blocker / "stop.log").exists()
 
 
 def test_helper_self_test_when_powershell_exists():

@@ -1,13 +1,12 @@
 #Requires -Version 5.1
 <#
-  Create the two Desktop shortcuts for the local DFS Lineup Generator.
+  Create the Desktop shortcut for the local DFS Lineup Generator.
 
   Desktop comes from [Environment]::GetFolderPath('Desktop'), which follows
   OneDrive Known Folder Move. Nothing in this script hard-codes a user path.
 
-  Re-running overwrites only these shortcuts:
-    DFS Lineup Generator.lnk
-    Stop DFS Lineup Generator.lnk
+  Re-running overwrites only DFS Lineup Generator.lnk.
+  If a previous run left Stop DFS Lineup Generator.lnk, that one file is removed.
 #>
 $ErrorActionPreference = 'Stop'
 
@@ -22,13 +21,9 @@ if ($env:DFS_SHORTCUT_STA -ne '1' -and [System.Threading.Thread]::CurrentThread.
 $launcherDir = $PSScriptRoot
 $projectRoot = (Resolve-Path -LiteralPath (Join-Path $launcherDir '..')).Path
 $launchBat = Join-Path $launcherDir 'launch_dfs.bat'
-$stopBat = Join-Path $launcherDir 'stop_dfs.bat'
 
 if (-not (Test-Path -LiteralPath $launchBat)) {
     throw "Launcher not found: $launchBat"
-}
-if (-not (Test-Path -LiteralPath $stopBat)) {
-    throw "Stop script not found: $stopBat"
 }
 
 $desktop = [Environment]::GetFolderPath('Desktop')
@@ -79,10 +74,13 @@ function Set-DfsShortcut {
 }
 
 $launchLink = Set-DfsShortcut -Name 'DFS Lineup Generator.lnk' -Target $launchBat -Description 'Start the local DFS Lineup Generator' -WindowStyle 7
-$stopLink = Set-DfsShortcut -Name 'Stop DFS Lineup Generator.lnk' -Target $stopBat -Description 'Stop the local DFS Lineup Generator server on port 8501' -WindowStyle 1
+$legacyStop = Join-Path $desktop 'Stop DFS Lineup Generator.lnk'
+if (Test-Path -LiteralPath $legacyStop) {
+    Remove-Item -LiteralPath $legacyStop -Force
+    Write-Output ("Removed legacy shortcut: " + $legacyStop)
+}
 
 Write-Output ("Desktop: " + $desktop)
 Write-Output ("Created: " + $launchLink)
-Write-Output ("Created: " + $stopLink)
 Write-Output ("Project: " + $projectRoot)
-Write-Output 'Run minimized is set on DFS Lineup Generator. The stop shortcut opens a normal window so its result stays visible.'
+Write-Output 'Run minimized is set on DFS Lineup Generator. Close that window to stop the app.'

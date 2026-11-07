@@ -57,19 +57,27 @@ goto :port_blocked
 :start_server
 cd /d "%ROOT%"
 if errorlevel 1 goto :cd_failed
+if not defined DFS_IDLE_SECONDS set "DFS_IDLE_SECONDS=7200"
+call :digits_only "%DFS_IDLE_SECONDS%"
+if not "%DIGITS_OK%"=="1" set "DFS_IDLE_SECONDS=7200"
+set "IDLE_REASON_FILE=%LOGDIR%\idle-shutdown.txt"
+if exist "%IDLE_REASON_FILE%" del /q "%IDLE_REASON_FILE%"
 call :log "Starting: %PY% -m streamlit run app.py --server.port=8501 --server.address=localhost --server.headless=true --browser.gatherUsageStats=false"
+call :log "Idle shutdown after %DFS_IDLE_SECONDS% seconds with no connected browser session. Close this window to stop sooner."
 echo.
 echo DFS Lineup Generator is starting.
 echo   App URL: http://localhost:8501/
 echo   Log: %LOG%
 echo   This window stays open so errors remain readable. The desktop shortcut minimizes it.
-echo   Stop the app with the Stop DFS Lineup Generator shortcut, or close this window.
+echo   Close this window to stop the app.
+echo   If no browser stays connected, it exits after %DFS_IDLE_SECONDS% seconds.
 echo.
-start "DFSLineupOpenBrowser" /MIN powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%HELPER%" -Command wait-and-open -Url "http://localhost:8501/" -Port 8501 -LogPath "%LOG%"
+start "DFSLineupOpenBrowser" /MIN powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%HELPER%" -Command wait-and-open -Url "http://localhost:8501/" -Port 8501
 set "STREAMLIT_BROWSER_GATHER_USAGE_STATS=false"
 set "STREAMLIT_SERVER_HEADLESS=true"
-"%PY%" -m streamlit run app.py --server.port=8501 --server.address=localhost --server.headless=true --browser.gatherUsageStats=false >>"%LOG%" 2>&1
+"%PY%" "%ROOT%\launcher\idle_watch.py" --timeout-seconds %DFS_IDLE_SECONDS% --port 8501 --poll-seconds 15 --output-log "%LOG%" --reason-file "%IDLE_REASON_FILE%" -- "%PY%" -m streamlit run app.py --server.port=8501 --server.address=localhost --server.headless=true --browser.gatherUsageStats=false
 set "RC=%ERRORLEVEL%"
+if exist "%IDLE_REASON_FILE%" goto :idle_exit
 call :log "Streamlit exited with code %RC%."
 call :release_lock
 if "%RC%"=="0" exit /b 0
@@ -81,9 +89,17 @@ echo.
 pause
 exit /b %RC%
 
+:idle_exit
+set "IDLE_REASON="
+for /f "usebackq delims=" %%R in ("%IDLE_REASON_FILE%") do set "IDLE_REASON=%%R"
+del /q "%IDLE_REASON_FILE%"
+call :log "Idle shutdown: %IDLE_REASON%"
+call :release_lock
+exit /b 0
+
 :open_and_exit
 call :log "Opening http://localhost:8501/ because this app is already on port 8501. PID %PORT_PID%."
-start "DFSLineupOpenBrowser" /MIN powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%HELPER%" -Command wait-and-open -Url "http://localhost:8501/" -Port 8501 -LogPath "%LOG%" -TimeoutSeconds 15
+start "DFSLineupOpenBrowser" /MIN powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%HELPER%" -Command wait-and-open -Url "http://localhost:8501/" -Port 8501 -TimeoutSeconds 15
 call :release_lock
 exit /b 0
 
@@ -182,7 +198,8 @@ goto :eof
 set "LOG_RC=%ERRORLEVEL%"
 set "MSG=%~1"
 echo %MSG%
->>"%LOG%" echo [%DATE% %TIME%] %MSG%
+set "DFS_LOG_MSG=%MSG%"
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%HELPER%" -Command append-log -LogPath "%LOG%" >nul 2>&1
 exit /b %LOG_RC%
 
 :digits_only

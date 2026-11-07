@@ -70,14 +70,14 @@ contacted only after a CSV is loaded or a lineup is generated.
    powershell -ExecutionPolicy Bypass -File launcher\create_shortcut.ps1
    ```
 
-   The script writes only these two shortcuts and, if you run it again,
-   overwrites only those two:
+   The script writes only `DFS Lineup Generator.lnk` and, if you run it again,
+   overwrites only that shortcut. If an older copy of this project left
+   `Stop DFS Lineup Generator.lnk` on the Desktop, that one file is removed.
+   No other Desktop shortcut is touched.
 
    - `DFS Lineup Generator.lnk` — starts the app. The shortcut is saved with
      Run: Minimized. Its target is `launcher\launch_dfs.bat` and its working
      directory is the project root.
-   - `Stop DFS Lineup Generator.lnk` — stops this app's server. The window is
-     normal so the result stays on screen.
 
    An icon is optional. If `launcher\dfs.ico` exists, the shortcuts use it.
 
@@ -103,39 +103,45 @@ Double-click **DFS Lineup Generator**.
    interpreter path. A failed install does not update the stamp, so the next
    launch tries again, and the app still attempts to start.
 5. It runs the selected Python with `-m streamlit run app.py` on port 8501,
-   bound to localhost. If this app is already listening there, the launcher
-   opens the browser and does not start a second server. If something else is
-   listening, or the owner cannot be confirmed, it warns and leaves that
-   process alone.
+   bound to localhost. `launcher\idle_watch.py` is the foreground process so
+   the minimized window stays open with the server. If this app is already
+   listening there, the launcher opens the browser and does not start a second
+   server. If something else is listening, or the owner cannot be confirmed,
+   it warns and leaves that process alone.
 6. A second double-click while the first launch is still updating waits, then
    opens the browser once this server is up.
+7. While at least one browser tab is connected, the app keeps running. That
+   includes a tab where you are not clicking and a tab that is building
+   lineups. Streamlit reports those tabs as `active_sessions`. After every
+   connected tab has been gone for the idle timeout, the server and this
+   window exit. The default is 7200 seconds (2 hours). Set `DFS_IDLE_SECONDS`
+   before launch to use another positive number of seconds. The timeout is not
+   a fixed clock from startup: a connected tab resets it. A failed reading of
+   the session gauge does not shut the app down. Opening `/_stcore/health`
+   does not count as someone using the app.
 
 The shortcut keeps the window minimized. It is not hidden. The window title is
-**DFS Lineup Generator**. Startup messages stay in that window, and the full
-session is appended to `launcher\logs\launch.log` (gitignored, along with the
-rest of `launcher\logs\`). If the site does not open, restore the window from
-the taskbar. A failed start leaves the log tail on screen until you press a key.
-
-If a launch keeps reporting that another launch is in progress after the app
-has quit, delete `launcher\logs\launch.lockdir` and try again. That folder is
-only the single-launch lock. Deleting it does not change your code.
+**DFS Lineup Generator**. Startup messages stay in that window. Launch output,
+including Streamlit's own console output, is appended to
+`launcher\logs\launch.log`. Short status lines go through a small append that
+retries a few times if OneDrive has the file open, and then skips the write
+instead of printing a file-access error. The window still shows the launch
+result. If the site does not open, restore the launcher window from the
+taskbar. A failed start leaves the log tail on screen until you press a key.
+An idle exit is also written to that log after the server releases the file,
+with the reason `no connected browser session`.
 
 ### Stopping
 
-Use **Stop DFS Lineup Generator**, or close the minimized launcher window.
-Closing the window stops the server because Streamlit is running in it.
+Close the minimized **DFS Lineup Generator** window. That stops the server.
+There is no separate Stop shortcut. Running `launcher\create_shortcut.ps1`
+again removes a leftover `Stop DFS Lineup Generator.lnk` from the Desktop and
+does not remove any other shortcut.
 
-The stop shortcut ends a process only when all of these are true:
-
-- it is listening on port 8501
-- its command line is this project's `streamlit run app.py` using
-  `.venv\Scripts\python.exe` or `venv\Scripts\python.exe`, or the command line
-  otherwise contains this project folder as a whole path (a similarly named
-  folder is not treated as this app)
-
-It then stops that process tree only. It does not kill other Python programs.
-If port 8501 is free, it reports that and exits. If the listener is some other
-program, or the check is inconclusive, it reports that and does not stop it.
+If a launch keeps reporting that another launch is in progress after the app
+has quit, delete `launcher\logs\launch.lockdir` and try again. That folder is
+only the single-launch lock. Deleting it does not change your code. An idle
+exit removes it as well, so the next double-click can start again.
 
 ## Tests
 
