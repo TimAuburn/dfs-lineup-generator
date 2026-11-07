@@ -17,8 +17,9 @@ from src.data_loader import (
     low_scoring_showdown,
     projection_adjustment_labels,
     projection_deltas,
-    reconcile_vegas_editor,
     slate_odds_warnings,
+    split_game_lines,
+    sync_vegas_editor,
     visible_odds_warnings,
 )
 from src.vegas_cache import (
@@ -268,9 +269,11 @@ def test_projection_deltas_show_the_vegas_boost_and_wind_cut():
         ]
     )
     lines = {
-        # (55.5 - (-3.5)) / 2 = 29.5. Negative spread is the favorite.
-        "BUF": {"itt": 29.5, "total": 55.5, "spread": -3.5},
-        "GB": {"itt": 22.0, "total": 44.0, "spread": 0.0},
+        # (55.5 - (-3.5)) / 2 = 29.5. The pair shares the total and opposite spreads.
+        "BUF": {"itt": 29.5, "total": 55.5, "spread": -3.5, "game": "BUF@LAR"},
+        "LAR": {"itt": 26.0, "total": 55.5, "spread": 3.5, "game": "BUF@LAR"},
+        "GB": {"itt": 22.0, "total": 44.0, "spread": 0.0, "game": "CHI@GB"},
+        "CHI": {"itt": 22.0, "total": 44.0, "spread": 0.0, "game": "CHI@GB"},
     }
     deltas = projection_deltas(pool, lines, {"GB": {"wind_mph": 20}})
     assert deltas.iloc[0] == pytest.approx(0.53)
@@ -300,10 +303,13 @@ def test_projection_adjustments_and_low_total():
         ]
     )
     lines = {
-        # ITTs match (total - signed spread) / 2: 27, 18, and 22.
-        "IND": {"total": 51.0, "spread": -3.0, "itt": 27.0, "game": "IND@WAS"},
+        # Each game shares one total and opposite spreads. ITTs are derived.
+        "IND": {"total": 51.0, "spread": -3.0, "itt": 27.0, "game": "IND@LAC"},
+        "LAC": {"total": 51.0, "spread": 3.0, "itt": 24.0, "game": "IND@LAC"},
         "WAS": {"total": 40.0, "spread": 4.0, "itt": 18.0, "game": "LAR@WAS"},
+        "LAR": {"total": 40.0, "spread": -4.0, "itt": 22.0, "game": "LAR@WAS"},
         "GB": {"total": 44.0, "spread": 0.0, "itt": 22.0, "game": "CHI@GB"},
+        "CHI": {"total": 44.0, "spread": 0.0, "itt": 22.0, "game": "CHI@GB"},
     }
     adjusted = apply_vegas_projections(pool, lines)
     by_pos = dict(zip(adjusted["Position"], adjusted["Projection"]))
@@ -596,55 +602,118 @@ def _editor_start() -> pd.DataFrame:
     )
 
 
-def test_editor_total_edit_shows_the_same_itt_the_adjustment_uses():
-    """A data_editor return keeps the old ITT cell until it is reconciled.
+def _shown(frame: pd.DataFrame) -> dict:
+    return {
+        team: {
+            "total": total,
+            "spread": spread,
+            "itt": itt,
+        }
+        for team, total, spread, itt in zip(
+            frame["Team"], frame["Over/Under"], frame["Spread"], frame["ITT"]
+        )
+    }
 
-    Changing the total from 50 to 40 leaves the grid showing 30 (or a typed
-    99) while (40 - -10) / 2 is 25. The reconciled frame, the lines, and the
-    skill-player adjustment all use 25, and the next rerun does not bump again.
+
+def test_one_team_total_edit_updates_the_whole_game():
+    """Two team rows are not independent game inputs.
+
+    Editing only KC's total from 50 to 40, with spreads still -10 and +10,
+    must not leave BUF at 20. The shared total is 40, so the ITTs are 25 and
+    15, they sum to 40, and BUF's skill players take the -5% cut. The next
+    rerun keeps that pair.
     """
-    edited = _editor_start()
-    edited["Over/Under"] = 40.0
-    edited.loc[edited["Team"] == "KC", "ITT"] = 99.0
-    shown_before = dict(zip(edited["Team"], edited["ITT"]))
-    assert shown_before["KC"] == pytest.approx(99.0)
-
-    first = reconcile_vegas_editor(edited, editor_version=2)
-    shown = dict(zip(first["frame"]["Team"], first["frame"]["ITT"]))
-    assert shown["KC"] == pytest.approx(25.0)
-    assert shown["BUF"] == pytest.approx(15.0)
-    assert first["lines"]["KC"]["itt"] == pytest.approx(shown["KC"])
-    assert first["lines"]["BUF"]["itt"] == pytest.approx(shown["BUF"])
+    previous = _editor_start()
+    edited = previous.copy()
+    edited.loc[edited["Team"] == "KC", "Over/Under"] = 40.0
+    first = sync_vegas_editor(previous, edited, editor_version=2)
+    shown = _shown(first["frame"])
+    assert shown["KC"]["total"] == pytest.approx(40)
+    assert shown["BUF"]["total"] == pytest.approx(40)
+    assert shown["KC"]["spread"] == pytest.approx(-10)
+    assert shown["BUF"]["spread"] == pytest.approx(10)
+    assert shown["KC"]["itt"] == pytest.approx(25)
+    assert shown["BUF"]["itt"] == pytest.approx(15)
+    assert shown["KC"]["itt"] + shown["BUF"]["itt"] == pytest.approx(40)
+    assert first["lines"]["KC"]["itt"] == pytest.approx(25)
+    assert first["lines"]["BUF"]["itt"] == pytest.approx(15)
     assert first["changed"] is True
     assert first["editor_version"] == 3
+    assert first["warnings"] == []
 
-    pool = pd.DataFrame(
-        [
-            {"Name": "KC WR", "TeamAbbrev": "KC", "Position": "WR", "Projection": 12.0},
-            {"Name": "BUF WR", "TeamAbbrev": "BUF", "Position": "WR", "Projection": 12.0},
-        ]
-    )
+    pool = _skill_pool().iloc[:2].reset_index(drop=True)
     adjusted = apply_vegas_projections(pool, first["lines"])
     by_name = dict(zip(adjusted["Name"], adjusted["Projection"]))
     assert by_name["KC WR"] == pytest.approx(12.0)
     assert by_name["BUF WR"] == pytest.approx(11.4)
     assert projection_adjustment_labels(pool, first["lines"]) == ["BUF -5%"]
 
-    second = reconcile_vegas_editor(first["frame"], editor_version=first["editor_version"])
+    second = sync_vegas_editor(
+        first["frame"], first["frame"], editor_version=first["editor_version"]
+    )
     assert second["changed"] is False
     assert second["editor_version"] == 3
-    assert dict(zip(second["frame"]["Team"], second["frame"]["ITT"]))["KC"] == pytest.approx(25.0)
-    assert second["lines"]["KC"]["itt"] == pytest.approx(25.0)
+    assert _shown(second["frame"])["BUF"]["itt"] == pytest.approx(15)
 
 
-def test_clearing_the_total_clears_the_displayed_itt():
-    edited = _editor_start()
+def test_one_team_spread_edit_flips_the_opponent():
+    """Editing one signed spread sets the game spread. The other side opposes it."""
+    previous = _editor_start()
+    edited = previous.copy()
+    edited.loc[edited["Team"] == "KC", "Spread"] = -2.5
+    first = sync_vegas_editor(previous, edited, editor_version=0)
+    shown = _shown(first["frame"])
+    assert shown["KC"]["spread"] == pytest.approx(-2.5)
+    assert shown["BUF"]["spread"] == pytest.approx(2.5)
+    assert shown["KC"]["total"] == pytest.approx(50)
+    assert shown["BUF"]["total"] == pytest.approx(50)
+    assert shown["KC"]["itt"] == pytest.approx(26.25)
+    assert shown["BUF"]["itt"] == pytest.approx(23.75)
+    assert shown["KC"]["itt"] + shown["BUF"]["itt"] == pytest.approx(50)
+    assert shown["KC"]["itt"] > shown["BUF"]["itt"]
+    assert first["changed"] is True
+    second = sync_vegas_editor(
+        first["frame"], first["frame"], editor_version=first["editor_version"]
+    )
+    assert second["changed"] is False
+    assert _shown(second["frame"])["BUF"]["spread"] == pytest.approx(2.5)
+
+
+def test_clearing_the_total_clears_both_teams_and_skips_the_adjustment():
+    previous = _editor_start()
+    edited = previous.copy()
     edited.loc[edited["Team"] == "KC", "Over/Under"] = pd.NA
-    reconciled = reconcile_vegas_editor(edited, editor_version=0)
-    shown = dict(zip(reconciled["frame"]["Team"], reconciled["frame"]["ITT"]))
-    assert shown["KC"] is None or pd.isna(shown["KC"])
-    assert reconciled["lines"]["KC"]["itt"] is None
-    assert reconciled["changed"] is True
+    synced = sync_vegas_editor(previous, edited, editor_version=0)
+    shown = _shown(synced["frame"])
+    assert shown["KC"]["total"] is None or pd.isna(shown["KC"]["total"])
+    assert shown["BUF"]["total"] is None or pd.isna(shown["BUF"]["total"])
+    assert shown["KC"]["itt"] is None or pd.isna(shown["KC"]["itt"])
+    assert shown["BUF"]["itt"] is None or pd.isna(shown["BUF"]["itt"])
+    assert synced["lines"] == {}
+    assert synced["warnings"]
+    assert "KC@BUF" in synced["warnings"][0]
+    adjusted = apply_vegas_projections(_skill_pool(), synced["lines"])
+    assert list(adjusted["Projection"]) == pytest.approx([12.0, 12.0, 12.0])
+
+
+def test_contradictory_cached_rows_do_not_adjust():
+    """A saved pair with two totals, or spreads that do not oppose, is not used."""
+    mismatched_totals = {
+        "KC": {"total": 50.0, "spread": -10.0, "itt": 30.0, "game": "KC@BUF"},
+        "BUF": {"total": 30.0, "spread": 10.0, "itt": 10.0, "game": "KC@BUF"},
+    }
+    one_sided = {
+        "KC": {"total": 50.0, "spread": -10.0, "itt": 30.0, "game": "KC@BUF"},
+        "BUF": {"total": 50.0, "spread": 3.0, "itt": 23.5, "game": "KC@BUF"},
+    }
+    for lines in (mismatched_totals, one_sided):
+        adjusted = apply_vegas_projections(_skill_pool(), lines)
+        assert list(adjusted["Projection"]) == pytest.approx([12.0, 12.0, 12.0])
+        warnings = split_game_lines(lines)[1]
+        assert warnings and "KC@BUF" in warnings[0]
+        assert projection_adjustment_labels(_skill_pool(), lines) == []
+        frame = lines_to_frame(lines)
+        assert frame["ITT"].isna().all()
 
 
 def _slate(*games: str) -> pd.DataFrame:

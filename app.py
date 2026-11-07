@@ -21,7 +21,7 @@ from src.data_loader import (
     lines_to_frame,
     low_scoring_showdown,
     projection_adjustment_labels,
-    reconcile_vegas_editor,
+    sync_vegas_editor,
     visible_odds_warnings,
 )
 from src.env_config import (
@@ -883,6 +883,9 @@ with st.sidebar:
         # grid. Otherwise the previous cells stay on screen.
         st.session_state.vegas_editor_version = int(st.session_state.vegas_editor_version) + 1
     st.caption(format_cache_status())
+    vegas_baseline = st.session_state.vegas_frame
+    if vegas_baseline is not None:
+        vegas_baseline = vegas_baseline.copy()
     edited_vegas = st.data_editor(
         st.session_state.vegas_frame,
         width="stretch",
@@ -900,17 +903,18 @@ with st.sidebar:
             ),
             "ITT": st.column_config.NumberColumn(
                 "ITT",
-                format="%.1f",
+                format="%.2f",
                 width="small",
                 disabled=True,
                 help=(
-                    "Calculated from Over/Under and the signed spread. "
-                    "A negative spread is the favorite, so that team is higher."
+                    "Derived from the shared game total and this team's signed spread. "
+                    "Editing one total or one spread updates both teams."
                 ),
             ),
         },
     )
-    reconciled = reconcile_vegas_editor(
+    reconciled = sync_vegas_editor(
+        vegas_baseline,
         edited_vegas,
         int(st.session_state.vegas_editor_version),
     )
@@ -922,6 +926,7 @@ with st.sidebar:
         reconciled["lines"],
         st.session_state.player_pool,
         coverage_warnings(),
+        reconciled["warnings"],
     )
     for warning in vegas_warnings:
         st.warning(warning)
