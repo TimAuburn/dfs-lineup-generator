@@ -99,11 +99,17 @@ def projections_for_solve(
 def apply_pool_edits(
     pool: pd.DataFrame,
     edited: pd.DataFrame,
-    computed: pd.DataFrame,
+    displayed: pd.DataFrame,
     *,
     showdown: bool,
 ) -> pd.DataFrame:
-    """Write include, captain, lock, ownership, captain share, and projection onto every salary row."""
+    """Write include, captain, lock, ownership, captain share, and projection onto every salary row.
+
+    ``displayed`` is the table the editor was given. A projection cell that
+    comes back unchanged does not touch ``ProjectionOverride``, including when
+    a pinned number happens to equal the new automatic projection. A different
+    number replaces the pin. Only ``clear_projection_overrides`` removes one.
+    """
     updated = pool.copy()
     if updated.empty or edited is None or edited.empty:
         return updated
@@ -119,7 +125,7 @@ def apply_pool_edits(
     if "Projection" not in updated.columns:
         updated["Projection"] = pd.Series(pd.NA, index=updated.index, dtype="Float64")
 
-    computed_projection = _projection_by_key(computed)
+    displayed_projection = _projection_by_key(displayed)
     for _, edit in edited.iterrows():
         key = person_key(edit.get("Name"), edit.get("TeamAbbrev"))
         mask = pd.Series(
@@ -142,14 +148,39 @@ def apply_pool_edits(
                 pd.NA if pd.isna(captain_rate) else captain_rate
             )
         projection = pd.to_numeric(edit.get("Projection"), errors="coerce")
-        auto = computed_projection.get(key)
         if pd.isna(projection):
             continue
         updated.loc[mask, "Projection"] = float(projection)
-        if auto is not None and abs(float(projection) - auto) < 0.011:
-            updated.loc[mask, "ProjectionOverride"] = pd.NA
-        else:
+        shown = displayed_projection.get(key)
+        if shown is None or abs(float(projection) - float(shown)) >= 0.011:
             updated.loc[mask, "ProjectionOverride"] = float(projection)
+    return updated
+
+
+def clear_projection_overrides(pool: pd.DataFrame, shown: pd.DataFrame) -> pd.DataFrame:
+    """Drop pinned projections for the players in ``shown``.
+
+    Captain and flex rows for the same player are cleared together. The next
+    automatic projection is the current baseline plus the current odds and wind.
+    """
+    updated = pool.copy()
+    if (
+        updated.empty
+        or shown is None
+        or shown.empty
+        or "Name" not in shown.columns
+        or "ProjectionOverride" not in updated.columns
+    ):
+        return updated
+    keys = {
+        person_key(name, team)
+        for name, team in zip(shown["Name"], shown["TeamAbbrev"])
+    }
+    mask = pd.Series(
+        [person_key(name, team) in keys for name, team in _key_list(updated)],
+        index=updated.index,
+    )
+    updated.loc[mask, "ProjectionOverride"] = pd.NA
     return updated
 
 

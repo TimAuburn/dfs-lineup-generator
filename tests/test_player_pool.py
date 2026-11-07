@@ -11,6 +11,7 @@ import pytest
 from src.optimizer import get_nfl_optimizer
 from src.player_pool import (
     apply_pool_edits,
+    clear_projection_overrides,
     collapse_for_editor,
     filter_editor_frame,
     game_choices,
@@ -459,3 +460,178 @@ def test_optimizer_generate_uses_current_odds_not_the_stored_projection():
     assert generate(_det_lines(50.0, -10.0), 2) == pytest.approx([12.07])
     assert generate(_det_lines(40.0, 20.0), 3) == pytest.approx([10.93])
     assert generate({}, 4) == pytest.approx([11.50])
+
+
+def _clean_det_pool() -> pd.DataFrame:
+    pool = _det_cash_pool()
+    pool["Projection"] = pool["AvgPointsPerGame"]
+    return pool
+
+
+def _player_editor(at):
+    for editor in at.data_editor:
+        value = editor.value
+        if value is not None and "Name" in value.columns and "Projection" in value.columns:
+            return editor
+    raise AssertionError("player projection editor was not on the page")
+
+
+def _worthy_override(pool: pd.DataFrame) -> float:
+    rows = pool.loc[pool["Name"].astype(str).eq("Xavier Worthy"), "ProjectionOverride"]
+    assert not rows.empty
+    return float(rows.iloc[0])
+
+
+def test_pinned_worthy_survives_odds_removal_editor_remount_and_generate():
+    """Pin 11.50 at ITT 30. Removing odds makes the automatic number 11.50 too.
+
+    The remount must not clear that pin. ITT 10 still solves at 11.50.
+    """
+    app_test = pytest.importorskip("streamlit.testing.v1")
+    from src.data_loader import lines_to_frame
+    from src.vegas_cache import CACHE_SCHEMA_VERSION
+
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    at = app_test.AppTest.from_file(str(app_path))
+    empty_fetch = json.dumps({}, sort_keys=True, default=str)
+    at.session_state["app_view"] = "Player pool"
+    at.session_state["contest_preset"] = "classic_cash"
+    at.session_state["player_pool"] = _clean_det_pool()
+    at.session_state["vegas_schema"] = CACHE_SCHEMA_VERSION
+    at.session_state["vegas_source_json"] = empty_fetch
+    at.session_state["vegas_editor_version"] = 1
+    at.session_state["vegas_frame"] = lines_to_frame(_det_lines(50.0, -10.0))
+    at.session_state["weather_by_home"] = {}
+    at.session_state["weather_source_json"] = empty_fetch
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+
+    editor = _player_editor(at)
+    table = editor.value.reset_index(drop=True)
+    worthy_row = int(table.index[table["Name"].eq("Xavier Worthy")][0])
+    assert float(table.loc[worthy_row, "Projection"]) == pytest.approx(12.07)
+    at.session_state[editor.key] = {
+        "edited_rows": {worthy_row: {"Projection": 11.50}},
+        "added_rows": [],
+        "deleted_rows": [],
+    }
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    assert _worthy_override(at.session_state["player_pool"]) == pytest.approx(11.50)
+
+    at.session_state["vegas_frame"] = lines_to_frame({})
+    at.session_state["vegas_source_json"] = empty_fetch
+    at.session_state["vegas_editor_version"] = 8
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    assert _worthy_override(at.session_state["player_pool"]) == pytest.approx(11.50)
+
+    editor = _player_editor(at)
+    table = editor.value.reset_index(drop=True)
+    worthy_row = int(table.index[table["Name"].eq("Xavier Worthy")][0])
+    at.session_state[editor.key] = {
+        "edited_rows": {worthy_row: {"Lock": True}},
+        "added_rows": [],
+        "deleted_rows": [],
+    }
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    locked = at.session_state["player_pool"]
+    worthy_rows = locked.loc[locked["Name"].astype(str).eq("Xavier Worthy")]
+    assert _worthy_override(locked) == pytest.approx(11.50)
+    assert bool(worthy_rows["Lock"].iloc[0])
+
+    at.session_state["app_view"] = "Optimizer"
+    at.session_state["vegas_frame"] = lines_to_frame(_det_lines(40.0, 20.0))
+    at.session_state["vegas_source_json"] = empty_fetch
+    at.session_state["vegas_editor_version"] = 9
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    button = next(item for item in at.button if item.label == "Generate Lineups")
+    button.click()
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    assert _worthy_lineup_projections(at) == pytest.approx([11.50])
+
+    at.session_state["app_view"] = "Player pool"
+    at.session_state["vegas_frame"] = lines_to_frame(_det_lines(40.0, 20.0))
+    at.session_state["vegas_source_json"] = empty_fetch
+    at.session_state["vegas_editor_version"] = 10
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    assert _worthy_override(at.session_state["player_pool"]) == pytest.approx(11.50)
+    reset = next(item for item in at.button if item.label == "Reset to automatic")
+    reset.click()
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    assert pd.isna(
+        at.session_state["player_pool"]
+        .loc[lambda frame: frame["Name"].astype(str).eq("Xavier Worthy"), "ProjectionOverride"]
+        .iloc[0]
+    )
+    at.session_state["app_view"] = "Optimizer"
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    button = next(item for item in at.button if item.label == "Generate Lineups")
+    button.click()
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    assert _worthy_lineup_projections(at) == pytest.approx([10.93])
+
+
+def test_showdown_pin_stays_on_captain_and_flex_until_reset():
+    """One editor row pins both salary rows, and reset restores the current automatic number."""
+    pool = pd.DataFrame(
+        [
+            {
+                "ID": "cpt",
+                "Name": "Xavier Worthy",
+                "Position": "WR",
+                "Roster Position": "CPT",
+                "RosterSlot": "CPT",
+                "TeamAbbrev": "KC",
+                "Salary": 16800,
+                "AvgPointsPerGame": 11.50,
+                "Projection": 11.50,
+                "Game Info": "KC@BUF 09/10/2025 08:20PM ET",
+            },
+            {
+                "ID": "flex",
+                "Name": "Xavier Worthy",
+                "Position": "WR",
+                "Roster Position": "FLEX",
+                "RosterSlot": "FLEX",
+                "TeamAbbrev": "KC",
+                "Salary": 11200,
+                "AvgPointsPerGame": 11.50,
+                "Projection": 11.50,
+                "Game Info": "KC@BUF 09/10/2025 08:20PM ET",
+            },
+        ]
+    )
+    shown = projections_for_solve(pool, _kc_buf_lines(50.0, -10.0), {})
+    editor = collapse_for_editor(shown, showdown=True)
+    edited = editor.copy()
+    edited.loc[edited["Name"].eq("Xavier Worthy"), "Projection"] = 11.50
+    pinned = apply_pool_edits(pool, edited, editor, showdown=True)
+    assert list(pinned["ProjectionOverride"]) == pytest.approx([11.50, 11.50])
+
+    displayed = collapse_for_editor(projections_for_solve(pinned, {}, {}), showdown=True)
+    returned = displayed.copy()
+    returned.loc[returned["Name"].eq("Xavier Worthy"), "Lock"] = True
+    kept = apply_pool_edits(pinned, returned, displayed, showdown=True)
+    assert list(kept["ProjectionOverride"]) == pytest.approx([11.50, 11.50])
+    assert list(kept["Lock"]) == [True, True]
+    solved = projections_for_solve(kept, _kc_buf_lines(40.0, 20.0), {})
+    assert list(solved["Projection"]) == pytest.approx([11.50, 11.50])
+    fppg = _solver_fppg(solved, showdown=True)
+    assert fppg["flex"] == pytest.approx(11.50)
+    assert fppg["cpt"] == pytest.approx(17.25)
+
+    reset = clear_projection_overrides(kept, displayed)
+    assert reset["ProjectionOverride"].isna().all()
+    automatic = projections_for_solve(reset, _kc_buf_lines(40.0, 20.0), {})
+    assert list(automatic["Projection"]) == pytest.approx([10.93, 10.93])
+    reset_fppg = _solver_fppg(automatic, showdown=True)
+    assert reset_fppg["flex"] == pytest.approx(10.93)
+    assert reset_fppg["cpt"] == pytest.approx(16.395)

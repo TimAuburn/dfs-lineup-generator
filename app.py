@@ -67,6 +67,7 @@ from src.parser import DKCSVValidationError, is_inactive_injury, parse_dk_csv
 from src.player_pool import (
     apply_pool_edits,
     carry_choices,
+    clear_projection_overrides,
     collapse_for_editor,
     filter_editor_frame,
     game_choices,
@@ -1519,6 +1520,15 @@ if view == "Player pool":
                 key="pool_remove_captain_shown",
             )
         clear_filters = st.button("Clear filters", key="pool_clear_filters_button")
+        reset_shown = st.button(
+            "Reset to automatic",
+            key="pool_reset_projections",
+            help=(
+                "Drop pinned projections for the players on screen. "
+                "A number you type stays, even when it matches the automatic projection, "
+                "until you change that cell or reset it."
+            ),
+        )
     if include_shown or remove_shown:
         st.session_state.player_pool = set_included(pool, visible_players, include_shown)
         st.rerun()
@@ -1529,6 +1539,9 @@ if view == "Player pool":
         st.rerun()
     if clear_filters:
         st.session_state.pool_clear_filters = True
+        st.rerun()
+    if reset_shown:
+        st.session_state.player_pool = clear_projection_overrides(pool, visible_players)
         st.rerun()
     if visible_players.empty:
         st.info("No players match these filters.")
@@ -1591,7 +1604,9 @@ if view == "Player pool":
                 format="%.2f",
                 help=(
                     "Sleeper, or the DraftKings average when Sleeper is blank, plus Delta. "
-                    "This is the number the optimizer uses. Edit to override."
+                    "Type a number to pin it. The pin stays when odds or wind change, "
+                    "including when it matches the automatic number. "
+                    "Reset to automatic to use the current odds and wind again."
                 ),
             ),
             "Delta": st.column_config.NumberColumn(
@@ -1628,7 +1643,7 @@ if view == "Player pool":
     st.session_state.player_pool = apply_pool_edits(
         pool,
         edited_players,
-        computed,
+        visible_players,
         showdown=is_showdown,
     )
     st.stop()
