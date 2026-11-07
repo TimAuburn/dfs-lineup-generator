@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 from src.data_loader import (
+    NO_SLATE_ODDS_WARNING,
     apply_vegas_projections,
     frame_to_lines,
     lines_to_frame,
@@ -16,13 +17,18 @@ from src.data_loader import (
     low_scoring_showdown,
     projection_adjustment_labels,
     projection_deltas,
+    reconcile_vegas_editor,
+    slate_odds_warnings,
+    visible_odds_warnings,
 )
 from src.vegas_cache import (
+    NO_USABLE_ODDS_WARNING,
     cache_ttl_seconds,
     coverage_warnings,
     fetch_vegas_lines,
     format_cache_status,
     implied_team_total,
+    missing_odds_warning,
     nfl_week_window,
     normalize_vegas_memory,
     parse_odds_payload,
@@ -579,3 +585,191 @@ def test_in_memory_vegas_lines_from_an_older_schema_are_dropped():
         "vegas_source_json": None,
         "vegas_editor_version": 0,
     }
+
+
+def _editor_start() -> pd.DataFrame:
+    return lines_to_frame(
+        {
+            "KC": {"total": 50.0, "spread": -10.0, "itt": 30.0, "game": "KC@BUF"},
+            "BUF": {"total": 50.0, "spread": 10.0, "itt": 20.0, "game": "KC@BUF"},
+        }
+    )
+
+
+def test_editor_total_edit_shows_the_same_itt_the_adjustment_uses():
+    """A data_editor return keeps the old ITT cell until it is reconciled.
+
+    Changing the total from 50 to 40 leaves the grid showing 30 (or a typed
+    99) while (40 - -10) / 2 is 25. The reconciled frame, the lines, and the
+    skill-player adjustment all use 25, and the next rerun does not bump again.
+    """
+    edited = _editor_start()
+    edited["Over/Under"] = 40.0
+    edited.loc[edited["Team"] == "KC", "ITT"] = 99.0
+    shown_before = dict(zip(edited["Team"], edited["ITT"]))
+    assert shown_before["KC"] == pytest.approx(99.0)
+
+    first = reconcile_vegas_editor(edited, editor_version=2)
+    shown = dict(zip(first["frame"]["Team"], first["frame"]["ITT"]))
+    assert shown["KC"] == pytest.approx(25.0)
+    assert shown["BUF"] == pytest.approx(15.0)
+    assert first["lines"]["KC"]["itt"] == pytest.approx(shown["KC"])
+    assert first["lines"]["BUF"]["itt"] == pytest.approx(shown["BUF"])
+    assert first["changed"] is True
+    assert first["editor_version"] == 3
+
+    pool = pd.DataFrame(
+        [
+            {"Name": "KC WR", "TeamAbbrev": "KC", "Position": "WR", "Projection": 12.0},
+            {"Name": "BUF WR", "TeamAbbrev": "BUF", "Position": "WR", "Projection": 12.0},
+        ]
+    )
+    adjusted = apply_vegas_projections(pool, first["lines"])
+    by_name = dict(zip(adjusted["Name"], adjusted["Projection"]))
+    assert by_name["KC WR"] == pytest.approx(12.0)
+    assert by_name["BUF WR"] == pytest.approx(11.4)
+    assert projection_adjustment_labels(pool, first["lines"]) == ["BUF -5%"]
+
+    second = reconcile_vegas_editor(first["frame"], editor_version=first["editor_version"])
+    assert second["changed"] is False
+    assert second["editor_version"] == 3
+    assert dict(zip(second["frame"]["Team"], second["frame"]["ITT"]))["KC"] == pytest.approx(25.0)
+    assert second["lines"]["KC"]["itt"] == pytest.approx(25.0)
+
+
+def test_clearing_the_total_clears_the_displayed_itt():
+    edited = _editor_start()
+    edited.loc[edited["Team"] == "KC", "Over/Under"] = pd.NA
+    reconciled = reconcile_vegas_editor(edited, editor_version=0)
+    shown = dict(zip(reconciled["frame"]["Team"], reconciled["frame"]["ITT"]))
+    assert shown["KC"] is None or pd.isna(shown["KC"])
+    assert reconciled["lines"]["KC"]["itt"] is None
+    assert reconciled["changed"] is True
+
+
+def _slate(*games: str) -> pd.DataFrame:
+    return pd.DataFrame({"Game Info": [f"{game} 09/10/2025 01:00PM ET" for game in games]})
+
+
+def _sleeper_week(url: str, timeout: float = 20):
+    if "sleeper.app" in url:
+        return {
+            "season": "2026",
+            "week": 5,
+            "season_type": "regular",
+            "season_start_date": "2026-09-09",
+        }
+    raise AssertionError(url)
+
+
+def test_empty_success_is_not_a_cached_lines_badge(tmp_path, monkeypatch):
+    cache = tmp_path / "vegas_cache.json"
+    cache.write_text(
+        json.dumps(
+            {
+                "schema": 2,
+                "timestamp": datetime(2026, 10, 5, 12, 0).timestamp(),
+                "data": _reversed_fifty_point_lines(),
+                "warnings": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _empty(url: str, timeout: float = 20):
+        if "sleeper.app" in url:
+            return _sleeper_week(url)
+        return []
+
+    monkeypatch.setattr("src.vegas_cache._http_get", _empty)
+    now = datetime(2026, 10, 5, 15, 0)
+    lines = fetch_vegas_lines(api_key="secret", force_refresh=True, cache_path=cache, now=now)
+    assert lines == {}
+    saved = json.loads(cache.read_text(encoding="utf-8"))
+    assert saved["data"] == {}
+    assert saved["warnings"] == [NO_USABLE_ODDS_WARNING]
+    status = format_cache_status(cache, now=now.timestamp())
+    assert status == "No Vegas lines cached (Last updated: 0 minutes ago)."
+    assert "Vegas Data: Cached" not in status
+    assert coverage_warnings(cache) == [NO_USABLE_ODDS_WARNING]
+    pool = _slate("KC@BUF", "PHI@DAL")
+    visible = visible_odds_warnings(lines, pool, coverage_warnings(cache))
+    assert NO_USABLE_ODDS_WARNING in visible
+    assert NO_SLATE_ODDS_WARNING in visible
+    assert missing_odds_warning("KC@BUF") in visible
+    assert missing_odds_warning("PHI@DAL") in visible
+    assert "KC" not in lines and "PHI" not in lines
+
+
+def test_omitted_slate_games_are_named_and_partial_coverage_keeps_priced_games():
+    priced = parse_odds_payload(
+        [
+            _priced("Buffalo Bills", "Kansas City Chiefs", "2026-10-11T17:00:00Z", 10, 50),
+            {
+                "home_team": "Dallas Cowboys",
+                "away_team": "Philadelphia Eagles",
+                "commence_time": "2026-10-11T20:25:00Z",
+                "bookmakers": [],
+            },
+        ]
+    )
+    assert set(priced) == {"KC", "BUF"}
+    assert missing_odds_warning("PHI@DAL") in priced.warnings
+    assert missing_odds_warning("TB@ATL") not in priced.warnings
+    pool = _slate("KC@BUF", "PHI@DAL", "TB@ATL")
+    notes = slate_odds_warnings(priced, pool)
+    assert notes == [
+        missing_odds_warning("PHI@DAL"),
+        missing_odds_warning("TB@ATL"),
+    ]
+    assert NO_SLATE_ODDS_WARNING not in notes
+    visible = visible_odds_warnings(priced, pool, priced.warnings)
+    assert visible == [
+        missing_odds_warning("PHI@DAL"),
+        missing_odds_warning("TB@ATL"),
+    ]
+
+    uncovered = slate_odds_warnings({}, pool)
+    assert uncovered[0] == NO_SLATE_ODDS_WARNING
+    assert missing_odds_warning("KC@BUF") in uncovered
+    assert missing_odds_warning("PHI@DAL") in uncovered
+    assert missing_odds_warning("TB@ATL") in uncovered
+
+
+def test_home_favorite_and_reordered_outcomes():
+    """Home can be the favorite, and outcome order is not significant."""
+    event = {
+        "home_team": "Kansas City Chiefs",
+        "away_team": "Buffalo Bills",
+        "commence_time": "2026-10-11T17:00:00Z",
+        "bookmakers": [
+            {
+                "key": "fanduel",
+                "markets": [
+                    {
+                        "key": "totals",
+                        "outcomes": [
+                            {"name": "Under", "point": 47},
+                            {"name": "Over", "point": 47},
+                        ],
+                    },
+                    {
+                        "key": "spreads",
+                        "outcomes": [
+                            {"name": "Kansas City Chiefs", "point": -7},
+                            {"name": "Buffalo Bills", "point": 7},
+                        ],
+                    },
+                ],
+            }
+        ],
+    }
+    lines = parse_odds_payload([event])
+    assert lines["KC"]["spread"] == pytest.approx(-7)
+    assert lines["BUF"]["spread"] == pytest.approx(7)
+    assert lines["KC"]["itt"] == pytest.approx(27)
+    assert lines["BUF"]["itt"] == pytest.approx(20)
+    assert lines["KC"]["itt"] > lines["BUF"]["itt"]
+    assert lines["KC"]["itt"] + lines["BUF"]["itt"] == pytest.approx(47)
+    assert lines["KC"]["game"] == "BUF@KC"
+    assert list(lines.warnings) == []

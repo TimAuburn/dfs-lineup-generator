@@ -6,8 +6,8 @@ from typing import Optional
 
 import pandas as pd
 
-from .optimizer import SKILL_POSITIONS
-from .vegas_cache import implied_team_total
+from .optimizer import SKILL_POSITIONS, games_from_pool
+from .vegas_cache import implied_team_total, missing_odds_warning
 from .weather import apply_weather_projections
 
 HIGH_ITT = 26.0
@@ -18,6 +18,9 @@ ITT_PENALTY = 0.95
 KICKER_CAPTAIN_MAX_EXPOSURE = 0.10
 
 VEGAS_EDITOR_COLUMNS = ["Game", "Team", "Spread", "Over/Under", "ITT"]
+NO_SLATE_ODDS_WARNING = (
+    "No Vegas odds cover this slate. Implied team totals were not applied."
+)
 _SKILL = set(SKILL_POSITIONS)
 
 
@@ -36,23 +39,118 @@ def _as_float(value: object) -> Optional[float]:
 
 
 def effective_implied_total(info: object) -> Optional[float]:
-    """Implied total used by the editor and the projection adjustment.
+    """Implied total derived from the game total and the signed spread.
 
-    When the game total and the team's signed spread are both present, ITT is
-    ``(total - signed spread) / 2``. A stored ``itt`` is only a fallback for
-    an incomplete market, so a reversed value saved next to a real spread
-    cannot win. A missing total or spread stays missing.
+    ITT is ``(total - signed spread) / 2`` when both numbers are present.
+    A stored or typed ``itt`` is not an override. If either input is missing,
+    the result is missing too.
     """
     if not isinstance(info, dict):
         return None
     total = _as_float(info.get("total"))
     spread = _as_float(info.get("spread"))
-    if total is not None and spread is not None:
-        return round(implied_team_total(total, spread), 2)
-    stored = _as_float(info.get("itt"))
-    if stored is None:
+    if total is None or spread is None:
         return None
-    return round(stored, 2)
+    return round(implied_team_total(total, spread), 2)
+
+
+def _same_optional_float(left: Optional[float], right: Optional[float]) -> bool:
+    if left is None and right is None:
+        return True
+    if left is None or right is None:
+        return False
+    return round(float(left), 2) == round(float(right), 2)
+
+
+def reconcile_vegas_editor(frame: Optional[pd.DataFrame], editor_version: int = 0) -> dict:
+    """Apply one data-editor return and derive the ITT column.
+
+    Streamlit sends back the grid the user just edited. Over/Under and Spread
+    can change while the ITT cell still holds the previous number, or a typed
+    ITT. This replaces ITT with the derived value and, when that differs,
+    increments ``editor_version`` so the widget can remount and show it.
+    Passing the returned frame through again leaves the version alone.
+    """
+    version = int(editor_version or 0)
+    if frame is None or frame.empty:
+        empty = frame if frame is not None else pd.DataFrame(columns=VEGAS_EDITOR_COLUMNS)
+        return {
+            "frame": empty,
+            "lines": {},
+            "editor_version": version,
+            "changed": False,
+        }
+    display = frame.copy()
+    derived_values = []
+    changed = False
+    for _, row in display.iterrows():
+        derived = effective_implied_total(
+            {
+                "total": _as_float(row.get("Over/Under")),
+                "spread": _as_float(row.get("Spread")),
+            }
+        )
+        if not _same_optional_float(_as_float(row.get("ITT")), derived):
+            changed = True
+        derived_values.append(derived)
+    display["ITT"] = derived_values
+    if changed:
+        version += 1
+    return {
+        "frame": display,
+        "lines": frame_to_lines(display),
+        "editor_version": version,
+        "changed": changed,
+    }
+
+
+def _matchup_covered(lines: dict, game: str) -> bool:
+    if "@" not in str(game):
+        return False
+    away, home = str(game).split("@", 1)
+    for team in (away.strip().upper(), home.strip().upper()):
+        info = lines.get(team)
+        if effective_implied_total(info) is None:
+            return False
+    return True
+
+
+def slate_odds_warnings(lines: object, pool: Optional[pd.DataFrame]) -> list[str]:
+    """Name loaded-slate games that have no usable odds.
+
+    A game counts only when both teams have a total and a signed spread.
+    Games left out of the feed entirely are listed along with games the feed
+    returned without a market. Nothing is filled in for them.
+    """
+    games = games_from_pool(pool)
+    if not games:
+        return []
+    line_map = lines if isinstance(lines, dict) else {}
+    missing = [game for game in games if not _matchup_covered(line_map, game)]
+    if not missing:
+        return []
+    notes: list[str] = []
+    if len(missing) == len(games):
+        notes.append(NO_SLATE_ODDS_WARNING)
+    notes.extend(missing_odds_warning(game) for game in missing)
+    return notes
+
+
+def visible_odds_warnings(
+    lines: object,
+    pool: Optional[pd.DataFrame],
+    feed_warnings: Optional[list] = None,
+) -> list[str]:
+    """Feed warnings plus slate gaps, with duplicates removed."""
+    notes: list[str] = []
+    seen = set()
+    for item in list(feed_warnings or []) + slate_odds_warnings(lines, pool):
+        text = str(item).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        notes.append(text)
+    return notes
 
 
 def lines_to_frame(lines: dict) -> pd.DataFrame:

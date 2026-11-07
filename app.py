@@ -18,10 +18,11 @@ if str(ROOT) not in sys.path:
 from src.data_loader import (
     KICKER_CAPTAIN_MAX_EXPOSURE,
     apply_projection_delta,
-    frame_to_lines,
     lines_to_frame,
     low_scoring_showdown,
     projection_adjustment_labels,
+    reconcile_vegas_editor,
+    visible_odds_warnings,
 )
 from src.env_config import (
     ODDS_API_KEY_ENV,
@@ -634,6 +635,7 @@ confirmed_qb_keys: List[Tuple[str, str]] | None = None
 # ---------------------------------------------------------------------------
 # Sidebar — format, preset, and editable overrides
 # ---------------------------------------------------------------------------
+vegas_editor_needs_rerun = False
 with st.sidebar:
     st.markdown("### Contest Format")
     st.radio(
@@ -869,7 +871,6 @@ with st.sidebar:
         api_key=odds_api_key,
         force_refresh=bool(force_vegas_refresh),
     )
-    vegas_warnings = coverage_warnings()
     signature = json.dumps(fetched_lines, sort_keys=True, default=str)
     if (
         force_vegas_refresh
@@ -878,17 +879,17 @@ with st.sidebar:
     ):
         st.session_state.vegas_source_json = signature
         st.session_state.vegas_frame = lines_to_frame(fetched_lines)
-        if force_vegas_refresh:
-            st.session_state.vegas_editor_version = int(st.session_state.vegas_editor_version) + 1
+        # A new fetch, including a successful empty feed, has to remount the
+        # grid. Otherwise the previous cells stay on screen.
+        st.session_state.vegas_editor_version = int(st.session_state.vegas_editor_version) + 1
     st.caption(format_cache_status())
-    for warning in vegas_warnings:
-        st.warning(warning)
     edited_vegas = st.data_editor(
         st.session_state.vegas_frame,
         width="stretch",
         hide_index=True,
         num_rows="dynamic",
         height=240,
+        disabled=["ITT"],
         key=f"vegas_editor_{st.session_state.vegas_editor_version}",
         column_config={
             "Game": st.column_config.TextColumn("Game", width="small"),
@@ -901,13 +902,29 @@ with st.sidebar:
                 "ITT",
                 format="%.1f",
                 width="small",
+                disabled=True,
                 help=(
-                    "(Over/Under − signed spread) / 2. "
+                    "Calculated from Over/Under and the signed spread. "
                     "A negative spread is the favorite, so that team is higher."
                 ),
             ),
         },
     )
+    reconciled = reconcile_vegas_editor(
+        edited_vegas,
+        int(st.session_state.vegas_editor_version),
+    )
+    if reconciled["changed"]:
+        st.session_state.vegas_frame = reconciled["frame"]
+        st.session_state.vegas_editor_version = reconciled["editor_version"]
+        vegas_editor_needs_rerun = True
+    vegas_warnings = visible_odds_warnings(
+        reconciled["lines"],
+        st.session_state.player_pool,
+        coverage_warnings(),
+    )
+    for warning in vegas_warnings:
+        st.warning(warning)
 
     st.markdown("### Weather")
     force_weather_refresh = st.button("Force Refresh Weather", key="force_weather_refresh")
@@ -965,7 +982,9 @@ with st.sidebar:
     else:
         st.caption("Using preset defaults (no overrides).")
 
-vegas_lines = frame_to_lines(edited_vegas)
+if vegas_editor_needs_rerun:
+    st.rerun()
+vegas_lines = reconciled["lines"]
 slate_teams: set[str] = set()
 if st.session_state.player_pool is not None and "TeamAbbrev" in st.session_state.player_pool.columns:
     slate_teams = set(
@@ -1317,7 +1336,7 @@ if generate:
     try:
         if working_pool.empty:
             raise RuntimeError("Every player is excluded.")
-        solve_lines = frame_to_lines(edited_vegas)
+        solve_lines = vegas_lines
         solve_teams = set(working_pool["TeamAbbrev"].astype(str).str.strip().str.upper())
         solve_low_total = is_showdown and low_scoring_showdown(solve_lines, solve_teams)
         solve_weather = fetch_slate_weather(

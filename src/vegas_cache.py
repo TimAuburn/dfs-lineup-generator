@@ -22,6 +22,9 @@ CACHE_PATH = PROJECT_ROOT / "data" / "vegas_cache.json"
 # no schema) stored the reversed favorite/underdog split and must not be read.
 CACHE_SCHEMA_VERSION = 2
 OUTDATED_CACHE_STATUS = "Vegas odds cache is out of date and was not used."
+NO_USABLE_ODDS_WARNING = (
+    "The odds feed returned no usable games, so no implied team totals were applied."
+)
 
 ODDS_URL = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds/"
 SLEEPER_STATE_URL = "https://api.sleeper.app/v1/state/nfl"
@@ -248,6 +251,10 @@ def format_cache_status(
     if not status["cached"]:
         return "No data cached"
     minutes = int(status["age_minutes"])
+    payload = _read_cache(cache_path)
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not data:
+        return f"No Vegas lines cached (Last updated: {minutes} minutes ago)."
     return f"Vegas Data: Cached (Last updated: {minutes} minutes ago)"
 
 
@@ -467,10 +474,15 @@ def fetch_vegas_lines(
         return _cached_data(cache_path)
 
     lines = dict(parsed)
+    warnings = list(parsed.warnings)
+    # A successful empty body used to save a blank file and look like a fresh
+    # cache. Name that outcome so the caption is not the only message.
+    if not lines and not warnings:
+        warnings.append(NO_USABLE_ODDS_WARNING)
     _write_cache(
         cache_path,
         lines,
         timestamp=current.timestamp(),
-        warnings=list(parsed.warnings),
+        warnings=warnings,
     )
     return lines
