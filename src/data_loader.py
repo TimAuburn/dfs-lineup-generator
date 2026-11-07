@@ -7,6 +7,7 @@ from typing import Optional
 import pandas as pd
 
 from .optimizer import SKILL_POSITIONS
+from .vegas_cache import implied_team_total
 from .weather import apply_weather_projections
 
 HIGH_ITT = 26.0
@@ -34,6 +35,26 @@ def _as_float(value: object) -> Optional[float]:
         return None
 
 
+def effective_implied_total(info: object) -> Optional[float]:
+    """Implied total used by the editor and the projection adjustment.
+
+    When the game total and the team's signed spread are both present, ITT is
+    ``(total - signed spread) / 2``. A stored ``itt`` is only a fallback for
+    an incomplete market, so a reversed value saved next to a real spread
+    cannot win. A missing total or spread stays missing.
+    """
+    if not isinstance(info, dict):
+        return None
+    total = _as_float(info.get("total"))
+    spread = _as_float(info.get("spread"))
+    if total is not None and spread is not None:
+        return round(implied_team_total(total, spread), 2)
+    stored = _as_float(info.get("itt"))
+    if stored is None:
+        return None
+    return round(stored, 2)
+
+
 def lines_to_frame(lines: dict) -> pd.DataFrame:
     """Build the sidebar editor table from a Vegas line dictionary."""
     rows = []
@@ -46,7 +67,7 @@ def lines_to_frame(lines: dict) -> pd.DataFrame:
                 "Team": str(team).upper(),
                 "Spread": _as_float(info.get("spread")),
                 "Over/Under": _as_float(info.get("total")),
-                "ITT": _as_float(info.get("itt")),
+                "ITT": effective_implied_total(info),
             }
         )
     frame = pd.DataFrame(rows, columns=VEGAS_EDITOR_COLUMNS)
@@ -64,10 +85,15 @@ def frame_to_lines(frame: pd.DataFrame) -> dict:
         team = str(row.get("Team", "")).strip().upper()
         if not team or team == "NAN":
             continue
-        lines[team] = {
+        info = {
             "total": _as_float(row.get("Over/Under")),
             "spread": _as_float(row.get("Spread")),
             "itt": _as_float(row.get("ITT")),
+        }
+        lines[team] = {
+            "total": info["total"],
+            "spread": info["spread"],
+            "itt": effective_implied_total(info),
             "game": "" if pd.isna(row.get("Game")) else str(row.get("Game") or ""),
         }
     return lines
@@ -95,7 +121,7 @@ def apply_vegas_projections(pool: pd.DataFrame, lines: dict) -> pd.DataFrame:
     for team, info in lines.items():
         if not isinstance(info, dict):
             continue
-        itt = _as_float(info.get("itt"))
+        itt = effective_implied_total(info)
         if itt is None:
             continue
         if itt >= HIGH_ITT:
@@ -180,7 +206,7 @@ def projection_adjustment_labels(pool: pd.DataFrame, lines: dict) -> list:
         info = lines.get(team)
         if not isinstance(info, dict):
             continue
-        itt = _as_float(info.get("itt"))
+        itt = effective_implied_total(info)
         if itt is None:
             continue
         if itt >= HIGH_ITT:

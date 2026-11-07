@@ -51,7 +51,12 @@ from src.optimizer import (
 )
 from src.parser import DKCSVValidationError, is_inactive_injury, parse_dk_csv
 from src.sleeper import overlay_sleeper_projections, sleeper_status_caption
-from src.vegas_cache import fetch_vegas_lines, format_cache_status
+from src.vegas_cache import (
+    coverage_warnings,
+    fetch_vegas_lines,
+    format_cache_status,
+    normalize_vegas_memory,
+)
 from src.weather import (
     WIND_THRESHOLD_MPH,
     fetch_slate_weather,
@@ -108,6 +113,18 @@ def _init_state() -> None:
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+    # Drop an in-memory odds frame from before the implied-total correction.
+    # The editor version bump changes the data_editor widget key.
+    migrated = normalize_vegas_memory(
+        {
+            "vegas_schema": st.session_state.get("vegas_schema"),
+            "vegas_frame": st.session_state.get("vegas_frame"),
+            "vegas_source_json": st.session_state.get("vegas_source_json"),
+            "vegas_editor_version": st.session_state.get("vegas_editor_version", 0),
+        }
+    )
+    for key, value in migrated.items():
+        st.session_state[key] = value
 
 
 def _on_format_change() -> None:
@@ -852,6 +869,7 @@ with st.sidebar:
         api_key=odds_api_key,
         force_refresh=bool(force_vegas_refresh),
     )
+    vegas_warnings = coverage_warnings()
     signature = json.dumps(fetched_lines, sort_keys=True, default=str)
     if (
         force_vegas_refresh
@@ -863,6 +881,8 @@ with st.sidebar:
         if force_vegas_refresh:
             st.session_state.vegas_editor_version = int(st.session_state.vegas_editor_version) + 1
     st.caption(format_cache_status())
+    for warning in vegas_warnings:
+        st.warning(warning)
     edited_vegas = st.data_editor(
         st.session_state.vegas_frame,
         width="stretch",
@@ -877,7 +897,15 @@ with st.sidebar:
             "Over/Under": st.column_config.NumberColumn(
                 "Over/Under", format="%.1f", width="small"
             ),
-            "ITT": st.column_config.NumberColumn("ITT", format="%.1f", width="small"),
+            "ITT": st.column_config.NumberColumn(
+                "ITT",
+                format="%.1f",
+                width="small",
+                help=(
+                    "(Over/Under − signed spread) / 2. "
+                    "A negative spread is the favorite, so that team is higher."
+                ),
+            ),
         },
     )
 
@@ -1004,6 +1032,8 @@ title = (
     if is_showdown
     else "DraftKings NFL Classic Lineup Optimizer"
 )
+for warning in vegas_warnings:
+    st.warning(warning)
 st.title(title)
 upload_help = (
     "Official DraftKings NFL Showdown / Captain Mode DKSalaries.csv "
