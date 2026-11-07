@@ -18,10 +18,11 @@ if str(ROOT) not in sys.path:
 from src.data_loader import (
     KICKER_CAPTAIN_MAX_EXPOSURE,
     apply_projection_delta,
-    frame_to_lines,
     lines_to_frame,
     low_scoring_showdown,
     projection_adjustment_labels,
+    sync_vegas_editor,
+    visible_odds_warnings,
 )
 from src.env_config import (
     ODDS_API_KEY_ENV,
@@ -57,7 +58,12 @@ from src.sleeper import (
     scoring_fallback_lines,
     sleeper_status_caption,
 )
-from src.vegas_cache import fetch_vegas_lines, format_cache_status
+from src.vegas_cache import (
+    coverage_warnings,
+    fetch_vegas_lines,
+    format_cache_status,
+    normalize_vegas_memory,
+)
 from src.weather import (
     WIND_THRESHOLD_MPH,
     fetch_slate_weather,
@@ -114,6 +120,18 @@ def _init_state() -> None:
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+    # Drop an in-memory odds frame from before the implied-total correction.
+    # The editor version bump changes the data_editor widget key.
+    migrated = normalize_vegas_memory(
+        {
+            "vegas_schema": st.session_state.get("vegas_schema"),
+            "vegas_frame": st.session_state.get("vegas_frame"),
+            "vegas_source_json": st.session_state.get("vegas_source_json"),
+            "vegas_editor_version": st.session_state.get("vegas_editor_version", 0),
+        }
+    )
+    for key, value in migrated.items():
+        st.session_state[key] = value
 
 
 def _on_format_change() -> None:
@@ -623,6 +641,7 @@ confirmed_qb_keys: List[Tuple[str, str]] | None = None
 # ---------------------------------------------------------------------------
 # Sidebar — format, preset, and editable overrides
 # ---------------------------------------------------------------------------
+vegas_editor_needs_rerun = False
 with st.sidebar:
     st.markdown("### Contest Format")
     st.radio(
@@ -866,15 +885,20 @@ with st.sidebar:
     ):
         st.session_state.vegas_source_json = signature
         st.session_state.vegas_frame = lines_to_frame(fetched_lines)
-        if force_vegas_refresh:
-            st.session_state.vegas_editor_version = int(st.session_state.vegas_editor_version) + 1
+        # A new fetch, including a successful empty feed, has to remount the
+        # grid. Otherwise the previous cells stay on screen.
+        st.session_state.vegas_editor_version = int(st.session_state.vegas_editor_version) + 1
     st.caption(format_cache_status())
+    vegas_baseline = st.session_state.vegas_frame
+    if vegas_baseline is not None:
+        vegas_baseline = vegas_baseline.copy()
     edited_vegas = st.data_editor(
         st.session_state.vegas_frame,
         width="stretch",
         hide_index=True,
         num_rows="dynamic",
         height=240,
+        disabled=["ITT"],
         key=f"vegas_editor_{st.session_state.vegas_editor_version}",
         column_config={
             "Game": st.column_config.TextColumn("Game", width="small"),
@@ -883,9 +907,35 @@ with st.sidebar:
             "Over/Under": st.column_config.NumberColumn(
                 "Over/Under", format="%.1f", width="small"
             ),
-            "ITT": st.column_config.NumberColumn("ITT", format="%.1f", width="small"),
+            "ITT": st.column_config.NumberColumn(
+                "ITT",
+                format="%.2f",
+                width="small",
+                disabled=True,
+                help=(
+                    "Derived from the shared game total and this team's signed spread. "
+                    "Editing one total or one spread updates both teams."
+                ),
+            ),
         },
     )
+    reconciled = sync_vegas_editor(
+        vegas_baseline,
+        edited_vegas,
+        int(st.session_state.vegas_editor_version),
+    )
+    if reconciled["changed"]:
+        st.session_state.vegas_frame = reconciled["frame"]
+        st.session_state.vegas_editor_version = reconciled["editor_version"]
+        vegas_editor_needs_rerun = True
+    vegas_warnings = visible_odds_warnings(
+        reconciled["lines"],
+        st.session_state.player_pool,
+        coverage_warnings(),
+        reconciled["warnings"],
+    )
+    for warning in vegas_warnings:
+        st.warning(warning)
 
     st.markdown("### Weather")
     force_weather_refresh = st.button("Force Refresh Weather", key="force_weather_refresh")
@@ -943,7 +993,9 @@ with st.sidebar:
     else:
         st.caption("Using preset defaults (no overrides).")
 
-vegas_lines = frame_to_lines(edited_vegas)
+if vegas_editor_needs_rerun:
+    st.rerun()
+vegas_lines = reconciled["lines"]
 slate_teams: set[str] = set()
 if st.session_state.player_pool is not None and "TeamAbbrev" in st.session_state.player_pool.columns:
     slate_teams = set(
@@ -1010,6 +1062,8 @@ title = (
     if is_showdown
     else "DraftKings NFL Classic Lineup Optimizer"
 )
+for warning in vegas_warnings:
+    st.warning(warning)
 st.title(title)
 upload_help = (
     "Official DraftKings NFL Showdown / Captain Mode DKSalaries.csv "
@@ -1329,7 +1383,7 @@ if generate:
     try:
         if working_pool.empty:
             raise RuntimeError("Every player is excluded.")
-        solve_lines = frame_to_lines(edited_vegas)
+        solve_lines = vegas_lines
         solve_teams = set(working_pool["TeamAbbrev"].astype(str).str.strip().str.upper())
         solve_low_total = is_showdown and low_scoring_showdown(solve_lines, solve_teams)
         solve_weather = fetch_slate_weather(
