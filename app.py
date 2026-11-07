@@ -30,7 +30,6 @@ from src.database import (
 )
 from src.data_loader import (
     KICKER_CAPTAIN_MAX_EXPOSURE,
-    apply_projection_delta,
     lines_to_frame,
     low_scoring_showdown,
     projection_adjustment_labels,
@@ -74,8 +73,10 @@ from src.player_pool import (
     generation_pool,
     locked_player_ids,
     position_choices,
+    projections_for_solve,
     set_captain,
     set_included,
+    stamp_projection_baseline,
 )
 from src.sleeper import overlay_sleeper_projections, sleeper_status_caption
 from src.vegas_cache import (
@@ -152,6 +153,24 @@ def _init_state() -> None:
     )
     for key, value in migrated.items():
         st.session_state[key] = value
+
+
+def _automatic_projection_key(frame: pd.DataFrame) -> str:
+    """Editor identity for the current automatic projections.
+
+    Odds or wind changes remount the grid. An explicit override lives on the
+    pool, so the remount shows that number again instead of the old delta.
+    """
+    if frame is None or frame.empty or "Projection" not in frame.columns:
+        return "none"
+    names = frame["Name"] if "Name" in frame.columns else [""] * len(frame)
+    teams = frame["TeamAbbrev"] if "TeamAbbrev" in frame.columns else [""] * len(frame)
+    values = pd.to_numeric(frame["Projection"], errors="coerce")
+    parts = []
+    for name, team, value in zip(names, teams, values):
+        text = "na" if pd.isna(value) else f"{float(value):.2f}"
+        parts.append(f"{name}|{team}|{text}")
+    return hashlib.sha1("\n".join(parts).encode()).hexdigest()[:12]
 
 
 def _on_format_change() -> None:
@@ -1353,6 +1372,7 @@ if view == "Player pool":
                 parsed_pool,
                 force_refresh=force_sleeper,
             )
+            parsed_pool = stamp_projection_baseline(parsed_pool)
             if force_sleeper:
                 st.session_state.sleeper_version = int(st.session_state.sleeper_version) + 1
             signature = hashlib.sha1(uploaded.getvalue()).hexdigest()
@@ -1437,16 +1457,15 @@ if view == "Player pool":
     if "Sleeper" not in pool.columns:
         pool = pool.copy()
         pool["Sleeper"] = pd.Series(pd.NA, index=pool.index, dtype="Float64")
-    adjusted = apply_projection_delta(pool, vegas_lines, weather_by_home)
-    if "ProjectionOverride" in adjusted.columns:
-        adjusted = adjusted.drop(columns=["ProjectionOverride"])
-    computed = collapse_for_editor(adjusted, showdown=is_showdown)
-    shown = adjusted
-    if "ProjectionOverride" in pool.columns:
-        shown = adjusted.copy()
-        shown["ProjectionOverride"] = pd.to_numeric(
-            pool["ProjectionOverride"], errors="coerce"
-        ).to_numpy()
+    pool = stamp_projection_baseline(pool)
+    automatic_pool = pool.copy()
+    if "ProjectionOverride" in automatic_pool.columns:
+        automatic_pool["ProjectionOverride"] = pd.Series(
+            pd.NA, index=automatic_pool.index, dtype="Float64"
+        )
+    automatic = projections_for_solve(automatic_pool, vegas_lines, weather_by_home)
+    shown = projections_for_solve(pool, vegas_lines, weather_by_home)
+    computed = collapse_for_editor(automatic, showdown=is_showdown)
     editor_frame = collapse_for_editor(shown, showdown=is_showdown)
     pool_signature = str(st.session_state.get("pool_signature") or "pool")
     name_key = f"pool_name_{pool_signature}"
@@ -1600,6 +1619,7 @@ if view == "Player pool":
             f"player_editor_{contest_format.value}_"
             f"{pool_signature}_"
             f"{int(st.session_state.sleeper_version)}_"
+            f"{_automatic_projection_key(computed)}_"
             f"{name_query}_"
             f"{','.join(selected_positions or [])}_"
             f"{','.join(selected_games or [])}"
@@ -1689,8 +1709,8 @@ if generate:
             force_refresh=False,
         )
         st.session_state.weather_by_home = solve_weather
-        # Projection already includes Delta from the Player pool page.
-        solve_pool = working_pool
+        # Current odds and wind, from the clean baseline. Overrides stay as entered.
+        solve_pool = projections_for_solve(working_pool, solve_lines, solve_weather)
         optimizer = get_nfl_optimizer(contest_format)
         optimizer.set_exclude_inactive(exclude_inactive)
         optimizer.load_from_dataframe(solve_pool)

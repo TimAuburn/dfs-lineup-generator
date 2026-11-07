@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pandas as pd
 
+from .data_loader import projection_deltas
+
 CHOICE_COLUMNS = (
     "Include",
     "Captain",
@@ -12,6 +14,9 @@ CHOICE_COLUMNS = (
     "Ownership",
     "CaptainExposure",
 )
+# Optional DraftKings scoring columns. Present only after that adapter runs.
+# The editor keeps them so a later whitelist cannot drop the pool contract.
+OPTIONAL_SCORING_COLUMNS = ("PPR", "Scoring", "ScoringNote")
 _POSITION_ORDER = ("QB", "RB", "WR", "TE", "FLEX", "DST", "K")
 _FLEX_POSITIONS = frozenset({"RB", "WR", "TE"})
 
@@ -28,7 +33,67 @@ def collapse_for_editor(pool: pd.DataFrame, *, showdown: bool) -> pd.DataFrame:
     for _, group in pool.groupby(_group_key(pool), sort=False):
         row = group.loc[_representative_index(group, showdown)]
         rows.append(_editor_row(row, group, showdown=showdown))
-    return pd.DataFrame(rows)
+    frame = pd.DataFrame(rows)
+    frame.attrs.update(dict(pool.attrs))
+    return frame
+
+
+def stamp_projection_baseline(pool: pd.DataFrame) -> pd.DataFrame:
+    """Record the clean projection base without replacing one already stored.
+
+    The base is the Sleeper weekly number when that cell is filled, otherwise
+    the DraftKings average. A projection that already includes Vegas or wind
+    is not a base. An explicit override is stored separately and is not a base.
+    """
+    if pool is None:
+        return pool
+    updated = pool.copy()
+    if updated.empty:
+        return updated
+    if "ProjectionBaseline" in updated.columns:
+        existing = pd.to_numeric(updated["ProjectionBaseline"], errors="coerce")
+    else:
+        existing = pd.Series(pd.NA, index=updated.index, dtype="Float64")
+    derived = pd.Series(pd.NA, index=updated.index, dtype="Float64")
+    for column in ("Sleeper", "AvgPointsPerGame", "Projection"):
+        if column not in updated.columns:
+            continue
+        derived = derived.fillna(pd.to_numeric(updated[column], errors="coerce"))
+    updated["ProjectionBaseline"] = existing.fillna(derived)
+    return updated
+
+
+def projections_for_solve(
+    pool: pd.DataFrame,
+    lines: dict | None,
+    weather_by_home: dict | None = None,
+) -> pd.DataFrame:
+    """Projection the optimizer should receive for these odds and this wind.
+
+    Automatic rows are the clean baseline plus the current Vegas and wind
+    delta. ``ProjectionOverride`` replaces that number exactly. The baseline
+    is never the adjusted result, so a second call does not compound, and a
+    removed total or a calmer wind returns the baseline.
+    """
+    updated = stamp_projection_baseline(pool)
+    if updated is None or updated.empty or "Projection" not in updated.columns:
+        return updated
+    baseline = pd.to_numeric(updated["ProjectionBaseline"], errors="coerce")
+    working = updated.copy()
+    working["Projection"] = baseline.to_numpy()
+    deltas = projection_deltas(working, lines or {}, weather_by_home or {})
+    delta_values = pd.to_numeric(
+        pd.Series(deltas.to_numpy(), index=updated.index),
+        errors="coerce",
+    ).fillna(0.0)
+    automatic = (baseline + delta_values).round(2)
+    if "ProjectionOverride" in updated.columns:
+        override = pd.to_numeric(updated["ProjectionOverride"], errors="coerce")
+    else:
+        override = pd.Series(pd.NA, index=updated.index, dtype="Float64")
+    updated["Delta"] = delta_values.to_numpy()
+    updated["Projection"] = automatic.where(override.isna(), override).to_numpy()
+    return updated
 
 
 def apply_pool_edits(
@@ -325,6 +390,7 @@ def _editor_row(row: pd.Series, group: pd.DataFrame, *, showdown: bool) -> dict:
         "DepthOrder",
         "DepthPosition",
         "Game Info",
+        *OPTIONAL_SCORING_COLUMNS,
     ):
         if column in group.columns:
             record[column] = row.get(column)

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
+from src.optimizer import get_nfl_optimizer
 from src.player_pool import (
     apply_pool_edits,
     collapse_for_editor,
@@ -15,9 +17,11 @@ from src.player_pool import (
     generation_pool,
     locked_player_ids,
     position_choices,
+    projections_for_solve,
     set_captain,
     set_included,
 )
+from src.presets import ContestFormat
 
 
 def _showdown_pool() -> pd.DataFrame:
@@ -211,3 +215,247 @@ def test_player_pool_uploader_is_on_the_pool_view_only():
     optimizer_labels = [item.label for item in optimizer.file_uploader]
     assert "DraftKings player pool CSV" not in optimizer_labels
     assert any("Player pool" in item.value for item in optimizer.info)
+
+
+def _worthy_pool() -> pd.DataFrame:
+    """Xavier Worthy at the salary-file base, before any odds or wind."""
+    return pd.DataFrame(
+        [
+            {
+                "ID": "3009",
+                "Name": "Xavier Worthy",
+                "Position": "WR",
+                "TeamAbbrev": "KC",
+                "Salary": 5000,
+                "AvgPointsPerGame": 11.50,
+                "Projection": 11.50,
+                "Game Info": "KC@BUF 09/10/2025 08:20PM ET",
+            }
+        ]
+    )
+
+
+def _kc_buf_lines(total: float, kc_spread: float) -> dict:
+    return {
+        "KC": {"total": total, "spread": kc_spread, "game": "KC@BUF"},
+        "BUF": {"total": total, "spread": -kc_spread, "game": "KC@BUF"},
+    }
+
+
+def _solver_fppg(pool: pd.DataFrame, *, showdown: bool = False) -> dict[str, float]:
+    optimizer = get_nfl_optimizer(
+        ContestFormat.SHOWDOWN if showdown else ContestFormat.CLASSIC
+    )
+    optimizer.set_exclude_inactive(False)
+    optimizer.load_from_dataframe(pool)
+    return {player.id: float(player.fppg) for player in optimizer._players}
+
+
+def test_solve_rederives_worthy_from_the_clean_base_when_odds_change():
+    """ITT 30, then 10, then no odds. The stored adjusted float is not the base."""
+    lines_30 = _kc_buf_lines(50.0, -10.0)
+    lines_10 = _kc_buf_lines(40.0, 20.0)
+    boosted = projections_for_solve(_worthy_pool(), lines_30, {})
+    assert boosted.loc[0, "ProjectionBaseline"] == pytest.approx(11.50)
+    assert boosted.loc[0, "Projection"] == pytest.approx(12.07)
+    assert _solver_fppg(boosted)["3009"] == pytest.approx(12.07)
+
+    stale = boosted.copy()
+    stale["Projection"] = 12.07
+    stale["ProjectionOverride"] = pd.NA
+    cut = projections_for_solve(stale, lines_10, {})
+    assert cut.loc[0, "ProjectionBaseline"] == pytest.approx(11.50)
+    assert cut.loc[0, "Projection"] == pytest.approx(10.93)
+    assert _solver_fppg(cut)["3009"] == pytest.approx(10.93)
+
+    legacy = _worthy_pool()
+    legacy["Projection"] = 12.07
+    cleared = projections_for_solve(legacy, {}, {})
+    assert cleared.loc[0, "ProjectionBaseline"] == pytest.approx(11.50)
+    assert cleared.loc[0, "Projection"] == pytest.approx(11.50)
+    assert _solver_fppg(cleared)["3009"] == pytest.approx(11.50)
+
+    again = projections_for_solve(cleared, {}, {})
+    assert again.loc[0, "Projection"] == pytest.approx(11.50)
+    assert again.loc[0, "ProjectionBaseline"] == pytest.approx(11.50)
+
+
+def test_solve_uses_current_weather_and_drops_it_when_the_wind_is_gone():
+    pool = _worthy_pool()
+    pool["TeamAbbrev"] = "GB"
+    pool["Game Info"] = "CHI@GB 10/12/2026 01:00PM ET"
+    wind = {"GB": {"wind_mph": 20}}
+    windy = projections_for_solve(pool, {}, wind)
+    assert windy.loc[0, "Projection"] == pytest.approx(10.35)
+    assert _solver_fppg(windy)["3009"] == pytest.approx(10.35)
+    calm = projections_for_solve(windy, {}, {})
+    assert calm.loc[0, "Projection"] == pytest.approx(11.50)
+    assert calm.loc[0, "ProjectionBaseline"] == pytest.approx(11.50)
+    repeated = projections_for_solve(calm, {}, {})
+    assert repeated.loc[0, "Projection"] == pytest.approx(11.50)
+
+
+def test_explicit_override_survives_odds_weather_and_a_second_solve():
+    pool = _worthy_pool()
+    pool["Projection"] = 12.07
+    pool["ProjectionOverride"] = 9.25
+    lines_30 = _kc_buf_lines(50.0, -10.0)
+    lines_10 = _kc_buf_lines(40.0, 20.0)
+    wind = {"BUF": {"wind_mph": 25}}
+    first = projections_for_solve(pool, lines_30, wind)
+    second = projections_for_solve(first, lines_10, {})
+    third = projections_for_solve(second, {}, {})
+    for frame in (first, second, third):
+        assert frame.loc[0, "Projection"] == pytest.approx(9.25)
+        assert frame.loc[0, "ProjectionBaseline"] == pytest.approx(11.50)
+        assert frame.loc[0, "ProjectionOverride"] == pytest.approx(9.25)
+        assert _solver_fppg(frame)["3009"] == pytest.approx(9.25)
+
+
+def test_showdown_captain_multiplier_is_applied_once_to_the_solve_projection():
+    pool = pd.DataFrame(
+        [
+            {
+                "ID": "cpt",
+                "Name": "Xavier Worthy",
+                "Position": "WR",
+                "Roster Position": "CPT",
+                "RosterSlot": "CPT",
+                "TeamAbbrev": "KC",
+                "Salary": 16800,
+                "AvgPointsPerGame": 11.50,
+                "Projection": 12.07,
+                "Game Info": "KC@BUF 09/10/2025 08:20PM ET",
+            },
+            {
+                "ID": "flex",
+                "Name": "Xavier Worthy",
+                "Position": "WR",
+                "Roster Position": "FLEX",
+                "RosterSlot": "FLEX",
+                "TeamAbbrev": "KC",
+                "Salary": 11200,
+                "AvgPointsPerGame": 11.50,
+                "Projection": 12.07,
+                "Game Info": "KC@BUF 09/10/2025 08:20PM ET",
+            },
+        ]
+    )
+    solved = projections_for_solve(pool, _kc_buf_lines(50.0, -10.0), {})
+    assert list(solved["Projection"]) == pytest.approx([12.07, 12.07])
+    fppg = _solver_fppg(solved, showdown=True)
+    assert fppg["flex"] == pytest.approx(12.07)
+    assert fppg["cpt"] == pytest.approx(18.105)
+    repeated = projections_for_solve(solved, _kc_buf_lines(50.0, -10.0), {})
+    assert list(repeated["Projection"]) == pytest.approx([12.07, 12.07])
+    assert _solver_fppg(repeated, showdown=True)["cpt"] == pytest.approx(18.105)
+
+
+def test_optional_scoring_columns_and_version_roundtrip():
+    pool = _showdown_pool()
+    pool["PPR"] = [18.0, 18.0, 12.5, 12.5]
+    pool["Scoring"] = ["DraftKings", "DraftKings", "DraftKings", "DraftKings"]
+    pool["ScoringNote"] = ["", "", "complete", "complete"]
+    pool.attrs["scoring_version"] = "dk-component-v2"
+    editor = collapse_for_editor(pool, showdown=True)
+    assert list(editor["PPR"]) == [18.0, 12.5]
+    assert list(editor["Scoring"]) == ["DraftKings", "DraftKings"]
+    assert list(editor["ScoringNote"]) == ["", "complete"]
+    assert editor.attrs["scoring_version"] == "dk-component-v2"
+    updated = apply_pool_edits(pool, editor, editor, showdown=True)
+    assert list(updated["PPR"]) == [18.0, 18.0, 12.5, 12.5]
+    assert list(updated["ScoringNote"]) == ["", "", "complete", "complete"]
+    assert updated.attrs["scoring_version"] == "dk-component-v2"
+    eligible = generation_pool(updated, showdown=True)
+    assert set(eligible["Scoring"]) == {"DraftKings"}
+    assert eligible.attrs["scoring_version"] == "dk-component-v2"
+
+
+def _det_cash_pool() -> pd.DataFrame:
+    """Nine classic players. Worthy's stored projection is the old ITT 30 number."""
+    game = "MIN@DET 11/08/2026 01:00PM ET"
+    rows = [
+        ("QB", "Jared Goff", "1", 8000, 18.0, 18.0),
+        ("RB", "Jahmyr Gibbs", "2", 7000, 16.0, 16.0),
+        ("RB", "David Montgomery", "3", 6000, 12.0, 12.0),
+        ("WR", "Xavier Worthy", "3009", 5000, 11.50, 12.07),
+        ("WR", "Amon-Ra St. Brown", "5", 6400, 15.0, 15.0),
+        ("WR", "Jameson Williams", "6", 4800, 10.0, 10.0),
+        ("TE", "Sam LaPorta", "7", 4600, 9.0, 9.0),
+        ("RB", "Craig Reynolds", "8", 4200, 6.0, 6.0),
+        ("DST", "Lions", "9", 3000, 7.0, 7.0),
+    ]
+    return pd.DataFrame(
+        [
+            {
+                "ID": player_id,
+                "Name": name,
+                "Position": position,
+                "TeamAbbrev": "DET",
+                "Salary": salary,
+                "AvgPointsPerGame": base,
+                "Projection": stored,
+                "Game Info": game,
+            }
+            for position, name, player_id, salary, base, stored in rows
+        ]
+    )
+
+
+def _det_lines(total: float, det_spread: float) -> dict:
+    return {
+        "DET": {"total": total, "spread": det_spread, "game": "MIN@DET"},
+        "MIN": {"total": total, "spread": -det_spread, "game": "MIN@DET"},
+    }
+
+
+def _worthy_lineup_projections(at) -> list[float]:
+    found: list[float] = []
+    for frame in at.dataframe:
+        value = getattr(frame, "value", None)
+        if value is None or "Name" not in getattr(value, "columns", []):
+            continue
+        if "Projection" not in value.columns:
+            continue
+        rows = value.loc[value["Name"].astype(str).eq("Xavier Worthy"), "Projection"]
+        found.extend(float(item) for item in rows)
+    return found
+
+
+def test_optimizer_generate_uses_current_odds_not_the_stored_projection():
+    """Pool view stored 12.07. Solve still follows the odds on the screen."""
+    app_test = pytest.importorskip("streamlit.testing.v1")
+    from src.data_loader import lines_to_frame
+    from src.vegas_cache import CACHE_SCHEMA_VERSION
+
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    at = app_test.AppTest.from_file(str(app_path))
+    empty_fetch = json.dumps({}, sort_keys=True, default=str)
+    at.session_state["contest_preset"] = "classic_cash"
+    at.session_state["player_pool"] = _det_cash_pool()
+    at.session_state["vegas_schema"] = CACHE_SCHEMA_VERSION
+    at.session_state["vegas_source_json"] = empty_fetch
+    at.session_state["vegas_editor_version"] = 1
+    at.session_state["vegas_frame"] = lines_to_frame(_det_lines(50.0, -10.0))
+    at.session_state["weather_by_home"] = {}
+    at.session_state["weather_source_json"] = empty_fetch
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+
+    def generate(lines: dict | None, version: int) -> list[float]:
+        at.session_state["vegas_frame"] = lines_to_frame(lines or {})
+        at.session_state["vegas_source_json"] = empty_fetch
+        at.session_state["vegas_editor_version"] = version
+        at.run(timeout=90)
+        assert not at.exception, at.exception
+        button = next(item for item in at.button if item.label == "Generate Lineups")
+        button.click()
+        at.run(timeout=90)
+        assert not at.exception, at.exception
+        found = _worthy_lineup_projections(at)
+        assert found, "Xavier Worthy was not in the solved lineup"
+        return found
+
+    assert generate(_det_lines(50.0, -10.0), 2) == pytest.approx([12.07])
+    assert generate(_det_lines(40.0, 20.0), 3) == pytest.approx([10.93])
+    assert generate({}, 4) == pytest.approx([11.50])
