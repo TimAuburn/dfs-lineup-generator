@@ -8,7 +8,7 @@ Streamlit + `pydfs-lineup-optimizer` tool for DraftKings **NFL Classic** (9-play
 - Contest presets that configure solver rules:
   - Classic: Cash, Small-Field GPP, Large-Field Multi-Entry GPP
   - Showdown: Showdown GPP, Showdown Cash
-- Sleeper weekly PPR projections and injury status (no API key); OUT, IR, and Doubtful players are removed
+- Sleeper weekly component stats scored on the DraftKings table (no API key). A row missing those stats falls back to Sleeper PPR and is flagged. OUT, IR, and Doubtful players are removed
 - Projection jitter before optimize (reproducible default seed `42`; pass `None` for entropy)
 - DK upload CSV export (Classic name+ID slots; Showdown numeric CPT/FLEX IDs)
 - Vegas lines from The Odds API (key in `.env`) with ITT projection tweaks

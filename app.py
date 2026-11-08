@@ -51,7 +51,16 @@ from src.optimizer import (
     unique_quarterbacks,
 )
 from src.parser import DKCSVValidationError, is_inactive_injury, parse_dk_csv
-from src.sleeper import overlay_sleeper_projections, sleeper_status_caption
+from src.dk_scoring import SCORING_VERSION
+from src.sleeper import (
+    SCORING_COLUMNS,
+    drop_stale_scoring_session,
+    overlay_sleeper_projections,
+    scoring_approximation_lines,
+    scoring_fallback_lines,
+    scoring_metadata_current,
+    sleeper_status_caption,
+)
 from src.vegas_cache import (
     coverage_warnings,
     fetch_vegas_lines,
@@ -126,6 +135,8 @@ def _init_state() -> None:
     )
     for key, value in migrated.items():
         st.session_state[key] = value
+    if drop_stale_scoring_session(st.session_state):
+        st.session_state.sleeper_version = int(st.session_state.get("sleeper_version") or 0) + 1
 
 
 def _on_format_change() -> None:
@@ -1072,6 +1083,8 @@ st.caption(
 export_headers = ",".join(upload_columns_for(contest_format))
 st.caption(f"Export template: `{export_headers}`")
 
+if drop_stale_scoring_session(st.session_state):
+    st.session_state.sleeper_version = int(st.session_state.get("sleeper_version") or 0) + 1
 lineups = st.session_state.lineups
 csv_text = (
     lineups_to_dk_upload_csv(lineups, contest_format=contest_format) if lineups else ""
@@ -1179,7 +1192,20 @@ sleeper_refresh = st.button("Refresh Sleeper projections", key="refresh_sleeper"
 if sleeper_refresh:
     st.session_state.sleeper_force = True
     st.rerun()
-st.caption(sleeper_status_caption(st.session_state.sleeper_summary))
+if not scoring_metadata_current(pool, st.session_state.sleeper_summary):
+    drop_stale_scoring_session(st.session_state)
+    st.session_state.sleeper_version = int(st.session_state.get("sleeper_version") or 0) + 1
+    st.error(
+        "Stored projections are missing current DraftKings scoring metadata and were not used."
+    )
+    st.stop()
+st.caption(sleeper_status_caption(st.session_state.sleeper_summary, pool))
+fallback_line = scoring_fallback_lines(pool)
+if fallback_line:
+    st.warning(fallback_line)
+approximation_line = scoring_approximation_lines(pool)
+if approximation_line:
+    st.caption(approximation_line)
 if not is_showdown:
     considered = pool
     if exclude_inactive and "Injury" in pool.columns:
@@ -1219,6 +1245,9 @@ st.caption(
 if "Sleeper" not in pool.columns:
     pool = pool.copy()
     pool["Sleeper"] = pd.Series(pd.NA, index=pool.index, dtype="Float64")
+if "PPR" not in pool.columns:
+    pool = pool.copy()
+    pool["PPR"] = pd.Series(pd.NA, index=pool.index, dtype="Float64")
 editable_cols = [
     "Name",
     "Position",
@@ -1226,6 +1255,7 @@ editable_cols = [
     "Salary",
     "AvgPointsPerGame",
     "Sleeper",
+    "PPR",
     "Projection",
     "Delta",
 ]
@@ -1241,6 +1271,10 @@ if "DepthOrder" in pool.columns and pd.to_numeric(pool["DepthOrder"], errors="co
     display_extra.append("DepthOrder")
 if "DepthPosition" in pool.columns and pool["DepthPosition"].astype(str).str.strip().ne("").any():
     display_extra.append("DepthPosition")
+if "Scoring" in pool.columns and pool["Scoring"].astype(str).str.strip().ne("").any():
+    display_extra.append("Scoring")
+if "ScoringNote" in pool.columns and pool["ScoringNote"].astype(str).str.strip().ne("").any():
+    display_extra.append("ScoringNote")
 pool = apply_projection_delta(pool, vegas_lines, weather_by_home)
 editor_frame = pool[editable_cols + display_extra].copy()
 editor_frame.insert(0, "Exclude", False)
@@ -1270,15 +1304,37 @@ edited = st.data_editor(
         "Sleeper": st.column_config.NumberColumn(
             "Sleeper",
             format="%.2f",
-            help="Original Sleeper weekly PPR projection. This column does not include Delta.",
+            help=(
+                "Weekly DraftKings total from Sleeper component stats, before Delta. "
+                "A PPR fallback is the Sleeper PPR number and is named in Scoring. "
+                "This column does not include the captain multiplier."
+            ),
+        ),
+        "PPR": st.column_config.NumberColumn(
+            "PPR",
+            format="%.2f",
+            help=(
+                "Sleeper pts_ppr for this week. Compare it with Sleeper, which is "
+                "the DraftKings total. A PPR fallback uses this number."
+            ),
         ),
         "Projection": st.column_config.NumberColumn(
             "Projection",
             format="%.2f",
             help=(
-                "Sleeper, or the DraftKings average when Sleeper is blank, plus Delta. "
-                "This is the number the optimizer uses. Edit to override."
+                "Weekly DraftKings total, or the salary-file average when Sleeper "
+                "is blank, plus Delta. Milestone bonuses inside the weekly total are "
+                "expected values. This is the number the optimizer uses. Edit to override."
             ),
+        ),
+        "Scoring": st.column_config.TextColumn(
+            "Scoring",
+            help="DraftKings when component stats were complete. PPR fallback when they were not.",
+        ),
+        "ScoringNote": st.column_config.TextColumn(
+            "Scoring note",
+            help="Why a row used PPR, or which DraftKings input was approximated.",
+            width="large",
         ),
         "Delta": st.column_config.NumberColumn(
             "Delta",
@@ -1306,7 +1362,7 @@ edited = st.data_editor(
         f"{(st.session_state.sleeper_summary or {}).get('season')}-"
         f"{(st.session_state.sleeper_summary or {}).get('week')}-"
         f"{(st.session_state.sleeper_summary or {}).get('matched')}-"
-        f"{int(st.session_state.sleeper_version)}-projection-plus-delta"
+        f"{int(st.session_state.sleeper_version)}-{SCORING_VERSION}-projection-plus-delta"
     ),
 )
 
@@ -1337,6 +1393,15 @@ if "Exclude" in edited.columns and "Name" in edited.columns:
         ].copy()
 
 if generate:
+    if not scoring_metadata_current(
+        st.session_state.player_pool, st.session_state.sleeper_summary
+    ) or any(column not in working_pool.columns for column in SCORING_COLUMNS):
+        drop_stale_scoring_session(st.session_state)
+        st.session_state.sleeper_version = int(st.session_state.get("sleeper_version") or 0) + 1
+        st.error(
+            "Stored projections are missing current DraftKings scoring metadata and were not used."
+        )
+        st.stop()
     progress = st.progress(0, text="Building optimizer…")
     try:
         if working_pool.empty:

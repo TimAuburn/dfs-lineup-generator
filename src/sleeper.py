@@ -1,9 +1,14 @@
 """Sleeper weekly projections and injury status for a DraftKings pool.
 
-DraftKings salaries and player IDs stay on the CSV. The optimizer's
-``Projection`` column is replaced with Sleeper ``pts_ppr`` (DraftKings is
-PPR). Injury status comes from the same feed. OUT, IR, Doubtful, PUP,
-suspended, and NA stay ineligible through the existing injury filter.
+DraftKings salaries and player IDs stay on the CSV. When the weekly feed has
+the component stats the DraftKings table needs, ``Projection`` is the
+DraftKings total from ``src.dk_scoring``. Milestone bonuses are expected
+values. A captain row is not multiplied here.
+
+If those components are missing, the row falls back to Sleeper ``pts_ppr``
+and is flagged. ``pts_std`` is never used as that fallback. A partial stat
+line is not added up. Injury status still comes from this feed. OUT, IR,
+Doubtful, PUP, suspended, and NA stay ineligible through the existing filter.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ from urllib.request import Request, urlopen
 
 import pandas as pd
 
+from .dk_scoring import SCORING_VERSION, canon_scoring_position, score_projection
 from .parser import canon_injury_status, is_inactive_injury
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -57,18 +63,66 @@ def _primary_position(position: object) -> str:
     return token
 
 
-def _projection_points(stats: object) -> Optional[float]:
-    if not isinstance(stats, dict):
-        return None
-    raw = stats.get("pts_ppr")
-    if raw is None:
-        raw = stats.get("pts_std")
-    if raw is None:
+def _ppr_points(stats: object) -> Optional[float]:
+    """Sleeper PPR total. Standard scoring is not a stand-in for PPR."""
+    if not isinstance(stats, dict) or "pts_ppr" not in stats:
         return None
     try:
-        return float(raw)
+        return float(stats["pts_ppr"])
     except (TypeError, ValueError):
         return None
+
+
+def _adapted_projection(stats: object, position: str) -> dict:
+    """DraftKings points from components, or a flagged PPR fallback.
+
+    Kickers use the Showdown table, which is the only DraftKings NFL table
+    that scores them. Classic lineups have no kicker slot. Offense and
+    defense use the shared table. The captain multiplier is not applied.
+    """
+    pos = canon_scoring_position(position)
+    contest = "showdown" if pos == "K" else "classic"
+    ppr = _ppr_points(stats)
+    if not isinstance(stats, dict):
+        return _blank_score("Sleeper stats were not an object.")
+    result = score_projection(stats, position=pos or position, contest=contest)
+    if result.ok and result.points is not None:
+        return {
+            "projection": float(result.points),
+            "sleeper_ppr": ppr,
+            "score_basis": "draftkings",
+            "score_warning": result.warning,
+            "scoring": "DraftKings",
+        }
+    if ppr is not None:
+        detail = result.warning or "Component stats were incomplete."
+        return {
+            "projection": ppr,
+            "sleeper_ppr": ppr,
+            "score_basis": "ppr_fallback",
+            "score_warning": f"PPR fallback. {detail}",
+            "scoring": "PPR fallback",
+        }
+    detail = result.warning or "Component stats were incomplete."
+    if "pts_std" in stats and "pts_ppr" not in stats:
+        detail = f"{detail} pts_std is not used as PPR."
+    return {
+        "projection": None,
+        "sleeper_ppr": None,
+        "score_basis": "unavailable",
+        "score_warning": detail,
+        "scoring": "Unavailable",
+    }
+
+
+def _blank_score(warning: str) -> dict:
+    return {
+        "projection": None,
+        "sleeper_ppr": None,
+        "score_basis": "unavailable",
+        "score_warning": warning,
+        "scoring": "Unavailable",
+    }
 
 
 def index_projections(records: object) -> dict:
@@ -83,11 +137,15 @@ def index_projections(records: object) -> dict:
         team = dk_team(row.get("team") or player.get("team"))
         if not team:
             continue
-        points = _projection_points(row.get("stats"))
-        injury = canon_injury_status(player.get("injury_status"))
         position = _primary_position(player.get("position"))
+        adapted = _adapted_projection(row.get("stats"), position)
+        injury = canon_injury_status(player.get("injury_status"))
         entry = {
-            "projection": points,
+            "projection": adapted["projection"],
+            "sleeper_ppr": adapted["sleeper_ppr"],
+            "score_basis": adapted["score_basis"],
+            "score_warning": adapted["score_warning"],
+            "scoring": adapted["scoring"],
             "injury": injury,
             "position": position,
             "depth_order": None,
@@ -181,6 +239,10 @@ def merge_sleeper_indexes(projections: dict, depth: dict) -> dict:
             injury = projected.get("injury") or ""
         merged[key] = {
             "projection": projected.get("projection"),
+            "sleeper_ppr": projected.get("sleeper_ppr"),
+            "score_basis": projected.get("score_basis") or "",
+            "score_warning": projected.get("score_warning") or "",
+            "scoring": projected.get("scoring") or "",
             "injury": injury,
             "position": charted.get("position") or projected.get("position") or "",
             "depth_order": charted.get("depth_order"),
@@ -211,13 +273,22 @@ def _keep_better(index: dict, key: str, entry: dict) -> None:
 def apply_sleeper_index(pool: pd.DataFrame, index: dict) -> tuple[pd.DataFrame, int]:
     """Replace projections and injury status for rows Sleeper recognizes.
 
-    ``AvgPointsPerGame`` stays the DraftKings average. ``Sleeper`` stores the
-    weekly number, blank when Sleeper has no match. ``Projection`` is what the
-    optimizer uses: the Sleeper number when present, otherwise the DraftKings
-    average. Matched rows take Sleeper's status even when it is blank, so a
-    healthy player is not left OUT from a stale DK tag.
+    ``AvgPointsPerGame`` stays the salary-file average. ``Sleeper`` stores the
+    weekly DraftKings total, or the flagged PPR fallback, and is blank when
+    that number is missing. ``Projection`` is what the optimizer uses: that
+    weekly number when present, otherwise the salary-file average. ``Scoring``
+    and ``ScoringNote`` say which path was used. Matched rows take Sleeper's
+    status even when it is blank, so a healthy player is not left OUT from a
+    stale DK tag. Captain rows are stored at 1x.
     """
     updated = pool.copy()
+    if "PPR" not in updated.columns:
+        updated["PPR"] = pd.Series(pd.NA, index=updated.index, dtype="Float64")
+    if "Scoring" not in updated.columns:
+        updated["Scoring"] = ""
+    if "ScoringNote" not in updated.columns:
+        updated["ScoringNote"] = ""
+    updated.attrs["scoring_version"] = SCORING_VERSION
     if updated.empty or not index:
         return updated, 0
     if "Projection" not in updated.columns:
@@ -226,10 +297,13 @@ def apply_sleeper_index(pool: pd.DataFrame, index: dict) -> tuple[pd.DataFrame, 
         )
     updated["Projection"] = pd.to_numeric(updated["Projection"], errors="coerce").astype(float)
     updated["Sleeper"] = pd.Series(pd.NA, index=updated.index, dtype="Float64")
+    updated["PPR"] = pd.Series(pd.NA, index=updated.index, dtype="Float64")
     if "Injury" not in updated.columns:
         updated["Injury"] = ""
     updated["DepthOrder"] = pd.Series(pd.NA, index=updated.index, dtype="Int64")
     updated["DepthPosition"] = ""
+    updated["Scoring"] = ""
+    updated["ScoringNote"] = ""
     matched = 0
     for idx, row in updated.iterrows():
         team = dk_team(row.get("TeamAbbrev"))
@@ -245,6 +319,10 @@ def apply_sleeper_index(pool: pd.DataFrame, index: dict) -> tuple[pd.DataFrame, 
             points = float(hit["projection"])
             updated.at[idx, "Projection"] = points
             updated.at[idx, "Sleeper"] = points
+        if hit.get("sleeper_ppr") is not None:
+            updated.at[idx, "PPR"] = float(hit["sleeper_ppr"])
+        updated.at[idx, "Scoring"] = str(hit.get("scoring") or "")
+        updated.at[idx, "ScoringNote"] = str(hit.get("score_warning") or "")
         updated.at[idx, "Injury"] = hit.get("injury") or ""
         order = _depth_order(hit.get("depth_order"))
         if order is not None:
@@ -269,6 +347,9 @@ def _read_cache(path: Path) -> Optional[dict]:
         return None
     if not isinstance(payload, dict) or not isinstance(payload.get("index"), dict):
         return None
+    if payload.get("scoring") != SCORING_VERSION:
+        # Older files stored raw PPR in ``projection``. Do not reuse them.
+        return None
     try:
         float(payload["timestamp"])
     except (TypeError, ValueError, KeyError):
@@ -278,7 +359,12 @@ def _read_cache(path: Path) -> Optional[dict]:
 
 def _write_cache(path: Path, index: dict, meta: dict, *, timestamp: float) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"timestamp": float(timestamp), "index": index, **meta}
+    payload = {
+        "timestamp": float(timestamp),
+        "scoring": SCORING_VERSION,
+        "index": index,
+        **meta,
+    }
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
@@ -371,18 +457,117 @@ def overlay_sleeper_projections(
     inactive = 0
     if "Injury" in updated.columns:
         inactive = int(updated["Injury"].map(is_inactive_injury).sum())
+    fallback = 0
+    if "Scoring" in updated.columns:
+        fallback = int(updated["Scoring"].eq("PPR fallback").sum())
     summary = {
         **meta,
         "matched": matched,
         "rows": int(len(updated)),
         "inactive_rows": inactive,
+        "ppr_fallback_rows": fallback,
+        "scoring": SCORING_VERSION,
         "ok": bool(index),
     }
     return updated, summary
 
 
-def sleeper_status_caption(summary: Optional[dict]) -> str:
+def scoring_fallback_lines(pool: pd.DataFrame) -> str:
+    """One warning line naming players whose components were not scored."""
+    if pool is None or pool.empty or "Scoring" not in pool.columns:
+        return ""
+    flagged = pool.loc[pool["Scoring"].astype(str).eq("PPR fallback")]
+    if flagged.empty:
+        return ""
+    parts: list[str] = []
+    seen: set[str] = set()
+    for _, row in flagged.iterrows():
+        label = f"{row.get('Name')} ({row.get('TeamAbbrev')})"
+        if label in seen:
+            continue
+        seen.add(label)
+        note = str(row.get("ScoringNote") or "").strip()
+        parts.append(f"{label}: {note}" if note else label)
+    preview = "; ".join(parts[:6])
+    extra = f" +{len(parts) - 6} more" if len(parts) > 6 else ""
+    return (
+        "PPR fallback. Component stats were incomplete, so these projections "
+        f"are Sleeper PPR and were not filled in from a partial line: {preview}{extra}."
+    )
+
+
+def scoring_approximation_lines(pool: pd.DataFrame) -> str:
+    """Note defenses whose points-allowed tier is an expected value."""
+    if pool is None or pool.empty or "ScoringNote" not in pool.columns:
+        return ""
+    notes = pool["ScoringNote"].astype(str)
+    flagged = pool.loc[notes.str.contains("not a distribution", case=False, na=False)]
+    if flagged.empty or "TeamAbbrev" not in flagged.columns:
+        return ""
+    teams = sorted({str(team).strip().upper() for team in flagged["TeamAbbrev"] if str(team).strip()})
+    team_list = ", ".join(teams)
+    return (
+        "Defense points-allowed tiers are expected values from the average "
+        f"allowed, not a realized tier ({team_list}). "
+        "Yards allowed are not a DraftKings category."
+    )
+
+
+# Visible scoring metadata. A retained pool that loses any of these, including
+# through an editor whitelist that copies only a subset of columns, is not a
+# current DraftKings score.
+SCORING_COLUMNS = ("PPR", "Scoring", "ScoringNote")
+
+
+def scoring_metadata_current(pool: object, summary: object) -> bool:
+    """True when this pool was scored by the current DraftKings adapter."""
+    if not isinstance(pool, pd.DataFrame):
+        return False
+    if any(column not in pool.columns for column in SCORING_COLUMNS):
+        return False
+    if pool.attrs.get("scoring_version") != SCORING_VERSION:
+        return False
+    return isinstance(summary, dict) and summary.get("scoring") == SCORING_VERSION
+
+
+def drop_stale_scoring_session(state: dict) -> bool:
+    """Clear a pool and its lineups when their scoring version is missing or old.
+
+    The stored numbers cannot be rescored: the component stats are not on the
+    frame. Leaving them up would let a PPR total sit under a DraftKings caption.
+    A pool stamped with the current version is kept, including its lineups.
+    """
+    pool = state.get("player_pool")
+    summary = state.get("sleeper_summary")
+    lineups = state.get("lineups") or []
+    generated = state.get("generated_run")
+    has_work = (
+        isinstance(pool, pd.DataFrame)
+        or bool(lineups)
+        or generated is not None
+        or summary is not None
+    )
+    if not has_work or scoring_metadata_current(pool, summary):
+        return False
+    state["player_pool"] = None
+    state["lineups"] = []
+    state["generated_run"] = None
+    state["sleeper_summary"] = None
+    return True
+
+
+def sleeper_status_caption(summary: Optional[dict], pool: object = None) -> str:
     """One line for the player-pool caption."""
+    if pool is not None and not scoring_metadata_current(pool, summary):
+        return (
+            "Stored projections are missing current DraftKings scoring metadata "
+            "and were not used."
+        )
+    if isinstance(summary, dict) and summary.get("ok") and summary.get("scoring") != SCORING_VERSION:
+        return (
+            "Stored Sleeper projections do not match the current DraftKings "
+            "scoring version and were not used."
+        )
     if not summary or not summary.get("ok"):
         detail = (summary or {}).get("error") or "unavailable"
         return f"Sleeper projections unavailable ({detail}). Using DraftKings averages."
@@ -394,8 +579,12 @@ def sleeper_status_caption(summary: Optional[dict]) -> str:
     cached = " Cached." if summary.get("from_cache") else ""
     if summary.get("error"):
         cached = " Saved copy used after a refresh failed."
+    fallback = int(summary.get("ppr_fallback_rows") or 0)
     return (
-        f"Projections: Sleeper {season} week {week}, {matched} of {rows} rows. "
-        f"DraftKings is the salary-file average. "
+        f"Projections: DraftKings scoring from Sleeper {season} week {week} "
+        f"component stats, {matched} of {rows} rows. "
+        f"Milestone bonuses are expected values, not a flat +3. "
+        f"{fallback} row(s) flagged as PPR fallback. "
+        f"The salary-file average stays in the DraftKings column. "
         f"{inactive} row(s) marked OUT, IR, or Doubtful.{cached}"
     )
