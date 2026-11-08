@@ -127,9 +127,9 @@ def test_depth_only_hit_is_not_a_projection_match():
             "1": {
                 "first_name": "Drew",
                 "last_name": "Lock",
-                "position": "QB",
+                "position": "RB",
                 "team": "SEA",
-                "depth_chart_position": "QB",
+                "depth_chart_position": "RB",
                 "depth_chart_order": 2,
                 "injury_status": None,
             }
@@ -140,7 +140,7 @@ def test_depth_only_hit_is_not_a_projection_match():
         [
             _pool_row(
                 Name="Drew Lock",
-                Position="QB",
+                Position="RB",
                 TeamAbbrev="SEA",
                 Projection=17.1,
                 AvgPointsPerGame=17.1,
@@ -685,9 +685,9 @@ def test_unmatched_players_are_listed_separately_from_projection_coverage():
                 "player_id": "9",
                 "first_name": "Drew",
                 "last_name": "Lock",
-                "position": "QB",
+                "position": "RB",
                 "team": "SEA",
-                "depth_chart_position": "QB",
+                "depth_chart_position": "RB",
                 "depth_chart_order": 2,
                 "injury_status": "Questionable",
             }
@@ -697,7 +697,7 @@ def test_unmatched_players_are_listed_separately_from_projection_coverage():
     pool = pd.DataFrame(
         [
             _pool_row(ID="1", Name="Josh Allen", Projection=1.0),
-            _pool_row(ID="2", Name="Drew Lock", Position="QB", TeamAbbrev="SEA", Projection=17.0, AvgPointsPerGame=17.0),
+            _pool_row(ID="2", Name="Drew Lock", Position="RB", TeamAbbrev="SEA", Projection=17.0, AvgPointsPerGame=17.0),
             _pool_row(ID="3", Name="Unlisted Rookie", Position="WR", TeamAbbrev="BUF", Projection=1.5),
         ]
     )

@@ -1,9 +1,9 @@
 """Sleeper weekly projections and injury status for one uploaded slate.
 
-DraftKings salaries, roster slots, and player IDs stay on the CSV. The
-optimizer projection becomes Sleeper ``pts_ppr`` when that player's weekly
-number is matched. ``pts_std`` is only a fallback when ``pts_ppr`` is absent;
-the DraftKings scoring adapter is a separate change and is not applied here.
+DraftKings salaries, roster slots, and player IDs stay on the CSV. Candidate
+matching chooses the Sleeper identity. The DraftKings component scorer then
+turns that player's stat line into the weekly number. ``pts_std`` is never
+that number. A captain row is stored at 1x.
 
 The week comes from the slate's game dates and a real NFL schedule, then it
 is checked against the projection payload. The Sleeper current-week endpoint
@@ -40,6 +40,7 @@ from urllib.request import Request, urlopen
 
 import pandas as pd
 
+from .dk_scoring import SCORING_VERSION, canon_scoring_position, score_projection
 from .parser import canon_injury_status, injury_status_for_player, is_inactive_injury
 from .slate_week import (
     ScheduledGame,
@@ -109,23 +110,68 @@ def _positions_compatible(left: object, right: object) -> bool:
     return _primary_position(left) == _primary_position(right) and bool(_primary_position(left))
 
 
-def _projection_points(stats: object) -> Optional[float]:
-    """Weekly points. ``pts_std`` fills in only when ``pts_ppr`` is absent.
-
-    The unmerged scoring adapter stops using ``pts_std`` and scores DraftKings
-    components instead. This function does not do that.
-    """
-    if not isinstance(stats, dict):
-        return None
-    raw = stats.get("pts_ppr")
-    if raw is None:
-        raw = stats.get("pts_std")
-    if raw is None:
+def _ppr_points(stats: object) -> Optional[float]:
+    """Sleeper PPR total. Standard scoring is not a stand-in for PPR."""
+    if not isinstance(stats, dict) or "pts_ppr" not in stats:
         return None
     try:
-        return float(raw)
+        return float(stats["pts_ppr"])
     except (TypeError, ValueError):
         return None
+
+
+def _adapted_projection(stats: object, position: str) -> dict:
+    """DraftKings points for one already chosen stat line.
+
+    Kickers use the Showdown table. The captain multiplier is not applied.
+    Missing components fall back to ``pts_ppr`` and are flagged. ``pts_std``
+    is never that fallback.
+    """
+    pos = canon_scoring_position(position)
+    contest = "showdown" if pos == "K" else "classic"
+    ppr = _ppr_points(stats)
+    if not isinstance(stats, dict):
+        return _blank_score("Sleeper stats were not an object.")
+    result = score_projection(stats, position=pos or position, contest=contest)
+    if result.ok and result.points is not None:
+        return {
+            "projection": float(result.points),
+            "sleeper_ppr": ppr,
+            "score_basis": "draftkings",
+            "score_warning": result.warning or "",
+            "scoring": "DraftKings",
+        }
+    if ppr is not None:
+        detail = result.warning or "Component stats were incomplete."
+        return {
+            "projection": ppr,
+            "sleeper_ppr": ppr,
+            "score_basis": "ppr_fallback",
+            "score_warning": f"PPR fallback. {detail}",
+            "scoring": "PPR fallback",
+        }
+    detail = result.warning or "Component stats were incomplete."
+    if isinstance(stats, dict) and "pts_std" in stats and "pts_ppr" not in stats:
+        detail = f"{detail} pts_std is not used as PPR."
+    return _blank_score(detail)
+
+
+def _blank_score(warning: str) -> dict:
+    return {
+        "projection": None,
+        "sleeper_ppr": None,
+        "score_basis": "unavailable",
+        "score_warning": warning,
+        "scoring": "Unavailable",
+    }
+
+
+def _score_candidate(row: dict) -> dict:
+    """Score one source row after identity selection. Does not choose among rows."""
+    adapted = _adapted_projection(row.get("stats") or {}, str(row.get("position") or ""))
+    scored = dict(row)
+    scored.update(adapted)
+    return scored
 
 
 def _feed_updated_at(row: dict) -> Optional[float]:
@@ -147,12 +193,14 @@ def _candidate_from_projection(row: dict) -> Optional[dict]:
     first = str(player.get("first_name") or "").strip()
     last = str(player.get("last_name") or "").strip()
     player_id = str(row.get("player_id") or player.get("player_id") or "").strip()
+    stats = row.get("stats") if isinstance(row.get("stats"), dict) else {}
     return {
         "player_id": player_id,
         "name": normalize_player_name(f"{first} {last}".strip()),
         "team": team,
         "position": position,
-        "projection": _projection_points(row.get("stats")),
+        "stats": stats,
+        "projection": None,
         "injury": canon_injury_status(player.get("injury_status")),
         "depth_order": None,
         "depth_position": "",
@@ -411,7 +459,7 @@ def _select_candidates(row: pd.Series, projections: list[dict], depth: list[dict
     proj_groups = _unique_players(proj_hits)
     depth_groups = _unique_players(depth_hits)
     if len(proj_groups) > 1 or (not proj_groups and len(depth_groups) > 1):
-        shown = proj_hits or depth_hits
+        shown = [_score_candidate(candidate) for candidate in (proj_hits or depth_hits)]
         detail = "; ".join(_candidate_brief(candidate) for candidate in shown[:6])
         return {
             "status": "ambiguous",
@@ -419,19 +467,20 @@ def _select_candidates(row: pd.Series, projections: list[dict], depth: list[dict
             "candidates": shown,
         }
     if proj_groups:
-        values = _projection_values(proj_groups[0])
+        scored = [_score_candidate(candidate) for candidate in proj_groups[0]]
+        values = _projection_values(scored)
         if len(values) > 1:
-            detail = "; ".join(_candidate_brief(candidate) for candidate in proj_groups[0][:6])
+            detail = "; ".join(_candidate_brief(candidate) for candidate in scored[:6])
             return {
                 "status": "ambiguous",
                 "reason": (
                     f"{label} has conflicting Sleeper projections ({detail}). "
                     "The higher number was not chosen."
                 ),
-                "candidates": proj_groups[0],
+                "candidates": scored,
             }
         points = values[0] if values else None
-        chosen = proj_groups[0]
+        chosen = scored
         chosen_depth = depth_hits
         if chosen[0].get("player_id"):
             chosen_depth = [
@@ -440,18 +489,47 @@ def _select_candidates(row: pd.Series, projections: list[dict], depth: list[dict
                 if str(candidate.get("player_id") or "") == str(chosen[0].get("player_id"))
             ] or depth_hits
         status = "projection" if points is not None else "no_projection"
+        status = _qb_without_weekly_status(status, position, chosen_depth)
         return {
             "status": status,
             "projection": points,
+            "score": chosen[0],
             "proj_rows": chosen,
             "depth_rows": chosen_depth,
         }
+    status = _qb_without_weekly_status("depth_only", position, depth_groups[0])
     return {
-        "status": "depth_only",
+        "status": status,
         "projection": None,
+        "score": {},
         "proj_rows": [],
         "depth_rows": depth_groups[0],
     }
+
+
+def _qb_without_weekly_status(status: str, position: object, depth_rows: list[dict]) -> str:
+    """Confirmed starters keep the salary-file average. Other depth-chart QBs do not.
+
+    A weekly number, including a PPR fallback, is left unchanged. A projection
+    feed that cannot be scored stays ``no_projection`` so the average is kept
+    and the under-12 cutoff still applies. Only a depth-chart quarterback with
+    no weekly row is rewritten here.
+    """
+    if status == "projection" or _primary_position(position) != "QB":
+        return status
+    if status not in {"no_projection", "depth_only"}:
+        return status
+    orders = [_depth_order(item.get("depth_order")) for item in depth_rows]
+    orders = [order for order in orders if order is not None]
+    slots = [str(item.get("depth_position") or "").strip().upper() for item in depth_rows]
+    slots = [slot for slot in slots if slot]
+    order = min(orders) if orders else None
+    confirmed = order == 1 and (not slots or "QB" in slots)
+    if confirmed and status == "depth_only":
+        return "starter_average"
+    if status == "depth_only" and order is not None:
+        return "backup_zero"
+    return status
 
 
 def match_sleeper_pool(pool: pd.DataFrame, index: object) -> tuple[pd.DataFrame, dict]:
@@ -481,6 +559,10 @@ def match_sleeper_pool(pool: pd.DataFrame, index: object) -> tuple[pd.DataFrame,
     updated["PreLock"] = ""
     updated["InjuryNote"] = ""
     updated["MatchStatus"] = ""
+    updated["PPR"] = pd.Series(pd.NA, index=updated.index, dtype="Float64")
+    updated["Scoring"] = ""
+    updated["ScoringNote"] = ""
+    updated["StarterFallback"] = False
 
     identities: dict[tuple, dict] = {}
     for idx, row in updated.iterrows():
@@ -507,13 +589,36 @@ def match_sleeper_pool(pool: pd.DataFrame, index: object) -> tuple[pd.DataFrame,
         updated.at[idx, "InjuryNote"] = note
         updated.at[idx, "PreLock"] = "Q" if injury == "QUESTIONABLE" else ""
         updated.at[idx, "MatchStatus"] = status
+        score = choice.get("score") if isinstance(choice.get("score"), dict) else {}
         if status == "projection" and points is not None:
             updated.at[idx, "Projection"] = float(points)
             updated.at[idx, "Sleeper"] = float(points)
+            if score.get("sleeper_ppr") is not None:
+                updated.at[idx, "PPR"] = float(score["sleeper_ppr"])
+            updated.at[idx, "Scoring"] = str(score.get("scoring") or "")
+            updated.at[idx, "ScoringNote"] = str(score.get("score_warning") or "")
+        elif status == "no_projection":
+            updated.at[idx, "Scoring"] = str(score.get("scoring") or "")
+            updated.at[idx, "ScoringNote"] = str(score.get("score_warning") or "")
+        elif status == "starter_average":
+            updated.at[idx, "StarterFallback"] = True
+            updated.at[idx, "Scoring"] = "Salary-file average"
+            updated.at[idx, "ScoringNote"] = (
+                "Confirmed starter has no weekly Sleeper projection. "
+                "DraftKings salary-file average kept. This is not a projection match."
+            )
+        elif status == "backup_zero":
+            updated.at[idx, "Projection"] = 0.0
+            updated.at[idx, "Sleeper"] = 0.0
+            updated.at[idx, "Scoring"] = "No weekly score"
+            updated.at[idx, "ScoringNote"] = (
+                "Unconfirmed quarterback has no weekly projection, "
+                "so the salary-file average was not used."
+            )
         depth_rows = choice.get("depth_rows") or []
         orders = [_depth_order(item.get("depth_order")) for item in depth_rows]
         orders = [order for order in orders if order is not None]
-        if status in {"projection", "no_projection", "depth_only"} and orders:
+        if status in {"projection", "no_projection", "depth_only", "starter_average", "backup_zero"} and orders:
             updated.at[idx, "DepthOrder"] = min(orders)
             slots = [str(item.get("depth_position") or "") for item in depth_rows if item.get("depth_position")]
             if slots:
@@ -539,6 +644,11 @@ def match_sleeper_pool(pool: pd.DataFrame, index: object) -> tuple[pd.DataFrame,
             bucket["candidates"] = choice.get("candidates") or bucket["candidates"]
         elif bucket["status"] != "ambiguous" and status == "projection":
             bucket["status"] = "projection"
+        elif bucket["status"] not in {"ambiguous", "projection"} and status in {
+            "starter_average",
+            "backup_zero",
+        }:
+            bucket["status"] = status
 
     for identity, bucket in identities.items():
         report["player_count"] += 1
@@ -546,6 +656,10 @@ def match_sleeper_pool(pool: pd.DataFrame, index: object) -> tuple[pd.DataFrame,
             report["projection_players"] += 1
         elif bucket["status"] == "depth_only":
             report["depth_only_players"] += 1
+        elif bucket["status"] == "starter_average":
+            report["starter_fallbacks"].append(
+                {"name": bucket["name"], "team": bucket["team"], "position": bucket["position"]}
+            )
         elif bucket["status"] == "unmatched":
             report["unmatched"].append(
                 {
@@ -573,7 +687,13 @@ def match_sleeper_pool(pool: pd.DataFrame, index: object) -> tuple[pd.DataFrame,
                     ],
                 }
             )
-        if bucket["status"] in {"projection", "no_projection", "depth_only"}:
+        if bucket["status"] in {
+            "projection",
+            "no_projection",
+            "depth_only",
+            "starter_average",
+            "backup_zero",
+        }:
             report["injury_players"] += 1
         if bucket["prelock"]:
             report["questionable"].append(
@@ -581,8 +701,13 @@ def match_sleeper_pool(pool: pd.DataFrame, index: object) -> tuple[pd.DataFrame,
             )
 
     report["projection_rows"] = int(updated["MatchStatus"].eq("projection").sum()) if len(updated) else 0
-    report["injury_rows"] = int(updated["MatchStatus"].isin(["projection", "no_projection", "depth_only"]).sum())
+    report["injury_rows"] = int(
+        updated["MatchStatus"].isin(
+            ["projection", "no_projection", "depth_only", "starter_average", "backup_zero"]
+        ).sum()
+    )
     report["depth_only_rows"] = int(updated["MatchStatus"].eq("depth_only").sum())
+    report["ppr_fallback_rows"] = int(updated["Scoring"].eq("PPR fallback").sum()) if len(updated) else 0
     report["rows"] = int(len(updated))
     report["inactive_rows"] = int(updated["Injury"].map(is_inactive_injury).sum())
     return updated, report
@@ -608,6 +733,8 @@ def _empty_report(rows: int) -> dict:
         "unmatched": [],
         "ambiguous": [],
         "questionable": [],
+        "starter_fallbacks": [],
+        "ppr_fallback_rows": 0,
         "matching_ran": False,
     }
 
@@ -667,6 +794,8 @@ def _read_cache(path: Path) -> Optional[dict]:
         return None
     if payload.get("match_schema") != MATCH_CACHE_VERSION:
         return None
+    if payload.get("scoring") != SCORING_VERSION:
+        return None
     if not isinstance(payload.get("index"), dict):
         return None
     if not payload.get("fingerprint") or not payload.get("slate_key"):
@@ -676,7 +805,12 @@ def _read_cache(path: Path) -> Optional[dict]:
 
 def _write_cache(path: Path, index: dict, meta: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"match_schema": MATCH_CACHE_VERSION, "index": index, **meta}
+    payload = {
+        **meta,
+        "match_schema": MATCH_CACHE_VERSION,
+        "scoring": SCORING_VERSION,
+        "index": index,
+    }
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
@@ -708,10 +842,10 @@ def _cache_age_seconds(payload: dict, now_ts: float) -> Optional[float]:
             stamps.append(float(players))
         except (TypeError, ValueError):
             return None
-    age = now_ts - min(stamps)
-    if age < 0:
+    ages = [now_ts - stamp for stamp in stamps]
+    if any(age < 0 for age in ages):
         return None
-    return age
+    return max(ages)
 
 
 def _cache_matches(payload: dict, fingerprint: str, season: str, week: int, season_type: str) -> bool:
@@ -753,6 +887,10 @@ def _base_meta(
         "rejected_cache": None,
         "schedule_supplied": False,
         "matching_ran": False,
+        "scoring": SCORING_VERSION,
+        "match_schema": MATCH_CACHE_VERSION,
+        "fingerprint": "",
+        "slate_key": "",
     }
 
 
@@ -805,6 +943,8 @@ def load_sleeper_index(
     meta = _base_meta(max_cache_age_seconds=max_cache_age_seconds, ttl_seconds=ttl_seconds)
     slate = slate_games_from_pool(pool) if pool is not None else []
     key = slate_key(slate)
+    meta["slate_key"] = key
+    meta["fingerprint"] = f"unresolved|{key}"
     cached = _read_cache(cache_path)
     supplied = schedule_games is not None
     meta["schedule_supplied"] = supplied
@@ -861,8 +1001,11 @@ def load_sleeper_index(
     meta["week"] = week
     meta["season_type"] = season_type
     meta["message"] = resolution["message"]
+    meta["fingerprint"] = fingerprint
+    meta["slate_key"] = key
 
-    fresh = _matching_cache(cached, fingerprint, season, week, season_type, now_ts, ttl_seconds)
+    fresh_limit = min(int(ttl_seconds), int(max_cache_age_seconds))
+    fresh = _matching_cache(cached, fingerprint, season, week, season_type, now_ts, fresh_limit)
     if fresh is not None and not force_refresh:
         return fresh["index"], _meta_from_cache(fresh, meta, from_cache=True, error=None, now_ts=now_ts)
 
@@ -1086,9 +1229,31 @@ def overlay_sleeper_projections(
         "matched": int(report["projection_rows"]),
         "rows": int(len(updated)),
         "inactive_rows": int(report["inactive_rows"]),
+        "ppr_fallback_rows": int(report.get("ppr_fallback_rows") or 0),
+        "scoring": SCORING_VERSION,
+        "match_schema": MATCH_CACHE_VERSION,
     }
     summary["message"] = _with_pool_gaps(pool, summary.get("message") or "")
+    updated = _stamp_contract(updated, summary)
     return updated, summary
+
+
+def _stamp_contract(pool: pd.DataFrame, summary: dict) -> pd.DataFrame:
+    """Mark this frame as produced by the current scorer and matcher."""
+    updated = pool.copy()
+    if "PPR" not in updated.columns:
+        updated["PPR"] = pd.Series(pd.NA, index=updated.index, dtype="Float64")
+    if "Scoring" not in updated.columns:
+        updated["Scoring"] = ""
+    if "ScoringNote" not in updated.columns:
+        updated["ScoringNote"] = ""
+    if "StarterFallback" not in updated.columns:
+        updated["StarterFallback"] = False
+    updated.attrs["scoring_version"] = SCORING_VERSION
+    updated.attrs["match_schema"] = MATCH_CACHE_VERSION
+    updated.attrs["fingerprint"] = summary.get("fingerprint") or ""
+    updated.attrs["slate_key"] = summary.get("slate_key") or ""
+    return updated
 
 
 def _with_pool_gaps(pool: pd.DataFrame, message: str) -> str:
@@ -1152,6 +1317,16 @@ def sleeper_status_lines(summary: Optional[dict]) -> list[str]:
             "Questionable players stay eligible and are flagged before lock: "
             f"{len(questionable)}. {_names(questionable)}."
         )
+        starters = summary.get("starter_fallbacks") or []
+        lines.append(
+            "Confirmed starters with no weekly projection keep the DraftKings average "
+            f"and are not projection coverage: {len(starters)}. {_names(starters)}."
+        )
+        lines.append(
+            "DraftKings scoring from Sleeper component stats. "
+            "Milestone bonuses are expected values, not a flat +3. "
+            f"{int(summary.get('ppr_fallback_rows') or 0)} row(s) flagged as PPR fallback."
+        )
     else:
         lines.append(
             "Projection coverage: 0. Injury coverage: 0. "
@@ -1209,6 +1384,129 @@ def _freshness_line(summary: dict) -> str:
     return " ".join(parts)
 
 
-def sleeper_status_caption(summary: Optional[dict]) -> str:
+SCORING_COLUMNS = ("PPR", "Scoring", "ScoringNote")
+MATCH_COLUMNS = ("PreLock", "InjuryNote", "MatchStatus", "StarterFallback")
+STARTER_FALLBACK_NOTE = (
+    "Confirmed starter has no weekly Sleeper projection. "
+    "DraftKings salary-file average kept. This is not a projection match."
+)
+
+
+def scoring_metadata_current(pool: object, summary: object) -> bool:
+    """True when this pool carries the current DraftKings scoring contract."""
+    if not isinstance(pool, pd.DataFrame):
+        return False
+    if any(column not in pool.columns for column in SCORING_COLUMNS):
+        return False
+    if pool.attrs.get("scoring_version") != SCORING_VERSION:
+        return False
+    return isinstance(summary, dict) and summary.get("scoring") == SCORING_VERSION
+
+
+def session_contract_current(pool: object, summary: object) -> bool:
+    """True when scoring and slate matching are the current pair.
+
+    A wrong slate, a missing version, or a week that was not recorded clears
+    the retained pool and its lineups. An explicit failed resolve stays only
+    when this overlay wrote both versions and the same slate key.
+    """
+    if not scoring_metadata_current(pool, summary):
+        return False
+    if not isinstance(pool, pd.DataFrame) or not isinstance(summary, dict):
+        return False
+    if summary.get("match_schema") != MATCH_CACHE_VERSION:
+        return False
+    if pool.attrs.get("match_schema") != MATCH_CACHE_VERSION:
+        return False
+    if summary.get("applied"):
+        if summary.get("season") in (None, "") or summary.get("week") in (None, ""):
+            return False
+        if summary.get("season_type") not in {"pre", "regular", "post"}:
+            return False
+    pool_key = ""
+    if "Game Info" in pool.columns:
+        pool_key = slate_key(slate_games_from_pool(pool))
+    if pool_key and pool.attrs.get("slate_key") != pool_key:
+        return False
+    if summary.get("slate_key") != pool.attrs.get("slate_key"):
+        return False
+    if summary.get("fingerprint") != pool.attrs.get("fingerprint"):
+        return False
+    return True
+
+
+def drop_stale_scoring_session(state: dict) -> bool:
+    """Clear a pool and its lineups when scoring or matching is missing or old."""
+    pool = state.get("player_pool")
+    summary = state.get("sleeper_summary")
+    lineups = state.get("lineups") or []
+    generated = state.get("generated_run")
+    has_work = (
+        isinstance(pool, pd.DataFrame)
+        or bool(lineups)
+        or generated is not None
+        or summary is not None
+    )
+    if not has_work or session_contract_current(pool, summary):
+        return False
+    state["player_pool"] = None
+    state["lineups"] = []
+    state["generated_run"] = None
+    state["sleeper_summary"] = None
+    return True
+
+
+def scoring_fallback_lines(pool: pd.DataFrame) -> str:
+    """Name players whose components were incomplete."""
+    if pool is None or pool.empty or "Scoring" not in pool.columns:
+        return ""
+    flagged = pool.loc[pool["Scoring"].astype(str).eq("PPR fallback")]
+    if flagged.empty:
+        return ""
+    parts: list[str] = []
+    seen: set[str] = set()
+    for _, row in flagged.iterrows():
+        label = f"{row.get('Name')} ({row.get('TeamAbbrev')})"
+        if label in seen:
+            continue
+        seen.add(label)
+        note = str(row.get("ScoringNote") or "").strip()
+        parts.append(f"{label}: {note}" if note else label)
+    preview = "; ".join(parts[:6])
+    extra = f" +{len(parts) - 6} more" if len(parts) > 6 else ""
+    return (
+        "PPR fallback. Component stats were incomplete, so these projections "
+        f"are Sleeper PPR and were not filled in from a partial line: {preview}{extra}."
+    )
+
+
+def scoring_approximation_lines(pool: pd.DataFrame) -> str:
+    """Note defenses whose points-allowed tier is an expected value."""
+    if pool is None or pool.empty or "ScoringNote" not in pool.columns:
+        return ""
+    notes = pool["ScoringNote"].astype(str)
+    flagged = pool.loc[notes.str.contains("not a distribution", case=False, na=False)]
+    if flagged.empty or "TeamAbbrev" not in flagged.columns:
+        return ""
+    teams = sorted({str(team).strip().upper() for team in flagged["TeamAbbrev"] if str(team).strip()})
+    team_list = ", ".join(teams)
+    return (
+        "Defense points-allowed tiers are expected values from the average "
+        f"allowed, not a realized tier ({team_list}). "
+        "Yards allowed are not a DraftKings category."
+    )
+
+
+def sleeper_status_caption(summary: Optional[dict], pool: object = None) -> str:
     """One caption for the player pool. Coverage and freshness stay in the text."""
+    if pool is not None and not scoring_metadata_current(pool, summary):
+        return (
+            "Stored projections are missing current DraftKings scoring metadata "
+            "and were not used."
+        )
+    if pool is not None and not session_contract_current(pool, summary):
+        return (
+            "Stored projections are missing the current slate-matching contract "
+            "and were not used."
+        )
     return " ".join(sleeper_status_lines(summary))
