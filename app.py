@@ -83,6 +83,7 @@ from src.player_pool import (
 from src.sleeper import (
     SCORING_COLUMNS,
     drop_stale_scoring_session,
+    session_contract_current,
     overlay_sleeper_projections,
     scoring_approximation_lines,
     scoring_fallback_lines,
@@ -1058,11 +1059,29 @@ with st.sidebar:
             )
             if left_out:
                 st.caption("Leaving out " + ", ".join(left_out) + ".")
+            fallback_names = []
+            if "StarterFallback" in loaded_pool.columns:
+                fallback_names = (
+                    loaded_pool.loc[
+                        loaded_pool["StarterFallback"].fillna(False).astype(bool),
+                        "Name",
+                    ]
+                    .astype(str)
+                    .drop_duplicates()
+                    .tolist()
+                )
+            under_floor = [name for name in under_floor if name not in set(fallback_names)]
             if under_floor:
                 st.caption(
                     "Under 12.0 points, removed: "
                     + ", ".join(dict.fromkeys(under_floor))
                     + "."
+                )
+            if fallback_names:
+                st.caption(
+                    "Confirmed starter with no weekly projection, DraftKings average kept: "
+                    + ", ".join(fallback_names)
+                    + ". This is not a Sleeper projection and is not removed by the 12-point line."
                 )
 
     lo, hi = preset_cfg.lineup_count_range
@@ -1420,6 +1439,9 @@ if view == "Player pool":
             pool_changed = st.session_state.get("pool_signature") != signature
             if not pool_changed:
                 parsed_pool = carry_choices(st.session_state.player_pool, parsed_pool)
+            if pool_changed or not sleeper_summary.get("applied"):
+                st.session_state.lineups = []
+                st.session_state.generated_run = None
             st.session_state.player_pool = parsed_pool
             st.session_state.sleeper_summary = sleeper_summary
             st.session_state.pool_signature = signature
@@ -1455,7 +1477,7 @@ if view == "Player pool":
     if sleeper_refresh:
         st.session_state.sleeper_force = True
         st.rerun()
-    if not scoring_metadata_current(pool, st.session_state.sleeper_summary):
+    if not session_contract_current(pool, st.session_state.sleeper_summary):
         drop_stale_scoring_session(st.session_state)
         st.session_state.sleeper_version = int(st.session_state.get("sleeper_version") or 0) + 1
         st.error(
@@ -1793,14 +1815,23 @@ working_pool = generation_pool(pool, showdown=is_showdown).reset_index(drop=True
 locked_ids = locked_player_ids(working_pool, showdown=is_showdown)
 
 if generate:
-    if not scoring_metadata_current(
-        st.session_state.player_pool, st.session_state.sleeper_summary
-    ) or any(column not in working_pool.columns for column in SCORING_COLUMNS):
-        drop_stale_scoring_session(st.session_state)
-        st.session_state.sleeper_version = int(st.session_state.get("sleeper_version") or 0) + 1
-        st.error(
-            "Stored projections are missing current DraftKings scoring metadata and were not used."
-        )
+    sleeper_summary = st.session_state.sleeper_summary
+    contract_ok = session_contract_current(st.session_state.player_pool, sleeper_summary)
+    if (
+        not contract_ok
+        or not (sleeper_summary or {}).get("applied")
+        or any(column not in working_pool.columns for column in SCORING_COLUMNS)
+    ):
+        if not contract_ok:
+            drop_stale_scoring_session(st.session_state)
+            st.session_state.sleeper_version = int(st.session_state.get("sleeper_version") or 0) + 1
+            st.error(
+                "Stored projections are missing current DraftKings scoring metadata and were not used."
+            )
+        else:
+            st.session_state.lineups = []
+            st.session_state.generated_run = None
+            st.error(sleeper_status_caption(sleeper_summary, st.session_state.player_pool))
         st.stop()
     progress = st.progress(0, text="Building optimizer…")
     try:

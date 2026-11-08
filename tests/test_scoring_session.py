@@ -19,7 +19,12 @@ from src.dk_scoring import (
     RUSH_YARDS_SD,
     SCORING_VERSION,
 )
-from src.sleeper import drop_stale_scoring_session, scoring_metadata_current
+from src.sleeper import (
+    MATCH_CACHE_VERSION,
+    drop_stale_scoring_session,
+    scoring_metadata_current,
+    session_contract_current,
+)
 
 
 def _current_pool(points: float) -> pd.DataFrame:
@@ -38,15 +43,23 @@ def _current_pool(points: float) -> pd.DataFrame:
         }
     )
     frame.attrs["scoring_version"] = SCORING_VERSION
+    frame.attrs["match_schema"] = MATCH_CACHE_VERSION
+    frame.attrs["fingerprint"] = "test-slate"
+    frame.attrs["slate_key"] = ""
     return frame
 
 
 def _summary() -> dict:
     return {
         "ok": True,
+        "applied": True,
         "scoring": SCORING_VERSION,
+        "match_schema": MATCH_CACHE_VERSION,
         "season": "2026",
         "week": 9,
+        "season_type": "regular",
+        "fingerprint": "test-slate",
+        "slate_key": "",
         "matched": 1,
         "rows": 1,
         "ppr_fallback_rows": 0,
@@ -115,6 +128,45 @@ def test_missing_scoring_column_clears_pool_and_lineups(column):
     assert "DraftKings scoring from Sleeper" not in text
     assert "0 row(s) flagged" not in text
     assert "missing current DraftKings scoring metadata" in text
+
+
+def test_scoring_without_match_schema_clears_pool_and_lineups():
+    pool = _current_pool(22.89)
+    del pool.attrs["match_schema"]
+    summary = _summary()
+    summary.pop("match_schema")
+    lineup = pd.DataFrame({"Name": ["Josh Allen"], "Projection": [22.89]})
+    state = {
+        "player_pool": pool,
+        "sleeper_summary": summary,
+        "lineups": [lineup],
+        "generated_run": {"preset": "classic_small_gpp"},
+    }
+    assert scoring_metadata_current(pool, summary) is True
+    assert session_contract_current(pool, summary) is False
+    assert drop_stale_scoring_session(state) is True
+    assert state["player_pool"] is None
+    assert state["lineups"] == []
+    assert state["generated_run"] is None
+
+
+def test_wrong_slate_key_clears_the_retained_pool():
+    pool = _current_pool(22.89)
+    pool["Game Info"] = "KC@BUF 09/07/2025 01:00PM ET"
+    pool.attrs["slate_key"] = "2025-09-14:DAL@PHI"
+    pool.attrs["fingerprint"] = "other-week"
+    summary = _summary()
+    summary["slate_key"] = "2025-09-14:DAL@PHI"
+    summary["fingerprint"] = "other-week"
+    state = {
+        "player_pool": pool,
+        "sleeper_summary": summary,
+        "lineups": [pd.DataFrame({"Name": ["Josh Allen"]})],
+        "generated_run": {"preset": "classic_small_gpp"},
+    }
+    assert session_contract_current(pool, summary) is False
+    assert drop_stale_scoring_session(state) is True
+    assert state["lineups"] == []
 
 
 def test_old_scoring_version_is_not_current():

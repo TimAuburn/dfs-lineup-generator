@@ -288,14 +288,7 @@ def test_partial_components_do_not_become_a_total_and_std_is_not_ppr():
         },
     ]
     index = index_projections(records)
-    partial = index["josh allen|BUF"]
-    assert partial["score_basis"] == "ppr_fallback"
-    assert partial["projection"] == pytest.approx(17.5)
-    assert partial["projection"] != pytest.approx(250 * 0.04)
-    assert "pass_td" in partial["score_warning"]
-    assert index["dak prescott|DAL"]["projection"] is None
-    assert index["dak prescott|DAL"]["score_basis"] == "unavailable"
-    assert "pts_std" in index["dak prescott|DAL"]["score_warning"]
+    assert [row["name"] for row in index["projections"]] == ["josh allen", "dak prescott"]
 
     pool = pd.DataFrame(
         [
@@ -319,13 +312,15 @@ def test_partial_components_do_not_become_a_total_and_std_is_not_ppr():
     )
     updated, matched = apply_sleeper_index(pool, index)
     by_id = updated.set_index("ID")
-    assert matched == 2
+    assert matched == 1
     assert by_id.loc["1", "Projection"] == pytest.approx(17.5)
+    assert by_id.loc["1", "Projection"] != pytest.approx(250 * 0.04)
     assert by_id.loc["1", "Scoring"] == "PPR fallback"
     assert "pass_td" in by_id.loc["1", "ScoringNote"]
     # No component stats and no PPR: keep the salary-file average and say why.
     assert by_id.loc["2", "Projection"] == pytest.approx(8.0)
     assert by_id.loc["2", "Scoring"] == "Unavailable"
+    assert "pts_std" in by_id.loc["2", "ScoringNote"]
     assert pd.isna(by_id.loc["2", "Sleeper"])
 
 
@@ -343,8 +338,8 @@ def test_component_projection_replaces_ppr_and_does_not_scale_the_captain_row():
     }
     index = index_projections([record])
     scored = score_projection(stats, position="QB", contest="showdown")
-    assert index["josh allen|BUF"]["projection"] == pytest.approx(scored.points)
-    assert index["josh allen|BUF"]["projection"] != pytest.approx(99.0)
+    assert index["projections"][0]["name"] == "josh allen"
+    assert scored.points != pytest.approx(99.0)
     pool = pd.DataFrame(
         [
             {

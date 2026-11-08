@@ -618,25 +618,37 @@ def _pool_with_hidden_kelce_pins() -> pd.DataFrame:
 
 
 def _as_current_scoring(pool: pd.DataFrame) -> pd.DataFrame:
-    """Mark a fixture as the current scorer session without inventing component stats."""
+    """Mark a fixture as the current scorer and matcher without inventing stats."""
     from src.dk_scoring import SCORING_VERSION
+    from src.slate_week import slate_games_from_pool, slate_key
+    from src.sleeper import MATCH_CACHE_VERSION
 
     frame = pool.copy()
     frame["PPR"] = pd.Series(pd.NA, index=frame.index, dtype="Float64")
     frame["Scoring"] = ""
     frame["ScoringNote"] = ""
+    key = slate_key(slate_games_from_pool(frame)) if "Game Info" in frame.columns else ""
     frame.attrs["scoring_version"] = SCORING_VERSION
+    frame.attrs["match_schema"] = MATCH_CACHE_VERSION
+    frame.attrs["slate_key"] = key
+    frame.attrs["fingerprint"] = f"test|{key}"
     return frame
 
 
 def _current_sleeper_summary(pool: pd.DataFrame) -> dict:
     from src.dk_scoring import SCORING_VERSION
+    from src.sleeper import MATCH_CACHE_VERSION
 
     return {
         "ok": True,
+        "applied": True,
         "scoring": SCORING_VERSION,
+        "match_schema": MATCH_CACHE_VERSION,
         "season": "2026",
         "week": 9,
+        "season_type": "regular",
+        "fingerprint": pool.attrs.get("fingerprint") or "",
+        "slate_key": pool.attrs.get("slate_key") or "",
         "matched": 0,
         "rows": int(len(pool)),
         "inactive_rows": 0,

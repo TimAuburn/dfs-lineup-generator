@@ -17,6 +17,7 @@ CHOICE_COLUMNS = (
 # Optional DraftKings scoring columns. Present only after that adapter runs.
 # The editor keeps them so a later whitelist cannot drop the pool contract.
 OPTIONAL_SCORING_COLUMNS = ("PPR", "Scoring", "ScoringNote")
+OPTIONAL_MATCH_COLUMNS = ("PreLock", "InjuryNote", "MatchStatus", "StarterFallback")
 _POSITION_ORDER = ("QB", "RB", "WR", "TE", "FLEX", "DST", "K")
 _FLEX_POSITIONS = frozenset({"RB", "WR", "TE"})
 
@@ -424,6 +425,7 @@ def _editor_row(row: pd.Series, group: pd.DataFrame, *, showdown: bool) -> dict:
         "DepthPosition",
         "Game Info",
         *OPTIONAL_SCORING_COLUMNS,
+        *OPTIONAL_MATCH_COLUMNS,
     ):
         if column in group.columns:
             record[column] = row.get(column)

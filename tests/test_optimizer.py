@@ -1585,18 +1585,26 @@ def test_showdown_results_list_every_lineup_without_a_dropdown():
     pool["RosterSlot"] = pool["Slot"]
 
     from src.dk_scoring import SCORING_VERSION
+    from src.sleeper import MATCH_CACHE_VERSION
 
     pool["PPR"] = pd.Series(pd.NA, index=pool.index, dtype="Float64")
     pool["Scoring"] = ""
     pool["ScoringNote"] = ""
     pool.attrs["scoring_version"] = SCORING_VERSION
+    pool.attrs["match_schema"] = MATCH_CACHE_VERSION
+    pool.attrs["slate_key"] = ""
+    pool.attrs["fingerprint"] = "results-view"
     at = app_test.AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"))
     at.session_state["app_view"] = "Optimizer"
     at.session_state["contest_format"] = ContestFormat.SHOWDOWN.value
     at.session_state["player_pool"] = pool
     at.session_state["sleeper_summary"] = {
         "ok": False,
+        "applied": False,
         "scoring": SCORING_VERSION,
+        "match_schema": MATCH_CACHE_VERSION,
+        "fingerprint": "results-view",
+        "slate_key": "",
         "matched": 0,
         "rows": len(pool),
         "ppr_fallback_rows": 0,

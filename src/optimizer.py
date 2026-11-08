@@ -139,8 +139,13 @@ def unique_quarterbacks(df: pd.DataFrame) -> pd.DataFrame:
         charted = pd.to_numeric(qbs["DepthOrder"], errors="coerce").notna()
     else:
         charted = pd.Series(False, index=qbs.index)
-    # Depth-chart QBs with no Sleeper weekly number are 0, not the DK average.
-    qbs.loc[charted & sleeper.isna(), "Projection"] = 0.0
+    if "StarterFallback" in qbs.columns:
+        starter_fallback = qbs["StarterFallback"].fillna(False).astype(bool)
+    else:
+        starter_fallback = pd.Series(False, index=qbs.index)
+    # Depth-chart QBs with no weekly number are 0, except a confirmed starter
+    # whose salary-file average is the explicit fallback.
+    qbs.loc[charted & sleeper.isna() & ~starter_fallback, "Projection"] = 0.0
     qbs["Projection"] = pd.to_numeric(qbs["Projection"], errors="coerce").fillna(0.0)
     # When one CPT/FLEX row has a Sleeper number, ignore the other row's DK average.
     if "Sleeper" in qbs.columns:
@@ -1357,7 +1362,14 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             return pool
         projection = pd.to_numeric(pool[proj_col], errors="coerce")
         is_qb = pool["Position"].map(lambda value: "QB" in _position_tokens(value))
-        return pool.loc[~(is_qb & (projection < SHOWDOWN_QB_MIN_PROJECTION))].copy()
+        if "StarterFallback" in pool.columns:
+            starter_fallback = pool["StarterFallback"].fillna(False).astype(bool)
+        else:
+            starter_fallback = pd.Series(False, index=pool.index)
+        # A confirmed starter with no weekly score keeps a salary-file average
+        # under 12. A real weekly projection under 12 is still removed.
+        drop = is_qb & (projection < SHOWDOWN_QB_MIN_PROJECTION) & ~starter_fallback
+        return pool.loc[~drop].copy()
 
     def _players_for_optimize(self) -> List[Player]:
         original = self._player_df
