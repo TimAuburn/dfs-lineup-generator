@@ -9,9 +9,12 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 from pydfs_lineup_optimizer import Player, Site, Sport, get_optimizer
+from pydfs_lineup_optimizer.exceptions import GenerateLineupException
 from pydfs_lineup_optimizer.lineup import Lineup
 from pydfs_lineup_optimizer.player import GameInfo, LineupPlayer
+from pydfs_lineup_optimizer.rules import OptimizerRule
 from pydfs_lineup_optimizer.settings import LineupPosition
+from pydfs_lineup_optimizer.solvers.constants import SolverSign
 from pydfs_lineup_optimizer.stacks import PlayersGroup, PositionsStack
 
 from .parser import drop_inactive_players, is_inactive_injury, parse_dk_csv
@@ -46,8 +49,8 @@ _NOT_CPT_QB_PASS_CATCHERS = frozenset({"K", "DST", "DEF", "RB", "QB"})
 QB_BRING_BACK_POSITIONS = frozenset({"WR", "TE", "RB"})
 # Captain is a skill spot unless a low-total slate explicitly allows a kicker.
 CAPTAIN_POSITIONS = frozenset({"QB", "RB", "WR", "TE"})
-# Cash classic: no sub-$3,800 WR/RB/TE unless the user locks that player in.
-CASH_SKILL_MIN_SALARY = 3_800
+# Cash classic: no sub-$4,200 WR/RB/TE unless the user locks that player in.
+CASH_SKILL_MIN_SALARY = 4_200
 CASH_SKILL_POSITIONS = frozenset({"RB", "WR", "TE"})
 # Showdown cash spends the cap and captains a high-salary QB, RB, or WR.
 SHOWDOWN_CASH_MIN_SALARY = 49_600
@@ -112,8 +115,8 @@ def _position_tokens(value: object) -> set[str]:
 
 
 def unique_quarterbacks(df: pd.DataFrame) -> pd.DataFrame:
-    """One row per quarterback, using the higher listed projection of CPT and FLEX."""
-    empty = pd.DataFrame(columns=["Name", "TeamAbbrev", "Projection"])
+    """One row per quarterback. Projection is the Sleeper weekly number when present."""
+    empty = pd.DataFrame(columns=["Name", "TeamAbbrev", "Projection", "DepthOrder"])
     if df is None or df.empty or "Position" not in df.columns or "Name" not in df.columns:
         return empty
     is_qb = df["Position"].map(lambda value: "QB" in _position_tokens(value))
@@ -125,10 +128,39 @@ def unique_quarterbacks(df: pd.DataFrame) -> pd.DataFrame:
         return empty
     qbs["Name"] = qbs["Name"].astype(str).str.strip()
     qbs["TeamAbbrev"] = qbs["TeamAbbrev"].astype(str).str.strip().str.upper()
-    qbs["Projection"] = pd.to_numeric(qbs[proj_col], errors="coerce").fillna(0.0)
+    listed = pd.to_numeric(qbs[proj_col], errors="coerce")
+    if "Sleeper" in qbs.columns:
+        sleeper = pd.to_numeric(qbs["Sleeper"], errors="coerce")
+        qbs["Projection"] = sleeper.where(sleeper.notna(), listed)
+    else:
+        sleeper = pd.Series(pd.NA, index=qbs.index, dtype="Float64")
+        qbs["Projection"] = listed
+    if "DepthOrder" in qbs.columns:
+        charted = pd.to_numeric(qbs["DepthOrder"], errors="coerce").notna()
+    else:
+        charted = pd.Series(False, index=qbs.index)
+    # Depth-chart QBs with no Sleeper weekly number are 0, not the DK average.
+    qbs.loc[charted & sleeper.isna(), "Projection"] = 0.0
+    qbs["Projection"] = pd.to_numeric(qbs["Projection"], errors="coerce").fillna(0.0)
+    # When one CPT/FLEX row has a Sleeper number, ignore the other row's DK average.
+    if "Sleeper" in qbs.columns:
+        has_sleeper = (
+            sleeper.notna()
+            .groupby([qbs["Name"], qbs["TeamAbbrev"]])
+            .transform("any")
+        )
+        qbs.loc[has_sleeper.to_numpy() & sleeper.isna().to_numpy(), "Projection"] = pd.NA
+        qbs["Projection"] = pd.to_numeric(qbs["Projection"], errors="coerce")
+    if "DepthOrder" in qbs.columns:
+        qbs["DepthOrder"] = pd.to_numeric(qbs["DepthOrder"], errors="coerce")
+    else:
+        qbs["DepthOrder"] = pd.Series(pd.NA, index=qbs.index, dtype="Float64")
+    if "DepthPosition" in qbs.columns:
+        depth_pos = qbs["DepthPosition"].astype(str).str.strip().str.upper()
+        qbs.loc[~depth_pos.eq("QB"), "DepthOrder"] = pd.NA
     grouped = (
-        qbs.groupby(["Name", "TeamAbbrev"], as_index=False)["Projection"]
-        .max()
+        qbs.groupby(["Name", "TeamAbbrev"], as_index=False)
+        .agg(Projection=("Projection", "max"), DepthOrder=("DepthOrder", "min"))
         .sort_values(["Projection", "Name"], ascending=[False, True])
         .reset_index(drop=True)
     )
@@ -145,20 +177,119 @@ def default_starting_quarterbacks(
     *,
     limit: int = 2,
 ) -> List[Tuple[str, str]]:
-    """Highest-projected quarterback on each team, then the top ``limit`` of those.
+    """Depth-chart QB1 on each team, otherwise the highest Sleeper projection.
 
     A Showdown slate is one game, so this is one starter from each team.
+    The points used to break ties are the Sleeper weekly number when present.
     """
     qbs = unique_quarterbacks(df)
     if qbs.empty:
         return []
+    ranked = qbs.copy()
+    depth = pd.to_numeric(ranked["DepthOrder"], errors="coerce")
+    ranked["_starter"] = depth.eq(1)
     leaders = (
-        qbs.sort_values(["Projection", "Name"], ascending=[False, True])
+        ranked.sort_values(
+            ["_starter", "Projection", "Name"],
+            ascending=[False, False, True],
+        )
         .drop_duplicates("TeamAbbrev", keep="first")
         .sort_values(["Projection", "Name"], ascending=[False, True])
         .head(max(0, int(limit)))
     )
     return [(str(row.Name), str(row.TeamAbbrev)) for row in leaders.itertuples(index=False)]
+
+
+def starting_showdown_core(
+    pool: pd.DataFrame,
+    confirmed_quarterbacks: Optional[Sequence[Tuple[str, str]]] = None,
+) -> List[Tuple[str, str]]:
+    """Starting quarterback and running back on each team, as ``(name, team)``.
+
+    A confirmed quarterback list replaces the depth-chart quarterbacks. A
+    running back is the depth-chart RB1, or the highest projection when the
+    chart is missing.
+    """
+    if pool is None or pool.empty or "Name" not in pool.columns or "TeamAbbrev" not in pool.columns:
+        return []
+    people = _one_row_per_player(pool)
+    if people.empty or "Position" not in people.columns:
+        return []
+    keys: List[Tuple[str, str]] = []
+    keys.extend(_starters_at(people, "QB", confirmed_quarterbacks))
+    keys.extend(_starters_at(people, "RB", None))
+    return keys
+
+
+def _one_row_per_player(pool: pd.DataFrame) -> pd.DataFrame:
+    frame = pool.copy()
+    if "RosterSlot" in frame.columns:
+        flex = frame["RosterSlot"].astype(str).str.strip().str.upper() != "CPT"
+        if bool(flex.any()):
+            frame = frame.loc[flex].copy()
+    frame["Name"] = frame["Name"].astype(str).str.strip()
+    frame["TeamAbbrev"] = frame["TeamAbbrev"].astype(str).str.strip().str.upper()
+    return frame.drop_duplicates(["Name", "TeamAbbrev"], keep="first")
+
+
+def _starters_at(
+    people: pd.DataFrame,
+    position: str,
+    confirmed: Optional[Sequence[Tuple[str, str]]],
+) -> List[Tuple[str, str]]:
+    positions = people["Position"].map(lambda value: position in _position_tokens(value))
+    group = people.loc[positions].copy()
+    if group.empty:
+        return []
+    if confirmed is not None and position == "QB":
+        allowed = {
+            (str(name).strip().casefold(), str(team).strip().upper())
+            for name, team in confirmed
+        }
+        keys = [
+            (str(row.Name).strip(), str(row.TeamAbbrev).strip().upper())
+            for row in group.itertuples(index=False)
+            if (str(row.Name).strip().casefold(), str(row.TeamAbbrev).strip().upper()) in allowed
+        ]
+        return list(dict.fromkeys(keys))
+    chosen: List[Tuple[str, str]] = []
+    for _, team_rows in group.groupby("TeamAbbrev", sort=False):
+        starter = _depth_leader(team_rows, position)
+        if starter is None:
+            starter = _highest_projection(team_rows)
+        if starter is None:
+            continue
+        chosen.append((str(starter["Name"]).strip(), str(starter["TeamAbbrev"]).strip().upper()))
+    return chosen
+
+
+def _depth_leader(team_rows: pd.DataFrame, position: str) -> Optional[pd.Series]:
+    if "DepthOrder" not in team_rows.columns:
+        return None
+    depth = pd.to_numeric(team_rows["DepthOrder"], errors="coerce")
+    charted = team_rows.loc[depth.notna()].copy()
+    if charted.empty:
+        return None
+    if "DepthPosition" in charted.columns:
+        slot = charted["DepthPosition"].astype(str).str.strip().str.upper()
+        matched = charted.loc[slot.eq(position) | slot.str.startswith(position)]
+        if not matched.empty:
+            charted = matched
+    order = pd.to_numeric(charted["DepthOrder"], errors="coerce")
+    leaders = charted.loc[order == order.min()]
+    return _highest_projection(leaders)
+
+
+def _highest_projection(rows: pd.DataFrame) -> Optional[pd.Series]:
+    if rows is None or rows.empty:
+        return None
+    column = "Projection" if "Projection" in rows.columns else "AvgPointsPerGame"
+    if column not in rows.columns:
+        return rows.iloc[0]
+    ranked = rows.copy()
+    ranked["_proj"] = pd.to_numeric(ranked[column], errors="coerce").fillna(0)
+    ranked = ranked.sort_values(["_proj", "Name"], ascending=[False, True])
+    return ranked.iloc[0]
 
 
 def _player_positions(player: Player) -> set[str]:
@@ -305,6 +436,17 @@ def _lineups_for_overlap(
         if chosen:
             built.append(Lineup(chosen))
     return built
+
+
+def _is_locked(value: object) -> bool:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return False
+    try:
+        if pd.isna(value):
+            return False
+    except (TypeError, ValueError):
+        pass
+    return bool(value)
 
 
 def _ownership_fraction(raw: object) -> Optional[float]:
@@ -679,6 +821,58 @@ class BaseNFLOptimizer:
         raise NotImplementedError
 
 
+def showdown_lineup_grid(
+    lineups: Sequence[pd.DataFrame],
+    *,
+    salary_cap: int = DK_SALARY_CAP,
+) -> pd.DataFrame:
+    """One row per Showdown lineup: captain, each flex player, then salary and projection."""
+    flex_count = len(SHOWDOWN_ROSTER_SLOTS) - 1
+    rows = []
+    for index, lineup in enumerate(lineups, start=1):
+        slot = lineup["Slot"].astype(str).str.strip().str.upper()
+        captain = lineup.loc[slot.eq("CPT")]
+        flex = lineup.loc[~slot.eq("CPT")]
+        players = [_showdown_player_label(row) for _, row in flex.iterrows()]
+        players = (players + [""] * flex_count)[:flex_count]
+        spent = int(lineup.attrs.get("salary", int(lineup["Salary"].sum())))
+        if "salary_remaining" in lineup.attrs:
+            remaining = int(lineup.attrs["salary_remaining"])
+        else:
+            remaining = int(salary_cap) - spent
+        projection = float(
+            lineup.attrs.get("projection", float(lineup["Projection"].sum()))
+        )
+        row = {
+            "Lineup": index,
+            "Captain": _showdown_player_label(captain.iloc[0]) if not captain.empty else "",
+        }
+        row.update({f"FLEX {number}": name for number, name in enumerate(players, start=1)})
+        row["Salary"] = spent
+        row["Salary Remaining ($)"] = remaining
+        row["Projection"] = projection
+        rows.append(row)
+    columns = [
+        "Lineup",
+        "Captain",
+        *[f"FLEX {number}" for number in range(1, flex_count + 1)],
+        "Salary",
+        "Salary Remaining ($)",
+        "Projection",
+    ]
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _showdown_player_label(row: pd.Series) -> str:
+    name = str(row.get("Name") or "").strip()
+    team = str(row.get("Team") or "").strip()
+    if team and team.casefold() != "nan":
+        return f"{name} ({team})"
+    return name
+
+
 def drop_backup_players(pool: pd.DataFrame) -> pd.DataFrame:
     """Keep the top Sleeper depth-chart player at each spot.
 
@@ -783,7 +977,7 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
         self.last_stack_exposure: Optional[float] = None
         # None keeps the DraftKings flex (RB, WR, or TE).
         self.flex_positions: Optional[Tuple[str, ...]] = None
-        # None leaves cheap skill players eligible. Cash sets this to $3,800.
+        # None leaves cheap skill players eligible. Cash sets this to $4,200.
         self.min_skill_salary: Optional[int] = None
 
     def set_qb_stack(
@@ -967,6 +1161,39 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
         return frames
 
 
+class _EitherTeamSplitRule(OptimizerRule):
+    """Roster one side of a two-team split, and let the solver pick which side.
+
+    ``_showdown_either_split`` on the pydfs optimizer is
+    ``(team, high, low)``. That team ends up with ``high`` or ``low``
+    players. With two teams and a six-man roster, the other team gets the rest.
+    """
+
+    def apply(self, solver):
+        spec = getattr(self.optimizer, "_showdown_either_split", None)
+        if not spec:
+            return
+        team, high, low = spec
+        gap = int(high) - int(low)
+        if gap <= 0:
+            return
+        variables = [
+            variable
+            for player, variable in self.players_dict.items()
+            if player.team == team
+        ]
+        if not variables:
+            return
+        side = solver.add_variable("showdown_team_split_side")
+        solver.add_constraint(
+            list(variables) + [side],
+            [1.0] * len(variables) + [-float(gap)],
+            SolverSign.EQ,
+            float(low),
+            name="showdown_team_split_either",
+        )
+
+
 class NFLShowdownOptimizer(BaseNFLOptimizer):
     """DraftKings NFL Showdown (Captain Mode) lineup generator."""
 
@@ -1005,6 +1232,14 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         self.max_repeating_players = 3
         # None keeps every QB who clears the projection floor. A set keeps only those.
         self.confirmed_quarterbacks: Optional[set[Tuple[str, str]]] = None
+        # 1 blocks both teams' quarterbacks in one lineup. None leaves the count open.
+        self.max_quarterbacks: Optional[int] = None
+        # (high, low) player counts that add up to the six-man roster. None is any split.
+        self.team_split: Optional[Tuple[int, int]] = None
+        # Team that receives ``high``. None lets either team take that side.
+        self.team_split_team: Optional[str] = None
+        # Cash tries to roster both starting QBs and both starting RBs.
+        self.require_starting_core: bool = False
 
     def configure_showdown_rules(
         self,
@@ -1025,6 +1260,10 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         max_below_salary_players: Optional[int] = None,
         below_salary_threshold: Optional[int] = None,
         max_rbs_per_team: Optional[int] = None,
+        max_quarterbacks: Optional[int] = None,
+        team_split: Optional[Tuple[int, int]] = None,
+        team_split_team: Optional[str] = None,
+        require_starting_core: bool = False,
     ) -> None:
         if cpt_qb_pass_catchers < 1:
             raise ValueError("cpt_qb_pass_catchers must be at least 1")
@@ -1042,6 +1281,21 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             raise ValueError("below_salary_threshold must be at least 0")
         if max_rbs_per_team is not None and int(max_rbs_per_team) < 0:
             raise ValueError("max_rbs_per_team must be at least 0")
+        if max_quarterbacks is not None and int(max_quarterbacks) < 1:
+            raise ValueError("max_quarterbacks must be at least 1")
+        parsed_split: Optional[Tuple[int, int]] = None
+        if team_split is not None:
+            high, low = int(team_split[0]), int(team_split[1])
+            roster = len(SHOWDOWN_ROSTER_SLOTS)
+            if high < low or low < 0 or high + low != roster:
+                raise ValueError(
+                    f"team split must be two counts that add up to {roster}, larger first"
+                )
+            if high > 5:
+                raise ValueError(
+                    "DraftKings Showdown allows at most 5 players from one team"
+                )
+            parsed_split = (high, low)
         self.min_salary_cap = min_salary_cap
         self.max_salary_cap = max_salary_cap
         self.min_teams = min_teams
@@ -1068,6 +1322,12 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             None if below_salary_threshold is None else int(below_salary_threshold)
         )
         self.max_rbs_per_team = None if max_rbs_per_team is None else int(max_rbs_per_team)
+        self.max_quarterbacks = None if max_quarterbacks is None else int(max_quarterbacks)
+        self.team_split = parsed_split
+        self.team_split_team = (
+            None if not team_split_team else str(team_split_team).strip().upper()
+        )
+        self.require_starting_core = bool(require_starting_core)
 
     def set_confirmed_quarterbacks(
         self,
@@ -1085,11 +1345,10 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         }
 
     def _without_backup_quarterbacks(self, pool: pd.DataFrame) -> pd.DataFrame:
-        """Drop Showdown QBs whose listed projection is under 12.0.
+        """Drop Showdown QBs whose weekly projection is under 12.0.
 
-        The check uses the projection on the salary file, before jitter and
-        before the 1.5x captain boost, so a 10-point backup cannot survive as
-        a 15-point captain row.
+        The check uses Projection, which is the Sleeper number when that player
+        matched, before jitter and before the 1.5x captain boost.
         """
         if pool.empty or "Position" not in pool.columns:
             return pool
@@ -1165,6 +1424,75 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         if "CPT" in player.positions:
             return points / 1.5
         return points
+
+    def _apply_captain_exposure(self, players: List[Player]) -> None:
+        """Set each captain row to the share stored in Captain %.
+
+        A blank cell leaves the global exposure. 0 keeps the player at flex.
+        A positive share is both the minimum and the maximum, so that player
+        is captain in that fraction of the batch. CPT and FLEX are separate
+        player objects, so the flex row keeps the global exposure.
+        """
+        frame = self._player_df
+        if frame is None or frame.empty or "CaptainExposure" not in frame.columns:
+            return
+        rates: Dict[Tuple[str, str], float] = {}
+        locked: set[Tuple[str, str]] = set()
+        names: Dict[Tuple[str, str], str] = {}
+        for _, row in frame.iterrows():
+            key = (
+                str(row.get("Name") or "").strip().casefold(),
+                str(row.get("TeamAbbrev") or "").strip().upper(),
+            )
+            names.setdefault(key, str(row.get("Name") or "").strip())
+            rate = _ownership_fraction(row.get("CaptainExposure"))
+            if rate is not None:
+                rates[key] = rate
+            if _is_locked(row.get("Lock")):
+                locked.add(key)
+        present = {
+            (player.full_name.strip().casefold(), str(player.team).strip().upper())
+            for player in players
+            if "CPT" in player.positions
+        }
+        applied = {key: rate for key, rate in rates.items() if key in present}
+        if not applied:
+            return
+        if any(rate > 1 for rate in applied.values()):
+            raise RuntimeError("Captain % must be between 0 and 100.")
+        total = sum(applied.values())
+        if total > 1 + 1e-6:
+            raise RuntimeError(
+                f"Captain percentages add up to {total * 100:.0f}%. "
+                "They need to add up to 100% or less."
+            )
+        conflicts = [
+            names.get(key) or key[0]
+            for key, rate in applied.items()
+            if rate > 0 and key in locked
+        ]
+        if conflicts:
+            label = conflicts[0] if len(conflicts) == 1 else ", ".join(conflicts)
+            raise RuntimeError(
+                f"{label} is locked and also has a captain percentage. "
+                "Lock forces the flex spot, so clear Lock or leave Captain % blank."
+            )
+        for player in players:
+            if "CPT" not in player.positions:
+                continue
+            key = (
+                player.full_name.strip().casefold(),
+                str(player.team).strip().upper(),
+            )
+            rate = applied.get(key)
+            if rate is None:
+                continue
+            if rate <= 0:
+                player.max_exposure = 0
+                player.min_exposure = None
+                continue
+            player.min_exposure = rate
+            player.max_exposure = rate
 
     def _apply_kicker_exposure_cap(self, players: List[Player]) -> None:
         cap = self.kicker_max_exposure
@@ -1367,6 +1695,60 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             PlayersGroup(kickers, max_from_group=int(self.max_kickers))
         )
 
+    def _apply_quarterback_limit(self, optimizer, players: List[Player]) -> None:
+        """At most ``max_quarterbacks`` quarterbacks, captain included.
+
+        Captain and flex rows of the same quarterback are separate players,
+        and a lineup can take only one of those rows. Capping every quarterback
+        row at 1 keeps the second team's quarterback out.
+        """
+        if self.max_quarterbacks is None:
+            return
+        quarterbacks = [player for player in players if self._football_pos(player) == "QB"]
+        cap = int(self.max_quarterbacks)
+        distinct = {player.full_name for player in quarterbacks}
+        if len(distinct) <= cap:
+            return
+        optimizer.add_players_group(PlayersGroup(quarterbacks, max_from_group=cap))
+
+    def _showdown_teams(self, players: List[Player]) -> Dict[str, str]:
+        """Map an uppercase abbrev to the team label stored on the player pool."""
+        labels: Dict[str, str] = {}
+        for player in players:
+            team = str(player.team or "").strip()
+            if team:
+                labels.setdefault(team.upper(), team)
+        return labels
+
+    def _apply_team_split(self, optimizer, players: List[Player]) -> None:
+        """Force a 5-1, 4-2, or 3-3 construction on a two-team slate."""
+        split = self.team_split
+        if split is None:
+            return
+        high, low = split
+        labels = self._showdown_teams(players)
+        if len(labels) != 2:
+            found = ", ".join(sorted(labels)) or "none"
+            raise RuntimeError(
+                "A team split needs a two-team Showdown slate. "
+                f"This pool has: {found}."
+            )
+        ordered = [labels[key] for key in sorted(labels)]
+        if high == low or self.team_split_team:
+            if self.team_split_team and high != low:
+                if self.team_split_team not in labels:
+                    raise RuntimeError(
+                        f"{self.team_split_team} is not on this Showdown slate."
+                    )
+                heavy = labels[self.team_split_team]
+                other = next(team for team in ordered if team != heavy)
+            else:
+                heavy, other = ordered
+            optimizer.set_players_from_one_team({heavy: high, other: low})
+            return
+        optimizer._showdown_either_split = (ordered[0], high, low)
+        optimizer.add_new_rule(_EitherTeamSplitRule)
+
     def _apply_dst_limit(self, optimizer, players: List[Player]) -> None:
         """Keep CPT and FLEX to at most ``max_dst`` defenses combined."""
         if self.max_dst is None:
@@ -1403,15 +1785,53 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
                         PlayersGroup(defenses + blocked, max_from_group=1)
                     )
 
+    def _apply_starting_core(self, optimizer, players: List[Player]) -> None:
+        """Require the starting quarterback and running back from each team.
+
+        Captain and flex rows both count, and the unique-player rule keeps a
+        player from filling two spots. The solve retries without this group
+        when the starters cannot fit.
+        """
+        if not self.require_starting_core or self._player_df is None:
+            return
+        wanted = {
+            (name.casefold(), team)
+            for name, team in starting_showdown_core(
+                self._player_df,
+                self.confirmed_quarterbacks,
+            )
+        }
+        if not wanted:
+            return
+        chosen = [
+            player
+            for player in players
+            if (
+                player.full_name.strip().casefold(),
+                str(player.team).strip().upper(),
+            )
+            in wanted
+        ]
+        distinct = {player.full_name.strip().casefold() for player in chosen}
+        if len(distinct) < 2:
+            return
+        optimizer.add_players_group(
+            PlayersGroup(chosen, min_from_group=len(distinct), max_from_group=len(chosen))
+        )
+
     def _build_optimizer(self, players: List[Player]):
         optimizer = get_optimizer(self.site, self.sport)
         # Optional window. Showdown presets leave $200–$2,000 under the DK cap.
         self._apply_salary_caps(optimizer)
         self._apply_injury_filter(optimizer)
         self._apply_kicker_exposure_cap(players)
+        self._apply_captain_exposure(players)
         optimizer.player_pool.load_players(players)
-        if self.min_teams is not None:
-            optimizer.set_total_teams(min_teams=int(self.min_teams))
+        min_teams = self.min_teams
+        if self.team_split is not None and self.team_split[1] == 0:
+            min_teams = None
+        if min_teams is not None:
+            optimizer.set_total_teams(min_teams=int(min_teams))
         if self.max_repeating_players is not None:
             optimizer.set_max_repeating_players(self.max_repeating_players)
         self._apply_captain_eligibility(optimizer, players)
@@ -1422,6 +1842,9 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         self._apply_locked_players(optimizer)
         self._apply_cheap_player_cap(optimizer, players)
         self._apply_same_team_rb_limit(optimizer, players)
+        self._apply_starting_core(optimizer, players)
+        self._apply_quarterback_limit(optimizer, players)
+        self._apply_team_split(optimizer, players)
         self._apply_game_script(optimizer, players)
         self._apply_kicker_limit(optimizer, players)
         self._apply_dst_limit(optimizer, players)
@@ -1434,13 +1857,26 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         if not 1 <= count <= 150:
             raise ValueError("lineup count must be between 1 and 150")
         players = self._players_for_optimize()
+        if self.require_starting_core:
+            try:
+                return self._optimize_showdown(players, count)
+            except GenerateLineupException:
+                self.require_starting_core = False
+                try:
+                    return self._optimize_showdown(players, count)
+                finally:
+                    self.require_starting_core = True
+        return self._optimize_showdown(players, count)
+
+    def _optimize_showdown(self, players: List[Player], count: int) -> List[pd.DataFrame]:
         optimizer = self._build_optimizer(players)
-        raw_lineups = list(
-            optimizer.optimize(
-                count,
-                max_exposure=self.max_exposure,
-            )
-        )
+        raw_lineups = []
+        try:
+            for lineup in optimizer.optimize(count, max_exposure=self.max_exposure):
+                raw_lineups.append(lineup)
+        except GenerateLineupException:
+            if not raw_lineups:
+                raise
         return [self.format_lineup(lineup) for lineup in raw_lineups]
 
 

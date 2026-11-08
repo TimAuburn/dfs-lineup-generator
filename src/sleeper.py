@@ -274,12 +274,13 @@ def apply_sleeper_index(pool: pd.DataFrame, index: dict) -> tuple[pd.DataFrame, 
     """Replace projections and injury status for rows Sleeper recognizes.
 
     ``AvgPointsPerGame`` stays the salary-file average. ``Sleeper`` stores the
-    weekly DraftKings total, or the flagged PPR fallback, and is blank when
-    that number is missing. ``Projection`` is what the optimizer uses: that
-    weekly number when present, otherwise the salary-file average. ``Scoring``
-    and ``ScoringNote`` say which path was used. Matched rows take Sleeper's
-    status even when it is blank, so a healthy player is not left OUT from a
-    stale DK tag. Captain rows are stored at 1x.
+    weekly DraftKings total from component stats, or the flagged PPR fallback,
+    and is blank when that number is missing. ``PPR`` keeps raw ``pts_ppr``
+    and is not the optimizer base when a DraftKings total exists. ``Projection``
+    starts as that weekly number, otherwise the salary-file average. A matched
+    quarterback with no weekly points is 0, not the salary-file average.
+    ``Scoring`` and ``ScoringNote`` say which path was used. Matched rows take
+    Sleeper's status even when it is blank. Captain rows are stored at 1x.
     """
     updated = pool.copy()
     if "PPR" not in updated.columns:
@@ -291,6 +292,9 @@ def apply_sleeper_index(pool: pd.DataFrame, index: dict) -> tuple[pd.DataFrame, 
     updated.attrs["scoring_version"] = SCORING_VERSION
     if updated.empty or not index:
         return updated, 0
+    # A rescore replaces the clean base. An older baseline must not survive it.
+    if "ProjectionBaseline" in updated.columns:
+        updated = updated.drop(columns=["ProjectionBaseline"])
     if "Projection" not in updated.columns:
         updated["Projection"] = pd.to_numeric(
             updated.get("AvgPointsPerGame", 0.0), errors="coerce"
@@ -319,6 +323,15 @@ def apply_sleeper_index(pool: pd.DataFrame, index: dict) -> tuple[pd.DataFrame, 
             points = float(hit["projection"])
             updated.at[idx, "Projection"] = points
             updated.at[idx, "Sleeper"] = points
+        elif (
+            (position == "QB" or str(hit.get("position") or "").upper() == "QB")
+            and str(hit.get("scoring") or "") != "Unavailable"
+            and hit.get("depth_order") is not None
+        ):
+            # Depth-chart quarterback with no weekly score is 0.
+            # A row the scorer marked Unavailable keeps the salary-file average.
+            updated.at[idx, "Projection"] = 0.0
+            updated.at[idx, "Sleeper"] = 0.0
         if hit.get("sleeper_ppr") is not None:
             updated.at[idx, "PPR"] = float(hit["sleeper_ppr"])
         updated.at[idx, "Scoring"] = str(hit.get("scoring") or "")
