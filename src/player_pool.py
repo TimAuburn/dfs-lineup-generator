@@ -41,9 +41,11 @@ def collapse_for_editor(pool: pd.DataFrame, *, showdown: bool) -> pd.DataFrame:
 def stamp_projection_baseline(pool: pd.DataFrame) -> pd.DataFrame:
     """Record the clean projection base without replacing one already stored.
 
-    The base is the Sleeper weekly number when that cell is filled, otherwise
-    the DraftKings average. A projection that already includes Vegas or wind
-    is not a base. An explicit override is stored separately and is not a base.
+    The base is the Sleeper cell when it is filled: the weekly DraftKings
+    component total, or the flagged PPR fallback stored in that same cell.
+    Raw ``PPR`` is not the base when a DraftKings total exists. Otherwise the
+    base is the salary-file average. A projection that already includes Vegas
+    or wind is not a base. An explicit override is stored separately.
     """
     if pool is None:
         return pool

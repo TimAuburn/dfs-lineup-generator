@@ -301,3 +301,43 @@ def test_overlay_uses_cache_and_survives_errors(tmp_path, monkeypatch):
     assert "josh allen|BUF" in cached_index
     assert meta["from_cache"] is True
     assert str(meta["error"]).startswith("fetch_failed")
+    assert saved["scoring"] == "dk-component-v2"
+
+
+def test_cache_without_scoring_version_is_not_reused(tmp_path, monkeypatch):
+    """A pre-adapter cache stored PPR in projection. It must not survive."""
+    cache = tmp_path / "sleeper_cache.json"
+    cache.write_text(
+        json.dumps(
+            {
+                "timestamp": datetime(2026, 10, 5, 18, 0).timestamp(),
+                "season": "2026",
+                "week": 4,
+                "season_type": "regular",
+                "players": 1,
+                "has_depth": True,
+                "index": {
+                    "josh allen|BUF": {
+                        "projection": 99.0,
+                        "injury": "",
+                        "position": "QB",
+                        "depth_order": 1,
+                        "depth_position": "QB",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _boom(url: str, timeout: float = 30):
+        raise URLError("down")
+
+    monkeypatch.setattr("src.sleeper._http_get", _boom)
+    index, meta = load_sleeper_index(
+        cache_path=cache,
+        now=datetime(2026, 10, 5, 18, 30),
+    )
+    assert index == {}
+    assert meta["from_cache"] is False
+    assert str(meta["error"]).startswith("fetch_failed")

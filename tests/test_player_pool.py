@@ -20,6 +20,7 @@ from src.player_pool import (
     position_choices,
     projections_for_solve,
     set_captain,
+    stamp_projection_baseline,
     set_included,
 )
 from src.presets import ContestFormat
@@ -177,7 +178,9 @@ def test_showdown_editor_renders_one_row_and_a_captain_column():
     at = app_test.AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"))
     at.session_state["app_view"] = "Player pool"
     at.session_state["contest_format"] = ContestFormat.SHOWDOWN.value
-    at.session_state["player_pool"] = _showdown_pool()
+    shown = _as_current_scoring(_showdown_pool())
+    at.session_state["player_pool"] = shown
+    at.session_state["sleeper_summary"] = _current_sleeper_summary(shown)
     at.run(timeout=90)
     assert not at.exception
     assert any(item.label == "Player name" for item in at.text_input)
@@ -433,7 +436,9 @@ def test_optimizer_generate_uses_current_odds_not_the_stored_projection():
     at = app_test.AppTest.from_file(str(app_path))
     empty_fetch = json.dumps({}, sort_keys=True, default=str)
     at.session_state["contest_preset"] = "classic_cash"
-    at.session_state["player_pool"] = _det_cash_pool()
+    scored = _as_current_scoring(_det_cash_pool())
+    at.session_state["player_pool"] = scored
+    at.session_state["sleeper_summary"] = _current_sleeper_summary(scored)
     at.session_state["vegas_schema"] = CACHE_SCHEMA_VERSION
     at.session_state["vegas_source_json"] = empty_fetch
     at.session_state["vegas_editor_version"] = 1
@@ -489,20 +494,11 @@ def test_pinned_worthy_survives_odds_removal_editor_remount_and_generate():
     """
     app_test = pytest.importorskip("streamlit.testing.v1")
     from src.data_loader import lines_to_frame
-    from src.vegas_cache import CACHE_SCHEMA_VERSION
 
     app_path = Path(__file__).resolve().parents[1] / "app.py"
     at = app_test.AppTest.from_file(str(app_path))
     empty_fetch = json.dumps({}, sort_keys=True, default=str)
-    at.session_state["app_view"] = "Player pool"
-    at.session_state["contest_preset"] = "classic_cash"
-    at.session_state["player_pool"] = _clean_det_pool()
-    at.session_state["vegas_schema"] = CACHE_SCHEMA_VERSION
-    at.session_state["vegas_source_json"] = empty_fetch
-    at.session_state["vegas_editor_version"] = 1
-    at.session_state["vegas_frame"] = lines_to_frame(_det_lines(50.0, -10.0))
-    at.session_state["weather_by_home"] = {}
-    at.session_state["weather_source_json"] = empty_fetch
+    _open_pool(at, _clean_det_pool(), _det_lines(50.0, -10.0))
     at.run(timeout=90)
     assert not at.exception, at.exception
 
@@ -621,15 +617,44 @@ def _pool_with_hidden_kelce_pins() -> pd.DataFrame:
     return pd.concat([pool, extra], ignore_index=True)
 
 
+def _as_current_scoring(pool: pd.DataFrame) -> pd.DataFrame:
+    """Mark a fixture as the current scorer session without inventing component stats."""
+    from src.dk_scoring import SCORING_VERSION
+
+    frame = pool.copy()
+    frame["PPR"] = pd.Series(pd.NA, index=frame.index, dtype="Float64")
+    frame["Scoring"] = ""
+    frame["ScoringNote"] = ""
+    frame.attrs["scoring_version"] = SCORING_VERSION
+    return frame
+
+
+def _current_sleeper_summary(pool: pd.DataFrame) -> dict:
+    from src.dk_scoring import SCORING_VERSION
+
+    return {
+        "ok": True,
+        "scoring": SCORING_VERSION,
+        "season": "2026",
+        "week": 9,
+        "matched": 0,
+        "rows": int(len(pool)),
+        "inactive_rows": 0,
+        "ppr_fallback_rows": 0,
+    }
+
+
 def _open_pool(at, pool: pd.DataFrame, lines: dict, *, name_query: str = "") -> None:
     from src.data_loader import lines_to_frame
     from src.vegas_cache import CACHE_SCHEMA_VERSION
 
     empty_fetch = json.dumps({}, sort_keys=True, default=str)
+    scored = _as_current_scoring(pool)
     at.session_state["app_view"] = "Player pool"
     at.session_state["contest_preset"] = "classic_cash"
     at.session_state["contest_format"] = "classic"
-    at.session_state["player_pool"] = pool
+    at.session_state["player_pool"] = scored
+    at.session_state["sleeper_summary"] = _current_sleeper_summary(scored)
     at.session_state["pool_signature"] = "pool"
     if name_query:
         at.session_state["pool_name_pool"] = name_query
@@ -766,7 +791,9 @@ def test_showdown_immediate_reset_clears_captain_and_flex_together():
     at.session_state["app_view"] = "Player pool"
     at.session_state["contest_format"] = "showdown"
     at.session_state["contest_preset"] = "showdown_cash"
-    at.session_state["player_pool"] = pool
+    scored = _as_current_scoring(pool)
+    at.session_state["player_pool"] = scored
+    at.session_state["sleeper_summary"] = _current_sleeper_summary(scored)
     at.session_state["vegas_schema"] = CACHE_SCHEMA_VERSION
     at.session_state["vegas_source_json"] = empty_fetch
     at.session_state["vegas_editor_version"] = 1
@@ -849,3 +876,64 @@ def test_showdown_pin_stays_on_captain_and_flex_until_reset():
     reset_fppg = _solver_fppg(automatic, showdown=True)
     assert reset_fppg["flex"] == pytest.approx(10.93)
     assert reset_fppg["cpt"] == pytest.approx(16.395)
+
+
+def test_baseline_is_the_draftkings_component_total_not_raw_ppr():
+    """Vegas and the captain multiplier each apply once, on the DraftKings total."""
+    rows = []
+    for slot, player_id, salary in (("CPT", "cpt", 16800), ("FLEX", "flex", 11200)):
+        rows.append(
+            {
+                "ID": player_id,
+                "Name": "Xavier Worthy",
+                "Position": "WR",
+                "Roster Position": slot,
+                "RosterSlot": slot,
+                "TeamAbbrev": "KC",
+                "Salary": salary,
+                "AvgPointsPerGame": 11.50,
+                "Projection": 99.0,
+                "Sleeper": 12.00,
+                "PPR": 20.00,
+                "Scoring": "DraftKings",
+                "ScoringNote": "",
+                "Game Info": "KC@BUF 09/10/2025 08:20PM ET",
+            }
+        )
+    pool = pd.DataFrame(rows)
+    stamped = stamp_projection_baseline(pool)
+    assert list(stamped["ProjectionBaseline"]) == pytest.approx([12.00, 12.00])
+    solved = projections_for_solve(stamped, _kc_buf_lines(50.0, -10.0), {})
+    assert list(solved["Projection"]) == pytest.approx([12.60, 12.60])
+    again = projections_for_solve(solved, _kc_buf_lines(50.0, -10.0), {})
+    assert list(again["Projection"]) == pytest.approx([12.60, 12.60])
+    fppg = _solver_fppg(solved, showdown=True)
+    assert fppg["flex"] == pytest.approx(12.60)
+    assert fppg["cpt"] == pytest.approx(18.90)
+
+    fallback = pool.copy()
+    fallback["Sleeper"] = 10.00
+    fallback["PPR"] = 10.00
+    fallback["Scoring"] = "PPR fallback"
+    fallback = fallback.drop(columns=["ProjectionBaseline"], errors="ignore")
+    fallback_base = stamp_projection_baseline(fallback)
+    assert list(fallback_base["ProjectionBaseline"]) == pytest.approx([10.00, 10.00])
+
+
+def test_scoring_version_upgrade_clears_old_baselines_and_lineups():
+    from src.sleeper import drop_stale_scoring_session
+
+    pool = _worthy_pool()
+    pool["ProjectionBaseline"] = 8.0
+    pool.attrs["scoring_version"] = "dk-component-v1"
+    state = {
+        "player_pool": pool,
+        "lineups": [pd.DataFrame({"Name": ["Xavier Worthy"]})],
+        "generated_run": {"preset": "classic_cash"},
+        "sleeper_summary": {"scoring": "dk-component-v1", "ok": True},
+    }
+    assert drop_stale_scoring_session(state) is True
+    assert state["player_pool"] is None
+    assert state["lineups"] == []
+    assert state["generated_run"] is None
+    assert state["sleeper_summary"] is None

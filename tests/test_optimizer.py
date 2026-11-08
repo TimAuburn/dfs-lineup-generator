@@ -1584,10 +1584,23 @@ def test_showdown_results_list_every_lineup_without_a_dropdown():
     pool["Position"] = ["RB", "RB", "TE", "WR", "QB", "QB"]
     pool["RosterSlot"] = pool["Slot"]
 
+    from src.dk_scoring import SCORING_VERSION
+
+    pool["PPR"] = pd.Series(pd.NA, index=pool.index, dtype="Float64")
+    pool["Scoring"] = ""
+    pool["ScoringNote"] = ""
+    pool.attrs["scoring_version"] = SCORING_VERSION
     at = app_test.AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"))
     at.session_state["app_view"] = "Optimizer"
     at.session_state["contest_format"] = ContestFormat.SHOWDOWN.value
     at.session_state["player_pool"] = pool
+    at.session_state["sleeper_summary"] = {
+        "ok": False,
+        "scoring": SCORING_VERSION,
+        "matched": 0,
+        "rows": len(pool),
+        "ppr_fallback_rows": 0,
+    }
     at.session_state["lineups"] = [lineup]
     at.run(timeout=90)
     assert not at.exception
