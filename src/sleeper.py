@@ -525,7 +525,7 @@ def _qb_without_weekly_status(status: str, position: object, depth_rows: list[di
     slots = [slot for slot in slots if slot]
     order = min(orders) if orders else None
     confirmed = order == 1 and (not slots or "QB" in slots)
-    if confirmed and status == "depth_only":
+    if confirmed:
         return "starter_average"
     if status == "depth_only" and order is not None:
         return "backup_zero"

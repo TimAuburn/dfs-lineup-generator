@@ -95,6 +95,38 @@ def test_unconfirmed_backup_is_not_promoted_by_the_salary_average():
     assert set(kept["Name"]) == {"Josh Allen"}
 
 
+def test_confirmed_starter_with_unscorable_stats_keeps_the_average():
+    from src.sleeper import index_projections, merge_sleeper_indexes
+
+    projections = index_projections(
+        [
+            {
+                "team": "BUF",
+                "player_id": "BUF-1",
+                "player": {
+                    "first_name": "Josh",
+                    "last_name": "Allen",
+                    "position": "QB",
+                    "team": "BUF",
+                    "player_id": "BUF-1",
+                },
+                "stats": {"pts_std": 19.0},
+            }
+        ]
+    )
+    depth = index_depth_chart({"BUF-1": _depth("Josh", "Allen", "BUF", 1)})
+    updated, report = match_sleeper_pool(
+        pd.DataFrame(_showdown_rows("Josh Allen", "BUF", 8.0)),
+        merge_sleeper_indexes(projections, depth),
+    )
+    assert list(updated["Projection"]) == [8.0, 8.0]
+    assert set(updated["StarterFallback"]) == {True}
+    assert report["projection_rows"] == 0
+    assert "pts_std" in updated.loc[0, "ScoringNote"] or "no weekly" in updated.loc[0, "ScoringNote"]
+    kept = _without_backup_quarterbacks_host()._without_backup_quarterbacks(updated)
+    assert len(kept) == 2
+
+
 def test_real_weekly_projection_under_12_is_still_removed():
     from src.sleeper import index_projections, merge_sleeper_indexes
 
