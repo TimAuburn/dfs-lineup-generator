@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import zipfile
 from io import BytesIO, StringIO
+
+import pytest
 from urllib.error import URLError
 
 import pandas as pd
@@ -17,8 +19,12 @@ from src.contest_parser import (
     parse_dk_contest_csv,
 )
 from src.database import (
+    DUPLICATE_ARCHIVE_MESSAGE,
+    _migrate_slate_archive,
+    file_content_hash,
     get_chalk_and_cutline_summary,
     get_recent_slates,
+    import_standings,
     save_contest,
     save_salary_pool_if_new,
     search_player_performance,
@@ -339,3 +345,351 @@ def test_api_showdown_label_overrides_a_classic_export():
     parsed = parse_dk_contest_csv(CLASSIC_STANDINGS, "197055070", metadata)
     assert parsed["slate"]["slate_type"] == "Showdown"
     assert parsed["slate"]["contest_id"] == "197055070"
+
+
+OTHER_CLASSIC = CLASSIC_STANDINGS.replace("Josh Allen", "Patrick Mahomes").replace("180.0", "175.0")
+_IMPORTED_AT = "2026-11-10T17:00:00Z"
+_IMPORTED_LATER = "2026-11-10T18:00:00Z"
+
+
+def _import_file(db_path, text: str, source_contest_id: str, imported_at: str, metadata=None):
+    parsed = parse_dk_contest_csv(text, source_contest_id, metadata or {})
+    return import_standings(
+        parsed["slate"],
+        parsed["players"],
+        parsed["standings"],
+        file_content_hash(text.encode()),
+        source_contest_id=source_contest_id,
+        imported_at=imported_at,
+        db_path=db_path,
+    )
+
+
+def test_two_different_files_without_contest_ids_are_both_kept(tmp_path):
+    """A blank contest id used to share ``-Classic-slate`` and the second import replaced the first."""
+    db_path = tmp_path / "archive.db"
+    first_parsed = parse_dk_contest_csv(CLASSIC_STANDINGS, "", {})
+    second_parsed = parse_dk_contest_csv(OTHER_CLASSIC, "", {})
+    assert first_parsed["slate"]["contest_id"] == "-Classic-slate"
+    assert second_parsed["slate"]["contest_id"] == first_parsed["slate"]["contest_id"]
+
+    first = _import_file(db_path, CLASSIC_STANDINGS, "", _IMPORTED_AT)
+    second = _import_file(db_path, OTHER_CLASSIC, "", _IMPORTED_LATER)
+
+    assert first.status == "imported"
+    assert second.status == "imported"
+    assert first.contest_id != second.contest_id
+    assert first.contest_id != "-Classic-slate"
+    assert file_content_hash(CLASSIC_STANDINGS.encode()) in first.contest_id
+    assert _IMPORTED_AT in first.contest_id
+    assert file_content_hash(OTHER_CLASSIC.encode()) in second.contest_id
+    assert _IMPORTED_LATER in second.contest_id
+
+    recent = get_recent_slates(db_path=db_path)
+    assert set(recent["Contest ID"]) == {first.contest_id, second.contest_id}
+    scores = set(recent["Top Score"].astype(float))
+    assert scores == {180.0, 175.0}
+    names = set(search_player_performance(db_path=db_path)["Player"])
+    assert {"Josh Allen", "Patrick Mahomes"} <= names
+
+
+def test_importing_the_same_file_twice_skips_the_duplicate(tmp_path):
+    db_path = tmp_path / "archive.db"
+    first = _import_file(db_path, CLASSIC_STANDINGS, "", _IMPORTED_AT)
+    second = _import_file(db_path, CLASSIC_STANDINGS, "", _IMPORTED_LATER)
+    named_again = _import_file(
+        db_path, CLASSIC_STANDINGS, "197055070", _IMPORTED_LATER, METADATA
+    )
+
+    assert first.status == "imported"
+    assert second.status == "duplicate"
+    assert second.message == DUPLICATE_ARCHIVE_MESSAGE
+    assert "already imported" in second.message
+    assert "duplicate" in second.message
+    assert second.contest_id == first.contest_id
+    assert named_again.status == "duplicate"
+    assert named_again.message == DUPLICATE_ARCHIVE_MESSAGE
+    recent = get_recent_slates(db_path=db_path)
+    assert list(recent["Contest ID"]) == [first.contest_id]
+    assert float(recent.loc[0, "Top Score"]) == 180.0
+
+
+def test_files_with_contest_ids_keep_that_id(tmp_path):
+    db_path = tmp_path / "archive.db"
+    direct_path = tmp_path / "direct.db"
+    parsed = parse_dk_contest_csv(CLASSIC_STANDINGS, "197055070", METADATA)
+    save_contest(parsed["slate"], parsed["players"], parsed["standings"], direct_path)
+    result = _import_file(db_path, CLASSIC_STANDINGS, "197055070", _IMPORTED_AT, METADATA)
+    other = _import_file(db_path, OTHER_CLASSIC, "197055071", _IMPORTED_LATER, METADATA)
+
+    assert result.status == "imported"
+    assert result.contest_id == "197055070"
+    assert result.message == ""
+    assert other.contest_id == "197055071"
+
+    imported = get_recent_slates(db_path=db_path).set_index("Contest ID")
+    direct = get_recent_slates(db_path=direct_path).set_index("Contest ID")
+    compared = ["Date", "Slate Name", "Slate Type", "Total Entries", "Cash Cutline", "Top Score"]
+    left = imported.loc["197055070", compared].fillna("")
+    right = direct.loc["197055070", compared].fillna("")
+    assert left.tolist() == right.tolist()
+    assert imported.loc["197055070", "Note"] == ""
+    players = search_player_performance(contest_id="197055070", db_path=db_path)
+    direct_players = search_player_performance(contest_id="197055070", db_path=direct_path)
+    assert players["Player"].tolist() == direct_players["Player"].tolist()
+    assert len(get_recent_slates(db_path=db_path)) == 2
+
+
+def test_same_contest_id_with_different_content_keeps_both(tmp_path):
+    db_path = tmp_path / "archive.db"
+    first = _import_file(db_path, CLASSIC_STANDINGS, "197055070", _IMPORTED_AT, METADATA)
+    second = _import_file(db_path, OTHER_CLASSIC, "197055070", _IMPORTED_LATER, METADATA)
+
+    assert first.status == "imported"
+    assert first.contest_id == "197055070"
+    assert second.status == "kept_both"
+    assert second.contest_id != "197055070"
+    assert second.contest_id.startswith("197055070~")
+    assert file_content_hash(OTHER_CLASSIC.encode()) in second.contest_id
+    assert "197055070" in second.message
+    assert "different content" in second.message
+    assert "existing entry was kept" in second.message
+    assert second.note
+    assert "197055070" in second.note
+
+    recent = get_recent_slates(db_path=db_path).set_index("Contest ID")
+    assert set(recent.index) == {"197055070", second.contest_id}
+    assert float(recent.loc["197055070", "Top Score"]) == 180.0
+    assert recent.loc["197055070", "Note"] == ""
+    assert "differs" in recent.loc[second.contest_id, "Note"]
+    assert float(recent.loc[second.contest_id, "Top Score"]) == 175.0
+    original = search_player_performance(contest_id="197055070", db_path=db_path)
+    assert "Josh Allen" in set(original["Player"])
+    assert "Patrick Mahomes" not in set(original["Player"])
+    added = search_player_performance(contest_id=second.contest_id, db_path=db_path)
+    assert "Patrick Mahomes" in set(added["Player"])
+
+
+def _legacy_archive(db_path):
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE slates (
+            contest_id TEXT PRIMARY KEY,
+            slate_name TEXT,
+            sport TEXT,
+            slate_type TEXT,
+            contest_date TEXT,
+            total_entries INTEGER,
+            entry_fee REAL,
+            cash_cutline REAL,
+            first_place_score REAL
+        );
+        CREATE TABLE player_performance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contest_id TEXT REFERENCES slates(contest_id),
+            player_name TEXT,
+            position TEXT,
+            team TEXT,
+            salary INTEGER,
+            ownership_pct REAL,
+            actual_fpts REAL,
+            UNIQUE(contest_id, player_name, team, position) ON CONFLICT REPLACE
+        );
+        CREATE TABLE contest_standings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contest_id TEXT REFERENCES slates(contest_id),
+            entry_id TEXT,
+            entry_name TEXT,
+            rank INTEGER,
+            points REAL,
+            lineup TEXT,
+            UNIQUE(contest_id, entry_id) ON CONFLICT REPLACE
+        );
+        CREATE TABLE monitored_contests (
+            contest_id TEXT PRIMARY KEY,
+            slate_name TEXT,
+            entry_fee REAL,
+            prize_pool REAL,
+            draft_group_id TEXT
+        );
+        INSERT INTO slates (
+            contest_id, slate_name, sport, slate_type, contest_date,
+            total_entries, entry_fee, cash_cutline, first_place_score
+        ) VALUES
+            ('197055070', 'HOU at JAX', 'NFL', 'Showdown', '2026-10-18', 4, 20.0, 150.0, 180.0),
+            ('salary-file-abc', 'DK salaries', 'NFL', 'Classic', '2026-10-18', NULL, NULL, NULL, NULL);
+        INSERT INTO player_performance (
+            id, contest_id, player_name, position, team, salary, ownership_pct, actual_fpts
+        ) VALUES
+            (1, '197055070', 'Josh Allen', 'QB', 'BUF', 8000, 0.184, 30.2),
+            (2, 'salary-file-abc', 'Nico Collins', 'WR', 'HOU', 6000, NULL, NULL);
+        INSERT INTO contest_standings (
+            id, contest_id, entry_id, entry_name, rank, points, lineup
+        ) VALUES
+            (7, '197055070', '100', 'Alpha', 1, 180.0, 'QB Josh Allen');
+        INSERT INTO monitored_contests (
+            contest_id, slate_name, entry_fee, prize_pool, draft_group_id
+        ) VALUES
+            ('197055070', 'HOU at JAX', 20.0, 15000.0, '55');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def _archive_snapshot(db_path):
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    snapshot = {
+        "slates": [
+            tuple(row)
+            for row in conn.execute(
+                """
+                SELECT contest_id, slate_name, sport, slate_type, contest_date,
+                       total_entries, entry_fee, cash_cutline, first_place_score
+                FROM slates
+                ORDER BY contest_id
+                """
+            )
+        ],
+        "players": [
+            tuple(row)
+            for row in conn.execute(
+                """
+                SELECT id, contest_id, player_name, position, team, salary,
+                       ownership_pct, actual_fpts
+                FROM player_performance
+                ORDER BY id
+                """
+            )
+        ],
+        "standings": [
+            tuple(row)
+            for row in conn.execute(
+                """
+                SELECT id, contest_id, entry_id, entry_name, rank, points, lineup
+                FROM contest_standings
+                ORDER BY id
+                """
+            )
+        ],
+        "monitored": [
+            tuple(row)
+            for row in conn.execute(
+                """
+                SELECT contest_id, slate_name, entry_fee, prize_pool, draft_group_id
+                FROM monitored_contests
+                ORDER BY contest_id
+                """
+            )
+        ],
+    }
+    conn.close()
+    return snapshot
+
+
+def test_existing_archive_is_unchanged_after_upgrade(tmp_path):
+    db_path = tmp_path / "legacy.db"
+    _legacy_archive(db_path)
+    before = _archive_snapshot(db_path)
+
+    from src.database import connect
+
+    conn = connect(db_path)
+    added = [
+        tuple(row)
+        for row in conn.execute(
+            """
+            SELECT contest_id, content_hash, imported_at, archive_note
+            FROM slates
+            ORDER BY contest_id
+            """
+        )
+    ]
+    child_sql = " ".join(
+        str(
+            conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'player_performance'"
+            ).fetchone()[0]
+        ).lower().split()
+    )
+    conn.execute(
+        """
+        INSERT INTO player_performance (contest_id, player_name, position, team)
+        VALUES ('197055070', 'Nico Collins', 'WR', 'HOU')
+        """
+    )
+    conn.commit()
+    conn.close()
+    after = _archive_snapshot(db_path)
+    assert after["slates"] == before["slates"]
+    assert after["standings"] == before["standings"]
+    assert after["monitored"] == before["monitored"]
+    assert after["players"][:2] == before["players"]
+    assert "references slates(" in child_sql
+    assert "slates_old" not in child_sql
+    assert added == [
+        ("197055070", None, None, None),
+        ("salary-file-abc", None, None, None),
+    ]
+    kept = _import_file(
+        db_path,
+        OTHER_CLASSIC,
+        "197055070",
+        _IMPORTED_AT,
+        {"slate_name": "Different file", "contest_date": "2026-10-18"},
+    )
+    assert kept.status == "kept_both"
+    assert kept.contest_id != "197055070"
+    upgraded = _archive_snapshot(db_path)
+    original_slate = [row for row in upgraded["slates"] if row[0] == "197055070"]
+    assert original_slate == [row for row in before["slates"] if row[0] == "197055070"]
+    assert any(row[0] == kept.contest_id for row in upgraded["slates"])
+    original_players = search_player_performance(contest_id="197055070", db_path=db_path)
+    assert "Josh Allen" in set(original_players["Player"])
+    assert "Patrick Mahomes" not in set(original_players["Player"])
+
+
+def test_slate_migration_failure_restores_the_original_archive(tmp_path):
+    import sqlite3
+
+    db_path = tmp_path / "legacy.db"
+    _legacy_archive(db_path)
+    before = _archive_snapshot(db_path)
+
+    class _FailingConnection:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args, **kwargs):
+            text = " ".join(str(sql).split()).lower()
+            if "add column archive_note" in text:
+                raise sqlite3.OperationalError("disk full")
+            return self._conn.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    held = sqlite3.connect(db_path)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="disk full"):
+            _migrate_slate_archive(_FailingConnection(held))
+    finally:
+        held.close()
+
+    check = sqlite3.connect(db_path)
+    names = {
+        row[0]
+        for row in check.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    assert "slates" in names
+    assert "slates_old" not in names
+    columns = [row[1] for row in check.execute("PRAGMA table_info(slates)")]
+    check.close()
+    assert "content_hash" not in columns
+    assert _archive_snapshot(db_path) == before

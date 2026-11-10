@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -23,9 +24,10 @@ from src.contest_parser import (
     parse_dk_contest_csv,
 )
 from src.database import (
+    file_content_hash,
     get_chalk_and_cutline_summary,
     get_recent_slates,
-    save_contest,
+    import_standings,
     save_salary_pool_if_new,
     search_player_performance,
 )
@@ -1193,6 +1195,8 @@ def render_archive_view() -> None:
     st.caption(
         "Upload a Game Center file named like contest-standings-197055070.csv or .zip. "
         "Contest name, date, entry fee, and contest type come from DraftKings. "
+        "A file name without a contest id is stored under its own key. "
+        "Importing the same file again is skipped. "
         "Player salaries are saved when you generate lineups."
     )
 
@@ -1210,7 +1214,8 @@ def render_archive_view() -> None:
         else:
             filename = str(getattr(standings_file, "name", "") or "")
             try:
-                standings_text, id_name = open_contest_standings(standings_file, filename)
+                raw_bytes = standings_file.getvalue()
+                standings_text, id_name = open_contest_standings(raw_bytes, filename)
                 contest_id = contest_id_from_filename(id_name)
                 metadata = fetch_dk_contest_metadata(contest_id)
                 note = ""
@@ -1223,17 +1228,32 @@ def render_archive_view() -> None:
                     contest_id,
                     metadata,
                 )
-                save_contest(parsed["slate"], parsed["players"], parsed["standings"])
+                if not contest_id and not str(parsed["slate"].get("slate_name") or "").strip():
+                    parsed["slate"]["slate_name"] = filename
+                result = import_standings(
+                    parsed["slate"],
+                    parsed["players"],
+                    parsed["standings"],
+                    file_content_hash(raw_bytes),
+                    source_contest_id=contest_id,
+                    imported_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                )
             except Exception as exc:  # noqa: BLE001 - show the import error in the page
                 st.error(str(exc))
             else:
+                warnings = []
+                for item in (note, result.message):
+                    if item and item not in warnings:
+                        warnings.append(item)
                 owned = sorted(
                     parsed["players"],
                     key=lambda player: float(player.get("ownership_pct") or -1),
                     reverse=True,
                 )[:5]
                 st.session_state["last_import"] = {
-                    "contest_id": parsed["slate"]["contest_id"],
+                    "status": result.status,
+                    "message": result.message,
+                    "contest_id": result.contest_id,
                     "slate_name": parsed["slate"]["slate_name"],
                     "slate_type": parsed["slate"]["slate_type"],
                     "contest_date": parsed["slate"]["contest_date"],
@@ -1241,6 +1261,7 @@ def render_archive_view() -> None:
                     "total_entries": parsed["slate"]["total_entries"],
                     "cash_cutline": parsed["slate"]["cash_cutline"],
                     "note": note,
+                    "warnings": warnings,
                     "top_owned": [
                         {
                             "Player": player["player_name"],
@@ -1255,27 +1276,30 @@ def render_archive_view() -> None:
 
     last_import = st.session_state.get("last_import")
     if last_import:
-        slate_name = str(last_import.get("slate_name") or "").strip() or last_import["contest_id"]
-        st.success(
-            f"Imported {last_import.get('slate_type', 'Classic')} contest {slate_name}."
-        )
-        if last_import.get("note"):
-            st.warning(str(last_import["note"]))
-        fee = last_import.get("entry_fee")
-        metric_date, metric_fee, metric_cash = st.columns(3)
-        metric_date.metric("Contest date", str(last_import.get("contest_date") or "—"))
-        metric_fee.metric("Entry fee", "—" if fee is None else f"${float(fee):g}")
-        cash_line = last_import.get("cash_cutline")
-        metric_cash.metric(
-            "Cash line",
-            "—" if cash_line is None else f"{float(cash_line):.2f}",
-        )
-        st.caption("Top chalk plays")
-        st.dataframe(
-            pd.DataFrame(last_import["top_owned"]),
-            width="stretch",
-            hide_index=True,
-        )
+        if last_import.get("status") == "duplicate":
+            st.warning(str(last_import.get("message") or ""))
+        else:
+            slate_name = str(last_import.get("slate_name") or "").strip() or last_import["contest_id"]
+            st.success(
+                f"Imported {last_import.get('slate_type', 'Classic')} contest {slate_name}."
+            )
+            for warning in last_import.get("warnings") or []:
+                st.warning(str(warning))
+            fee = last_import.get("entry_fee")
+            metric_date, metric_fee, metric_cash = st.columns(3)
+            metric_date.metric("Contest date", str(last_import.get("contest_date") or "—"))
+            metric_fee.metric("Entry fee", "—" if fee is None else f"${float(fee):g}")
+            cash_line = last_import.get("cash_cutline")
+            metric_cash.metric(
+                "Cash line",
+                "—" if cash_line is None else f"{float(cash_line):.2f}",
+            )
+            st.caption("Top chalk plays")
+            st.dataframe(
+                pd.DataFrame(last_import["top_owned"]),
+                width="stretch",
+                hide_index=True,
+            )
 
     st.subheader("Recent slates")
     recent = get_recent_slates()
