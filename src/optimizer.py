@@ -18,6 +18,20 @@ from pydfs_lineup_optimizer.solvers.constants import SolverSign
 from pydfs_lineup_optimizer.stacks import PlayersGroup, PositionsStack
 
 from .parser import drop_inactive_players, is_inactive_injury, parse_dk_csv
+from .portfolio import (
+    PortfolioIdentityRule,
+    PortfolioRuleState,
+    appearances_allowed,
+    batch_team_stack_exposures,
+    solver_rate_for_remaining,
+    explain_shortfall,
+    exposure_report_csv,
+    exposure_report_frame,
+    lineup_identities,
+    normalize_stack_spec,
+    person_key,
+    team_stack_counts,
+)
 from .presets import ContestFormat
 
 DK_SALARY_CAP = 50_000
@@ -635,6 +649,13 @@ class BaseNFLOptimizer:
         self.exclude_inactive: bool = True
         # Player IDs the user forced into the lineup. Salary floors skip these.
         self.locked_player_ids: set[str] = set()
+        # Set by a multi-batch portfolio (tiers or game scripts). None means
+        # this generate() call is the whole exported set.
+        self.portfolio_size: Optional[int] = None
+        self.portfolio_lineups: Optional[List[pd.DataFrame]] = None
+        self._inside_portfolio: bool = False
+        self.last_shortfall = None
+        self._solver_constraint_notes: List[str] = []
 
     def set_locked_players(self, player_ids: Optional[Sequence[str]]) -> None:
         """Force these player IDs into the lineup. Empty clears the locks."""
@@ -807,6 +828,229 @@ class BaseNFLOptimizer:
         df.attrs["projection"] = float(lineup.fantasy_points_projection)
         df.attrs["salary_remaining"] = int(self.salary_cap) - spent
         return df
+
+    def _prior_frames(self, existing: Optional[Sequence[pd.DataFrame]]) -> List[pd.DataFrame]:
+        if existing is not None:
+            return [frame for frame in existing if frame is not None]
+        stored = self.portfolio_lineups or []
+        return [frame for frame in stored if frame is not None]
+
+    def _active_overlap_cap(self) -> Optional[int]:
+        """Overlap cap for this format after slate tightening, if any."""
+        if ContestFormat(self.contest_format) is ContestFormat.CLASSIC:
+            return getattr(self, "last_overlap_cap", self.max_repeating_players)
+        return self.max_repeating_players
+
+    def _arm_portfolio_rule(
+        self,
+        pydfs_optimizer,
+        players: Sequence[Player],
+        prior_frames: Sequence[pd.DataFrame],
+        batch_size: int,
+    ) -> None:
+        """Add identity limits when pydfs would count the wrong player or batch."""
+        portfolio_size = int(self.portfolio_size or batch_size)
+        overlap = self._active_overlap_cap()
+        showdown = ContestFormat(self.contest_format) is ContestFormat.SHOWDOWN
+        exposure = self.max_exposure
+        kicker = getattr(self, "kicker_max_exposure", None)
+        enforce_overlap = overlap is not None and (showdown or int(overlap) < 1)
+        # Every batch, including the first tier and a single Classic solve.
+        # pydfs allows one extra lineup when the percentage is not a whole number.
+        enforce_exposure = exposure is not None
+        enforce_kicker = bool(showdown and kicker is not None)
+        if not (enforce_overlap or enforce_exposure or enforce_kicker):
+            return
+        allowance: Dict[tuple, int] = {}
+        default_allowed = appearances_allowed(exposure, portfolio_size) if enforce_exposure else None
+        if enforce_kicker:
+            kicker_allowed = appearances_allowed(float(kicker), portfolio_size)
+            for player in players:
+                positions = set(getattr(player, "original_positions", None) or ())
+                if "K" not in positions and "K" not in _player_positions(player):
+                    continue
+                key = person_key(player.full_name, player.team)
+                if default_allowed is None:
+                    allowance[key] = kicker_allowed
+                else:
+                    allowance[key] = min(default_allowed, kicker_allowed)
+        used: Dict[tuple, int] = {}
+        history = []
+        for frame in prior_frames:
+            identities = lineup_identities(frame)
+            history.append(set(identities))
+            for key in identities:
+                used[key] = used.get(key, 0) + 1
+        if enforce_exposure or enforce_kicker:
+            self._tighten_solver_exposure(
+                players,
+                used,
+                batch_size,
+                portfolio_size,
+                default_allowed if enforce_exposure else None,
+                kicker if enforce_kicker else None,
+            )
+        pydfs_optimizer._portfolio_limits = PortfolioRuleState(
+            portfolio_size=portfolio_size,
+            overlap_cap=None if overlap is None else int(overlap),
+            enforce_overlap=enforce_overlap,
+            default_allowed=default_allowed if enforce_exposure or enforce_kicker else None,
+            allowance=allowance,
+            prior_used=used,
+            prior_history=history,
+        )
+        pydfs_optimizer.add_new_rule(PortfolioIdentityRule)
+
+    def _tighten_solver_exposure(
+        self,
+        players: Sequence[Player],
+        used: Dict[tuple, int],
+        batch_size: int,
+        portfolio_size: int,
+        default_allowed: Optional[int],
+        kicker_rate: Optional[float],
+    ) -> None:
+        """Set each player's pydfs rate so that strategy cannot beat the floor.
+
+        The identity rule is the combined captain/flex count. This fraction
+        stops a single row, and the first batch, from using pydfs's extra lineup.
+        """
+        kicker_allowed = (
+            None
+            if kicker_rate is None
+            else appearances_allowed(float(kicker_rate), portfolio_size)
+        )
+        for player in players:
+            key = person_key(player.full_name, player.team)
+            remaining_caps: List[int] = []
+            if default_allowed is not None:
+                remaining_caps.append(int(default_allowed) - int(used.get(key, 0)))
+            if kicker_allowed is not None and self._player_is_kicker(player):
+                remaining_caps.append(int(kicker_allowed) - int(used.get(key, 0)))
+            if not remaining_caps:
+                continue
+            rate = solver_rate_for_remaining(min(remaining_caps), batch_size)
+            current = player.max_exposure
+            if current is None or current > rate:
+                player.max_exposure = rate
+
+    @staticmethod
+    def _player_is_kicker(player: Player) -> bool:
+        positions = set(getattr(player, "original_positions", None) or ())
+        if "K" in positions or "K" in _player_positions(player):
+            return True
+        return False
+
+    def _consume_lineups(self, pydfs_optimizer, count: int, players: Sequence[Player], prior_frames: Sequence[pd.DataFrame]):
+        """Run one pydfs batch. A partial result is kept; an empty one is raised."""
+        self._arm_portfolio_rule(pydfs_optimizer, players, prior_frames, count)
+        exclude = None
+        overlap = self._active_overlap_cap()
+        if (
+            prior_frames
+            and ContestFormat(self.contest_format) is not ContestFormat.SHOWDOWN
+            and overlap is not None
+            and int(overlap) >= 1
+        ):
+            # Removed and zero-exposure players are not in the solver dictionary.
+            available = pydfs_optimizer.player_pool.filtered_players
+            exclude = _lineups_for_overlap(prior_frames, available) or None
+        raw = []
+        self._solver_constraint_notes = []
+        try:
+            for lineup in pydfs_optimizer.optimize(
+                count,
+                max_exposure=self.max_exposure,
+                exclude_lineups=exclude,
+            ):
+                raw.append(lineup)
+        except GenerateLineupException as exc:
+            self._solver_constraint_notes = list(getattr(exc, "invalid_constraints", []) or [])
+            if not raw:
+                raise
+        return raw
+
+    def _limits_configured(self) -> bool:
+        if self.max_exposure is not None or self.min_exposure is not None:
+            return True
+        if self._active_overlap_cap() is not None:
+            return True
+        if getattr(self, "last_stack_exposure", None) is not None:
+            return True
+        if getattr(self, "kicker_max_exposure", None) is not None:
+            return True
+        return False
+
+    def _eligible_identities(self) -> List[tuple]:
+        frame = self._player_df
+        if frame is None or frame.empty or "Name" not in frame.columns:
+            return []
+        team_col = "TeamAbbrev" if "TeamAbbrev" in frame.columns else "Team"
+        found: List[tuple] = []
+        seen = set()
+        teams = frame[team_col] if team_col in frame.columns else [""] * len(frame)
+        for name, team in zip(frame["Name"], teams):
+            key = person_key(name, team)
+            if not key[0] or key in seen:
+                continue
+            seen.add(key)
+            found.append(key)
+        return found
+
+    def _locked_identities(self) -> List[tuple]:
+        frame = self._player_df
+        if not self.locked_player_ids or frame is None or frame.empty or "ID" not in frame.columns:
+            return []
+        team_col = "TeamAbbrev" if "TeamAbbrev" in frame.columns else "Team"
+        found = []
+        for _, row in frame.iterrows():
+            if str(row.get("ID")) not in self.locked_player_ids:
+                continue
+            key = person_key(row.get("Name"), row.get(team_col) if team_col in frame.columns else "")
+            if key[0] and key not in found:
+                found.append(key)
+        return found
+
+    def _stack_spec(self) -> Tuple[Tuple[str, ...], ...]:
+        if not getattr(self, "enable_qb_stack", False):
+            return ()
+        return normalize_stack_spec(self._qb_stack_positions())
+
+    def _display_names(self) -> Dict[tuple, str]:
+        frame = self._player_df
+        names: Dict[tuple, str] = {}
+        if frame is None or frame.empty or "Name" not in frame.columns:
+            return names
+        team_col = "TeamAbbrev" if "TeamAbbrev" in frame.columns else "Team"
+        teams = frame[team_col] if team_col in frame.columns else [""] * len(frame)
+        for name, team in zip(frame["Name"], teams):
+            key = person_key(name, team)
+            names.setdefault(key, str(name).strip())
+        return names
+
+    def explain_lineup_shortfall(self, lineups: Sequence[pd.DataFrame], requested: int):
+        return explain_shortfall(
+            lineups,
+            requested=int(requested),
+            overlap_cap=self._active_overlap_cap(),
+            max_exposure=self.max_exposure,
+            stack_exposure=getattr(self, "last_stack_exposure", None),
+            stack_spec=self._stack_spec(),
+            min_exposure=self.min_exposure,
+            eligible=self._eligible_identities(),
+            roster_size=len(self.roster_slots),
+            locked=self._locked_identities(),
+            solver_constraints=self._solver_constraint_notes,
+            display_names=self._display_names(),
+        )
+
+    def _finish_shortfall(self, frames: Sequence[pd.DataFrame], requested: int) -> None:
+        if self._inside_portfolio:
+            return
+        if len(frames) >= int(requested):
+            self.last_shortfall = None
+            return
+        self.last_shortfall = self.explain_lineup_shortfall(frames, requested)
 
     def generate_lineups_table(self, n: Optional[int] = None) -> pd.DataFrame:
         """Generate lineups and return a single multi-lineup summary table."""
@@ -1063,15 +1307,40 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
         self.last_game_count = n_games
         self.last_overlap_cap = overlap_cap
         self.last_stack_exposure = stack_exposure
-        if overlap_cap is not None:
+        # pydfs rejects an overlap below 1. Zero is enforced by the portfolio rule.
+        if overlap_cap is not None and int(overlap_cap) >= 1:
             optimizer.set_max_repeating_players(overlap_cap)
         if self.enable_qb_stack:
-            optimizer.add_stack(
-                PositionsStack(
-                    self._qb_stack_positions(),
-                    max_exposure=stack_exposure,
+            spec = self._qb_stack_positions()
+            per_team = None
+            blocked: List[str] = []
+            prior = list(getattr(self, "_active_prior_lineups", None) or [])
+            batch_size = getattr(self, "_active_batch_size", None) or self.lineup_count
+            portfolio_size = self.portfolio_size or batch_size
+            if stack_exposure is not None and batch_size and portfolio_size:
+                usage = team_stack_counts(prior, normalize_stack_spec(spec))
+                teams = sorted({str(player.team) for player in players if player.team})
+                per_team, blocked = batch_team_stack_exposures(
+                    rate=float(stack_exposure),
+                    portfolio_size=int(portfolio_size),
+                    batch_size=int(batch_size),
+                    prior_counts=usage,
+                    teams=teams,
                 )
-            )
+                for player in players:
+                    if str(player.team) in blocked and "QB" in _player_positions(player):
+                        optimizer.player_pool.remove_player(player)
+            if per_team is not None:
+                optimizer.add_stack(
+                    PositionsStack(spec, max_exposure_per_team=per_team or None)
+                )
+            else:
+                optimizer.add_stack(
+                    PositionsStack(
+                        spec,
+                        max_exposure=stack_exposure,
+                    )
+                )
         if self.enable_bring_back:
             self._apply_bring_back(optimizer, players)
         self._apply_flex_positions(optimizer)
@@ -1144,6 +1413,12 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
         count = self.lineup_count if n is None else int(n)
         if not 1 <= count <= 150:
             raise ValueError("lineup count must be between 1 and 150")
+        if not self._inside_portfolio:
+            self.last_shortfall = None
+            self.portfolio_size = count
+        prior = self._prior_frames(existing_lineups)
+        self._active_prior_lineups = prior
+        self._active_batch_size = count
         players = self._players_for_optimize()
         if quarterback_teams is not None:
             players = _without_outside_quarterbacks(players, quarterback_teams)
@@ -1151,18 +1426,22 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
                 label = game_script or "@".join(quarterback_teams)
                 raise RuntimeError(f"No quarterbacks left for {label}.")
         optimizer = self._build_optimizer(players)
-        exclude = _lineups_for_overlap(existing_lineups or [], players)
-        raw_lineups = list(
-            optimizer.optimize(
-                count,
-                max_exposure=self.max_exposure,
-                exclude_lineups=exclude or None,
-            )
-        )
+        try:
+            raw_lineups = self._consume_lineups(optimizer, count, players, prior)
+        except GenerateLineupException as exc:
+            self._solver_constraint_notes = list(getattr(exc, "invalid_constraints", []) or [])
+            if self._inside_portfolio:
+                raw_lineups = []
+            elif self._limits_configured():
+                self.last_shortfall = self.explain_lineup_shortfall([], count)
+                raise RuntimeError(self.last_shortfall.message) from exc
+            else:
+                raise
         frames = [self.format_lineup(lineup) for lineup in raw_lineups]
         if game_script:
             for frame in frames:
                 frame.attrs["game_script"] = game_script
+        self._finish_shortfall(frames, count)
         return frames
 
 
@@ -1844,7 +2123,7 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             min_teams = None
         if min_teams is not None:
             optimizer.set_total_teams(min_teams=int(min_teams))
-        if self.max_repeating_players is not None:
+        if self.max_repeating_players is not None and int(self.max_repeating_players) >= 1:
             optimizer.set_max_repeating_players(self.max_repeating_players)
         self._apply_captain_eligibility(optimizer, players)
         self._apply_dst_ban(optimizer, players)
@@ -1868,27 +2147,37 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         count = self.lineup_count if n is None else int(n)
         if not 1 <= count <= 150:
             raise ValueError("lineup count must be between 1 and 150")
+        if not self._inside_portfolio:
+            self.last_shortfall = None
+            self.portfolio_size = count
         players = self._players_for_optimize()
-        if self.require_starting_core:
-            try:
-                return self._optimize_showdown(players, count)
-            except GenerateLineupException:
-                self.require_starting_core = False
+        try:
+            if self.require_starting_core:
                 try:
-                    return self._optimize_showdown(players, count)
-                finally:
-                    self.require_starting_core = True
-        return self._optimize_showdown(players, count)
+                    frames = self._optimize_showdown(players, count)
+                except GenerateLineupException:
+                    self.require_starting_core = False
+                    try:
+                        frames = self._optimize_showdown(players, count)
+                    finally:
+                        self.require_starting_core = True
+            else:
+                frames = self._optimize_showdown(players, count)
+        except GenerateLineupException as exc:
+            self._solver_constraint_notes = list(getattr(exc, "invalid_constraints", []) or [])
+            if self._limits_configured():
+                self.last_shortfall = self.explain_lineup_shortfall([], count)
+                raise RuntimeError(self.last_shortfall.message) from exc
+            raise
+        self._finish_shortfall(frames, count)
+        return frames
 
     def _optimize_showdown(self, players: List[Player], count: int) -> List[pd.DataFrame]:
+        prior = self._prior_frames(None)
+        self._active_prior_lineups = prior
+        self._active_batch_size = count
         optimizer = self._build_optimizer(players)
-        raw_lineups = []
-        try:
-            for lineup in optimizer.optimize(count, max_exposure=self.max_exposure):
-                raw_lineups.append(lineup)
-        except GenerateLineupException:
-            if not raw_lineups:
-                raise
+        raw_lineups = self._consume_lineups(optimizer, count, players, prior)
         return [self.format_lineup(lineup) for lineup in raw_lineups]
 
 
@@ -2020,17 +2309,32 @@ def optimize_tiered_salaries(
 
     previous_min = optimizer.min_salary_cap
     previous_max = optimizer.max_salary_cap
+    previous_size = getattr(optimizer, "portfolio_size", None)
+    previous_lineups = getattr(optimizer, "portfolio_lineups", None)
+    previous_inside = getattr(optimizer, "_inside_portfolio", False)
     lineups: List[pd.DataFrame] = []
+    optimizer._inside_portfolio = True
+    optimizer.portfolio_size = int(total_n)
+    optimizer.last_shortfall = None
     try:
         if standard_n:
             optimizer.set_max_salary_cap(standard_cap)
             optimizer.set_min_salary_cap(STANDARD_TIER_FLOOR)
+            optimizer.portfolio_lineups = []
             lineups.extend(optimizer.generate_lineups(standard_n))
         if discount_n:
             optimizer.set_max_salary_cap(discount_cap)
             optimizer.set_min_salary_cap(discount_floor)
+            optimizer.portfolio_lineups = list(lineups)
             lineups.extend(optimizer.generate_lineups(discount_n))
+        if len(lineups) < int(total_n):
+            optimizer.last_shortfall = optimizer.explain_lineup_shortfall(lineups, total_n)
+        else:
+            optimizer.last_shortfall = None
     finally:
+        optimizer._inside_portfolio = previous_inside
+        optimizer.portfolio_size = previous_size
+        optimizer.portfolio_lineups = previous_lineups
         optimizer.set_min_salary_cap(previous_min)
         optimizer.set_max_salary_cap(previous_max)
     return lineups
@@ -2069,7 +2373,14 @@ def optimize_game_scripts(
     if repeating < 1:
         raise ValueError("max repeating players must be at least 1")
     saved = {name: getattr(optimizer, name) for name in _GAME_SCRIPT_FIELDS}
+    previous_size = optimizer.portfolio_size
+    previous_lineups = optimizer.portfolio_lineups
+    previous_inside = optimizer._inside_portfolio
     prior: List[pd.DataFrame] = []
+    requested = sum(max(0, int(bucket.lineups)) for bucket in buckets)
+    optimizer._inside_portfolio = True
+    optimizer.portfolio_size = requested
+    optimizer.last_shortfall = None
     try:
         optimizer.set_qb_stack(
             True, pass_catchers=1, bring_back=True, bring_back_position="SKILL"
@@ -2088,6 +2399,7 @@ def optimize_game_scripts(
                 continue
             away, home = _teams_in_game(bucket.game)
             optimizer.set_max_salary_cap(int(bucket.salary_cap))
+            optimizer.portfolio_lineups = list(prior)
             prior.extend(
                 optimizer.generate_lineups(
                     count,
@@ -2096,8 +2408,15 @@ def optimize_game_scripts(
                     game_script=f"{away}@{home}",
                 )
             )
+        if len(prior) < requested:
+            optimizer.last_shortfall = optimizer.explain_lineup_shortfall(prior, requested)
+        else:
+            optimizer.last_shortfall = None
         return prior
     finally:
+        optimizer._inside_portfolio = previous_inside
+        optimizer.portfolio_size = previous_size
+        optimizer.portfolio_lineups = previous_lineups
         for name, value in saved.items():
             setattr(optimizer, name, value)
 
@@ -2119,30 +2438,18 @@ def game_script_summary(lineups: Sequence[pd.DataFrame]) -> pd.DataFrame:
     )
 
 
-def player_exposure_table(lineups: Sequence[pd.DataFrame]) -> pd.DataFrame:
-    """How often each player appears in the batch, highest exposure first."""
-    columns = ["Name", "Team", "Position", "Lineups", "Exposure %"]
-    total = len(lineups)
-    if total == 0:
-        return pd.DataFrame(columns=columns)
-    pieces = [
-        lineup[["ID", "Name", "Team", "Position"]].copy()
-        for lineup in lineups
-        if not lineup.empty
-    ]
-    if not pieces:
-        return pd.DataFrame(columns=columns)
-    stacked = pd.concat(pieces, ignore_index=True)
-    grouped = (
-        stacked.groupby(["ID", "Name", "Team", "Position"], as_index=False)
-        .size()
-        .rename(columns={"size": "Lineups"})
-    )
-    grouped["Exposure %"] = (grouped["Lineups"] / total * 100).round(1)
-    grouped = grouped.sort_values(
-        ["Lineups", "Name"], ascending=[False, True], kind="mergesort"
-    ).reset_index(drop=True)
-    return grouped.drop(columns=["ID"])
+def player_exposure_table(
+    lineups: Sequence[pd.DataFrame],
+    requested: Optional[int] = None,
+) -> pd.DataFrame:
+    """How often each real player appears, highest count first.
+
+    Showdown captain and flex rows of the same name and team are one player.
+    ``Exported %`` is the share of the lineups that were built. ``Requested %``
+    is the share of ``requested``. The DraftKings upload file cannot carry
+    this table; use ``exposure_report_csv`` for a separate summary.
+    """
+    return exposure_report_frame(lineups, requested=requested)
 
 
 def get_nfl_optimizer(contest_format: ContestFormat | str) -> BaseNFLOptimizer:

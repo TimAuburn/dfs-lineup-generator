@@ -166,10 +166,13 @@ def test_classic_large_gpp_preset_clamps_lineups_and_sets_ownership_cap():
     assert optimizer.position_jitter_sds is not None
 
     optimizer.load_from_dataframe(df)
-    # Keep count small for test runtime while still exercising the builder path.
-    optimizer.set_lineup_count(2)
+    # Ask for three. Forty percent of two floors to zero and bans every stack.
+    # Forty percent of three allows one stack per team, and this pool can build two.
+    optimizer.set_lineup_count(3)
     lineups = optimizer.generate_lineups()
     assert len(lineups) == 2
+    assert optimizer.last_shortfall is not None
+    assert "Team stack exposure" in optimizer.last_shortfall.message
     if optimizer.last_game_count <= 4:
         assert optimizer.last_stack_exposure == 0.30
     else:
@@ -1545,10 +1548,12 @@ def test_game_script_portfolio_stacks_caps_and_overlap():
         "Team",
         "Position",
         "Lineups",
-        "Exposure %",
+        "Exported %",
+        "Requested %",
     ]
     assert exposure["Lineups"].is_monotonic_decreasing
-    assert float(exposure["Exposure %"].max()) <= 100.0
+    assert float(exposure["Exported %"].max()) <= 100.0
+    assert float(exposure["Requested %"].max()) <= 100.0
     assert int(exposure.iloc[0]["Lineups"]) == int(exposure["Lineups"].max())
 
 

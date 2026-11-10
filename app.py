@@ -57,6 +57,7 @@ from src.optimizer import (
     get_nfl_optimizer,
     optimize_game_scripts,
     optimize_tiered_salaries,
+    exposure_report_csv,
     player_exposure_table,
     quarterback_label,
     showdown_lineup_grid,
@@ -1398,11 +1399,24 @@ for warning in vegas_warnings:
 if drop_stale_scoring_session(st.session_state):
     st.session_state.sleeper_version = int(st.session_state.get("sleeper_version") or 0) + 1
 lineups = st.session_state.lineups
+_generated_for_export = st.session_state.generated_run or {}
+_requested_lineups = _generated_for_export.get("requested")
 csv_text = (
     lineups_to_dk_upload_csv(lineups, contest_format=contest_format) if lineups else ""
 )
+exposure_csv = (
+    exposure_report_csv(
+        lineups,
+        requested=None if _requested_lineups is None else int(_requested_lineups),
+    )
+    if lineups
+    else ""
+)
 download_name = (
     "dk_nfl_showdown_upload.csv" if is_showdown else "dk_nfl_classic_upload.csv"
+)
+exposure_name = (
+    "showdown_player_exposure.csv" if is_showdown else "classic_player_exposure.csv"
 )
 pool: pd.DataFrame | None = st.session_state.player_pool
 
@@ -1779,6 +1793,19 @@ with download_col:
         width="stretch",
         disabled=not bool(lineups),
     )
+    st.download_button(
+        "Download exposure report",
+        data=exposure_csv,
+        file_name=exposure_name,
+        mime="text/csv",
+        type="secondary",
+        width="stretch",
+        disabled=not bool(lineups),
+        help=(
+            "One row per real player. Showdown captain and flex count together. "
+            "This is not the DraftKings upload."
+        ),
+    )
 
 if st.session_state.error:
     st.error(st.session_state.error)
@@ -1902,12 +1929,17 @@ if generate:
                 "salary_max": DK_SALARY_CAP,
                 "flex_positions": strategy_overrides.get("flex_positions"),
             }
+        limit_message = None
+        if getattr(optimizer, "last_shortfall", None) is not None:
+            limit_message = optimizer.last_shortfall.message
         st.session_state.lineups = generated
         st.session_state.generated_run = {
             "preset": preset.value,
             "preset_label": preset_cfg.label,
             "rows": live_setting_rows,
             "rule_check": rule_check,
+            "limit_message": limit_message,
+            "requested": int(lineup_count),
         }
         override_note = (
             f" (overrides: {', '.join(all_changed)})" if all_changed else ""
@@ -1941,6 +1973,9 @@ if lineups:
             _render_settings_comparison(used["rows"])
 
     st.subheader(f"Generated lineups ({len(lineups)})")
+    limit_message = (used or {}).get("limit_message") if used else None
+    if limit_message:
+        st.warning(limit_message)
     if any(lineup.attrs.get("game_script") for lineup in lineups):
         st.markdown("#### Lineups per game")
         st.dataframe(
@@ -1948,18 +1983,42 @@ if lineups:
             width="stretch",
             hide_index=True,
         )
-        st.markdown("#### Player exposure")
-        st.dataframe(
-            player_exposure_table(lineups),
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "Lineups": st.column_config.NumberColumn("Lineups", format="%d"),
-                "Exposure %": st.column_config.NumberColumn(
-                    "Exposure %", format="%.1f"
-                ),
-            },
-        )
+    requested_count = (used or {}).get("requested") if used else None
+    exposure = player_exposure_table(
+        lineups,
+        requested=None if requested_count is None else int(requested_count),
+    )
+    st.markdown("#### Player exposure")
+    st.caption(
+        "Each person is counted once per lineup. Showdown captain and flex are the same player. "
+        "Lineups is the count. Exported % is the share of the lineups that were built. "
+        "Requested % is the share of the number you asked for. "
+        "The cap is the floor of that requested share, so 40% of 6 is 2. "
+        "The DraftKings upload file is unchanged and does not include this table; "
+        "use Download exposure report for the same numbers."
+    )
+    exposure_config = {
+        "Lineups": st.column_config.NumberColumn("Lineups", format="%d"),
+        "Exported %": st.column_config.NumberColumn(
+            "Exported %",
+            format="%.1f",
+            help="Share of the lineups that were exported.",
+        ),
+        "Requested %": st.column_config.NumberColumn(
+            "Requested %",
+            format="%.1f",
+            help="Share of the number of lineups you asked for.",
+        ),
+    }
+    if "CPT count" in exposure.columns:
+        exposure_config["CPT count"] = st.column_config.NumberColumn("CPT count", format="%d")
+        exposure_config["FLEX count"] = st.column_config.NumberColumn("FLEX count", format="%d")
+    st.dataframe(
+        exposure,
+        width="stretch",
+        hide_index=True,
+        column_config=exposure_config,
+    )
 
     options = list(range(len(lineups)))
 
