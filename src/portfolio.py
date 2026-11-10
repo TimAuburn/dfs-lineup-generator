@@ -37,17 +37,37 @@ This module is the portfolio layer around that solver:
   (``if not max_exposure``), so a spent team is removed instead of given a
   zero rate.
 
-Min exposure is unchanged and still belongs to pydfs, per batch. The solver
-does not name a unique infeasible constraint. Shortfall text reports a limit
-as binding only when the roster math shows that limit is enough to block
-another lineup. Everything else is labeled as a candidate.
+* Min exposure uses the same identity and the same requested-lineup basis.
+  A player must appear in ``ceil(rate * requested - 1e-9)`` lineups. Showdown
+  captain and flex count once. pydfs ``MinExposureRule`` instead requires
+  ``round(rate * batch)`` appearances of each solver row inside one
+  ``optimize()`` call, so a split portfolio (or a half that rounds to even)
+  can finish below the requested minimum. This layer does not use that
+  rounding.
+
+  The solver reserves a player for the lineups still ahead: a player is
+  forced into the current lineup only when the appearances still needed are
+  at least the lineups still to build, including later tiers and game-script
+  buckets. A position group is forced only for the overflow that cannot fit
+  in the lineups after this one. That avoids spending every early lineup on
+  the first minimum and then missing a later one. It is not a joint search
+  over the whole portfolio. Shared flex slots, salary windows, stacks,
+  overlap, and locks can still make a reserved set impossible. When that
+  happens the minimum is dropped for the rest of that batch, the legal
+  lineups are kept, and the unmet names are reported. A max is never raised
+  to satisfy a min.
+
+The solver does not name a unique infeasible constraint. Shortfall text
+reports a limit as binding only when the roster math shows that limit is
+enough to block another lineup. Everything else is labeled as a candidate.
+Unmet minimums are reported on their own, not guessed as that cause.
 """
 
 from __future__ import annotations
 
 import math
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import pandas as pd
@@ -88,6 +108,311 @@ def appearances_allowed(rate: Optional[float], total: int) -> int:
         return 0
     allowed = math.floor(float(rate) * total + 1e-9)
     return max(0, min(total, allowed))
+
+
+def appearances_needed(rate: Optional[float], total: int) -> int:
+    """How many lineups one minimum requires across the requested set.
+
+    ``ceil(rate * total - 1e-9)``, so ``0.5 * 5`` is 3 and ``0.5 * 4`` stays
+    2. ``None`` and non-positive rates require nothing. A rate of 1 requires
+    every requested lineup. ``total`` is the requested portfolio size.
+    """
+    total = int(total)
+    if total <= 0 or rate is None or float(rate) <= 0.0:
+        return 0
+    needed = math.ceil(float(rate) * total - 1e-9)
+    return max(0, min(total, needed))
+
+
+@dataclass(frozen=True)
+class RosterSlot:
+    """One roster seat and the football positions that can sit there."""
+
+    label: str
+    positions: frozenset[str]
+
+
+def classic_roster_slots(
+    flex_positions: Optional[Iterable[str]] = None,
+) -> Tuple[RosterSlot, ...]:
+    """Classic seats. Flex defaults to RB, WR, and TE."""
+    flex = frozenset(
+        str(pos).strip().upper()
+        for pos in (flex_positions or ("RB", "WR", "TE"))
+        if str(pos).strip()
+    )
+    return (
+        RosterSlot("QB", frozenset({"QB"})),
+        RosterSlot("RB", frozenset({"RB"})),
+        RosterSlot("RB", frozenset({"RB"})),
+        RosterSlot("WR", frozenset({"WR"})),
+        RosterSlot("WR", frozenset({"WR"})),
+        RosterSlot("WR", frozenset({"WR"})),
+        RosterSlot("TE", frozenset({"TE"})),
+        RosterSlot("FLEX", flex or frozenset({"RB", "WR", "TE"})),
+        RosterSlot("DST", frozenset({"DST"})),
+    )
+
+
+def showdown_roster_slots(
+    captain_positions: Iterable[str],
+) -> Tuple[RosterSlot, ...]:
+    """One captain seat and five flex seats. Flex accepts every football spot."""
+    captain = frozenset(
+        str(pos).strip().upper() for pos in captain_positions if str(pos).strip()
+    )
+    flex = frozenset({"QB", "RB", "WR", "TE", "K", "DST"})
+    return (
+        RosterSlot("CPT", captain or flex),
+        *(RosterSlot("FLEX", flex) for _ in range(5)),
+    )
+
+
+def _usable_slots(
+    player_positions: Iterable[str],
+    slots: Sequence[RosterSlot],
+) -> frozenset[int]:
+    owned = {str(pos).strip().upper() for pos in player_positions if str(pos).strip()}
+    if not owned:
+        return frozenset()
+    return frozenset(
+        index
+        for index, slot in enumerate(slots)
+        if owned & set(slot.positions)
+    )
+
+
+def _slot_phrase(slots: Sequence[RosterSlot], mask: int) -> str:
+    labels = [slots[index].label for index in range(len(slots)) if mask & (1 << index)]
+    counts = Counter(labels)
+    parts: List[str] = []
+    for label in dict.fromkeys(labels):
+        count = counts[label]
+        parts.append(label if count == 1 else f"{count} {label}")
+    if not parts:
+        return "no roster slots"
+    if len(labels) == 1:
+        return f"the {labels[0]} slot"
+    joined = ", ".join(parts)
+    total = len(labels)
+    if total == len(slots):
+        return f"{total} roster slots"
+    return f"{joined} ({total} slots)"
+
+
+def min_exposure_conflicts(
+    *,
+    needed: Mapping[Identity, int],
+    allowed: Mapping[Identity, Optional[int]],
+    positions: Mapping[Identity, Iterable[str]],
+    slots: Sequence[RosterSlot],
+    requested: int,
+    names: Mapping[Identity, str],
+    teams: Optional[Mapping[Identity, str]] = None,
+) -> Tuple[str, ...]:
+    """Name minimums that cannot fit before the solver runs.
+
+    A player's minimum above that player's max is one conflict. The sum of
+    minimums is another when those players can only sit in a set of seats
+    whose count, times the requested lineups, is smaller. Players with no
+    known position are left out of the seat check so a missing label is not
+    reported as an empty roster.
+    """
+    requested = int(requested)
+    messages: List[str] = []
+    messages.extend(
+        _min_above_max_messages(
+            needed=needed,
+            allowed=allowed,
+            requested=requested,
+            names=names,
+            teams=teams or {},
+        )
+    )
+    if requested <= 0 or not slots:
+        return tuple(messages)
+    messages.extend(
+        _slot_capacity_messages(
+            needed=needed,
+            positions=positions,
+            slots=slots,
+            requested=requested,
+        )
+    )
+    return tuple(messages)
+
+
+def _player_label(
+    key: Identity,
+    names: Mapping[Identity, str],
+    teams: Mapping[Identity, str],
+) -> str:
+    name = names.get(key) or key[0]
+    team = teams.get(key) or key[1]
+    if team:
+        return f"{name} ({team})"
+    return str(name)
+
+
+def _min_above_max_messages(
+    *,
+    needed: Mapping[Identity, int],
+    allowed: Mapping[Identity, Optional[int]],
+    requested: int,
+    names: Mapping[Identity, str],
+    teams: Mapping[Identity, str],
+) -> List[str]:
+    bad: List[Tuple[Identity, int, int]] = []
+    for key, need in needed.items():
+        cap = allowed.get(key)
+        if cap is None:
+            continue
+        if int(need) > int(cap):
+            bad.append((key, int(need), int(cap)))
+    if not bad:
+        return []
+    same_need = {need for _, need, _ in bad}
+    same_cap = {cap for _, _, cap in bad}
+    if len(bad) > 3 and len(same_need) == 1 and len(same_cap) == 1:
+        need = next(iter(same_need))
+        cap = next(iter(same_cap))
+        return [
+            f"Min exposure needs {need} appearances in {requested} requested lineups "
+            f"but max exposure allows {cap}. That minimum is above the max for "
+            f"{len(bad)} players."
+        ]
+    messages = [
+        f"{_player_label(key, names, teams)} min exposure needs {need} appearances "
+        f"but max exposure allows {cap}."
+        for key, need, cap in bad[:6]
+    ]
+    if len(bad) > 6:
+        messages.append(f"And {len(bad) - 6} more players have a minimum above their max.")
+    return messages
+
+
+def _slot_capacity_messages(
+    *,
+    needed: Mapping[Identity, int],
+    positions: Mapping[Identity, Iterable[str]],
+    slots: Sequence[RosterSlot],
+    requested: int,
+) -> List[str]:
+    usable: Dict[Identity, frozenset[int]] = {}
+    for key, need in needed.items():
+        if int(need) <= 0:
+            continue
+        seats = _usable_slots(positions.get(key) or (), slots)
+        if not seats:
+            continue
+        usable[key] = seats
+    if not usable:
+        return []
+    width = len(slots)
+    failures: List[Tuple[int, int, int, int, int]] = []
+    full_mask = (1 << width) - 1
+    exact_masks = {_seat_mask(seats) for seats in usable.values() if seats}
+    for mask in range(1, full_mask + 1):
+        demand = sum(
+            int(needed[key])
+            for key, seats in usable.items()
+            if seats and seats.issubset(_mask_indexes(mask))
+        )
+        capacity = bin(mask).count("1") * requested
+        if demand > capacity:
+            failures.append((demand - capacity, bin(mask).count("1"), mask, demand, capacity))
+    if not failures:
+        return []
+    messages: List[str] = []
+    for _, _, mask, demand, capacity in failures:
+        if mask != full_mask:
+            continue
+        messages.append(
+            f"Min exposure needs {demand} appearances but {requested} lineups "
+            f"have {capacity} roster slots."
+        )
+    # Only the seat sets players actually have. Combined masks restate the same limit.
+    specific = [item for item in failures if item[2] in exact_masks and item[2] != full_mask]
+    specific.sort(key=lambda item: (item[1], -item[0]))
+    for _, _, mask, demand, capacity in specific[:3]:
+        messages.append(
+            "Min exposure needs "
+            f"{demand} appearances from players who can only fill {_slot_phrase(slots, mask)}, "
+            f"but {requested} lineups have {capacity} of those slots."
+        )
+    return messages
+
+
+def _seat_mask(seats: Iterable[int]) -> int:
+    mask = 0
+    for index in seats:
+        mask |= 1 << int(index)
+    return mask
+
+
+def _mask_indexes(mask: int) -> frozenset[int]:
+    return frozenset(index for index in range(mask.bit_length()) if mask & (1 << index))
+
+
+def min_force_groups(
+    positions: Mapping[Identity, Iterable[str]],
+    slots: Sequence[RosterSlot],
+    extra_caps: Sequence[Tuple[Iterable[str], int]] = (),
+) -> Tuple[Tuple[Tuple[Identity, ...], int], ...]:
+    """Position groups whose remaining need can overflow a later batch.
+
+    Each group is the players who can only sit in seats that accept that
+    position set, plus the number of those seats in one lineup. Extra caps
+    (a kicker limit, a defense limit) tighten a position the seats alone
+    would leave open.
+    """
+    normalized = {
+        key: frozenset(str(pos).strip().upper() for pos in (owned or ()) if str(pos).strip())
+        for key, owned in positions.items()
+    }
+    tokens: set[str] = set()
+    for owned in normalized.values():
+        tokens |= set(owned)
+    position_sets: List[frozenset[str]] = [frozenset({token}) for token in sorted(tokens)]
+    skill = frozenset({"RB", "WR", "TE"}) & tokens
+    if len(skill) >= 2:
+        position_sets.append(skill)
+        ordered = tuple(sorted(skill))
+        for left in range(len(ordered)):
+            for right in range(left + 1, len(ordered)):
+                position_sets.append(frozenset({ordered[left], ordered[right]}))
+    if tokens:
+        position_sets.append(frozenset(tokens))
+    groups: List[Tuple[Tuple[Identity, ...], int]] = []
+    seen: set[frozenset[Identity]] = set()
+    for position_set in position_sets:
+        members = tuple(
+            key
+            for key, owned in normalized.items()
+            if owned and owned <= position_set
+        )
+        member_set = frozenset(members)
+        if not member_set or member_set in seen:
+            continue
+        if position_set >= tokens and tokens:
+            capacity = len(slots)
+        else:
+            capacity = sum(1 for slot in slots if set(slot.positions) & set(position_set))
+        if capacity <= 0:
+            continue
+        seen.add(member_set)
+        groups.append((members, capacity))
+    for token_set, cap in extra_caps:
+        limited = frozenset(str(pos).strip().upper() for pos in token_set if str(pos).strip())
+        if not limited or int(cap) < 0:
+            continue
+        members = tuple(
+            key for key, owned in normalized.items() if owned & limited
+        )
+        if not members:
+            continue
+        groups.append((members, int(cap)))
+    return tuple(groups)
 
 
 def position_tokens(value: object) -> set[str]:
@@ -357,11 +682,9 @@ def explain_shortfall(
                 f"already stack in {allowed} of {requested} requested lineups."
             )
 
-    if min_exposure is not None:
-        candidates.append(
-            f"Min exposure {float(min_exposure) * 100:.0f}% is active on each solver batch. "
-            "It was not isolated as the cause."
-        )
+    # A lineup-count shortfall does not guess that a minimum caused it.
+    # evaluate_min_exposure names anyone still under the requested minimum.
+    _ = min_exposure
 
     notes = [str(name) for name in solver_constraints if str(name).strip()]
     message = _shortfall_message(requested, built, proven, candidates, notes)
@@ -427,7 +750,7 @@ def _shortfall_message(
 
 @dataclass
 class PortfolioRuleState:
-    """Mutable counters the identity rule reads while pydfs solves one batch."""
+    """Mutable counters the portfolio rules read while pydfs solves one batch."""
 
     portfolio_size: int
     overlap_cap: Optional[int]
@@ -436,6 +759,16 @@ class PortfolioRuleState:
     allowance: Dict[Identity, int]
     prior_used: Dict[Identity, int]
     prior_history: List[set[Identity]]
+    # Remaining appearances still required from this batch forward, after the
+    # max has already capped anything a minimum is not allowed to exceed.
+    min_remaining: Dict[Identity, int] = field(default_factory=dict)
+    min_groups: Tuple[Tuple[Tuple[Identity, ...], int], ...] = ()
+    min_after: int = 0
+    min_batch: int = 0
+    min_relax: bool = False
+    # Lower priority is forced first when several players are equally behind.
+    min_priority: Dict[Identity, float] = field(default_factory=dict)
+    min_roster: int = 0
 
 
 class PortfolioIdentityRule(OptimizerRule):
@@ -504,16 +837,235 @@ class PortfolioIdentityRule(OptimizerRule):
         self.history.append(seen)
 
 
+class PortfolioMinExposureRule(OptimizerRule):
+    """Hold identity minimums for the lineups still left in the portfolio.
+
+    A player is required in this lineup when the appearances still needed are
+    at least the lineups still to build, including batches that have not
+    started. A position group is required only for the overflow that cannot
+    fit after this lineup. ``min_relax`` records usage and adds no constraint,
+    which is how an impossible reserved set gets out of the way without
+    raising a max.
+    """
+
+    def __init__(self, optimizer, players_dict, context):
+        super().__init__(optimizer, players_dict, context)
+        state: PortfolioRuleState = optimizer._portfolio_limits
+        self.need: Counter[Identity] = Counter(
+            {key: int(count) for key, count in state.min_remaining.items() if int(count) > 0}
+        )
+        self.after = int(state.min_after)
+        self.batch_left = int(state.min_batch)
+        self.relax = bool(state.min_relax)
+        self.groups = tuple(state.min_groups)
+        self.priority = dict(state.min_priority)
+        self.roster = int(state.min_roster)
+        self.variables: Dict[Identity, list] = {}
+        for player, variable in players_dict.items():
+            key = person_key(player.full_name, player.team)
+            self.variables.setdefault(key, []).append(variable)
+
+    def apply_for_iteration(self, solver, result):
+        if result is not None:
+            self._record(result)
+            self.batch_left -= 1
+        if self.relax or self.batch_left <= 0 or not self.need:
+            return
+        portfolio_left = self.batch_left + self.after
+        if portfolio_left <= 0:
+            return
+        due = [
+            key
+            for key, need in self.need.items()
+            if need >= portfolio_left and need > 0 and self.variables.get(key)
+        ]
+        due.extend(self._overflow_players(portfolio_left, set(due)))
+        forced = 0
+        for key in dict.fromkeys(due):
+            variables = self.variables.get(key) or []
+            if not variables:
+                continue
+            solver.add_constraint(
+                variables,
+                None,
+                SolverSign.GTE,
+                1,
+                name=f"portfolio_min_{forced}",
+            )
+            forced += 1
+        for index, (members, slots) in enumerate(self.groups):
+            demand = sum(int(self.need.get(key, 0)) for key in members)
+            if demand <= 0:
+                continue
+            overflow = demand - int(slots) * (portfolio_left - 1)
+            if overflow <= 0:
+                continue
+            variables = []
+            active = 0
+            for key in members:
+                if int(self.need.get(key, 0)) <= 0:
+                    continue
+                owned = self.variables.get(key) or []
+                if not owned:
+                    continue
+                variables.extend(owned)
+                active += 1
+            force = min(int(overflow), int(slots), active)
+            if force <= 0 or not variables:
+                continue
+            solver.add_constraint(
+                variables,
+                None,
+                SolverSign.GTE,
+                force,
+                name=f"portfolio_min_group_{index}",
+            )
+
+    def _overflow_players(self, portfolio_left: int, already: set) -> List[Identity]:
+        """Players who have to start now or the seats ahead cannot hold the need.
+
+        Ties go to the lower projection so a punt is not left until the last
+        lineup, where stars who are equally behind would crowd it out.
+        """
+        if self.roster <= 0 or portfolio_left <= 0:
+            return []
+        active = [
+            key
+            for key, need in self.need.items()
+            if need > 0 and self.variables.get(key)
+        ]
+        demand = sum(int(self.need[key]) for key in active)
+        overflow = demand - self.roster * (portfolio_left - 1)
+        if overflow <= 0:
+            return []
+        ranked = sorted(
+            active,
+            key=lambda key: (-int(self.need[key]), self.priority.get(key, 0.0), key),
+        )
+        chosen: List[Identity] = []
+        room = min(int(overflow), self.roster)
+        for key in ranked:
+            if key in already:
+                room -= 1
+                if room <= 0:
+                    break
+                continue
+            chosen.append(key)
+            room -= 1
+            if room <= 0:
+                break
+        return chosen
+
+    def _record(self, lineup) -> None:
+        seen: set[Identity] = set()
+        for player in lineup:
+            key = person_key(player.full_name, player.team)
+            if not key[0] or key in seen:
+                continue
+            seen.add(key)
+            if self.need.get(key, 0) > 0:
+                self.need[key] -= 1
+
+
+@dataclass(frozen=True)
+class MinExposureResult:
+    """Portfolio minimums for one export.
+
+    ``conflicts`` are obvious impossibilities known before the solve.
+    ``unmet`` names players whose final count is still below the requested
+    minimum. ``rows`` feed the exposure table.
+    """
+
+    requested: int
+    conflicts: Tuple[str, ...]
+    unmet: Tuple[str, ...]
+    message: str
+    rows: Tuple[Mapping[str, object], ...]
+
+
+def evaluate_min_exposure(
+    lineups: Sequence[pd.DataFrame],
+    *,
+    needed: Mapping[Identity, int],
+    allowed: Mapping[Identity, Optional[int]],
+    positions: Mapping[Identity, Iterable[str]],
+    slots: Sequence[RosterSlot],
+    requested: int,
+    names: Mapping[Identity, str],
+    teams: Optional[Mapping[Identity, str]] = None,
+    position_labels: Optional[Mapping[Identity, str]] = None,
+) -> MinExposureResult:
+    """Compare the export with each identity's requested minimum."""
+    requested = int(requested)
+    team_labels = dict(teams or {})
+    conflicts = min_exposure_conflicts(
+        needed=needed,
+        allowed=allowed,
+        positions=positions,
+        slots=slots,
+        requested=requested,
+        names=names,
+        teams=team_labels,
+    )
+    counts = exposure_counts(lineups)
+    labels = dict(position_labels or {})
+    unmet: List[str] = []
+    rows: List[dict] = []
+    for key, need in sorted(needed.items(), key=lambda item: (names.get(item[0]) or item[0][0], item[0][1])):
+        count = int(counts.get(key, 0))
+        required = int(need)
+        if required <= 0:
+            continue
+        label = _player_label(key, names, team_labels)
+        if count < required:
+            unmet.append(f"{label} is in {count} of {required} required lineups")
+        rows.append(
+            {
+                "Name": names.get(key) or key[0],
+                "Team": team_labels.get(key) or key[1],
+                "Position": labels.get(key) or "/".join(sorted(positions.get(key) or ())),
+                "needed": required,
+            }
+        )
+    message = _min_result_message(conflicts, unmet)
+    return MinExposureResult(
+        requested=requested,
+        conflicts=tuple(conflicts),
+        unmet=tuple(unmet),
+        message=message,
+        rows=tuple(rows),
+    )
+
+
+def _min_result_message(conflicts: Sequence[str], unmet: Sequence[str]) -> str:
+    parts: List[str] = []
+    if conflicts:
+        parts.append("Min exposure cannot all be met. " + " ".join(conflicts))
+    if unmet:
+        shown = list(unmet[:8])
+        text = "Unmet minimums: " + "; ".join(shown)
+        extra = len(unmet) - len(shown)
+        if extra > 0:
+            text += f"; and {extra} more"
+        parts.append(text + ".")
+    return " ".join(parts)
+
+
 def exposure_report_frame(
     lineups: Sequence[pd.DataFrame],
     requested: Optional[int] = None,
+    min_players: Optional[Sequence[Mapping[str, object]]] = None,
 ) -> pd.DataFrame:
     """One row per real player. This is not a DraftKings upload file.
 
     ``Lineups`` is the count. ``Exported %`` divides by the lineups that were
     built. ``Requested %`` divides by the number the user asked for, so a
-    short export does not look like a higher cap.
+    short export does not look like a higher cap. ``min_players`` adds
+    ``Min needed`` and ``Min met`` and keeps a targeted player who was never
+    rostered. Without that argument the columns stay as they are when no
+    minimum is set.
     """
+    min_rows = [dict(row) for row in (min_players or [])]
     columns = ["Name", "Team", "Position", "Lineups", "Exported %", "Requested %"]
     exported = len(lineups)
     requested_n = exported if requested is None else max(0, int(requested))
@@ -534,7 +1086,9 @@ def exposure_report_frame(
             "Exported %",
             "Requested %",
         ]
-    if exported == 0:
+    if min_rows:
+        columns = [*columns, "Min needed", "Min met"]
+    if exported == 0 and not min_rows:
         return pd.DataFrame(columns=columns)
 
     per_lineup: List[dict] = []
@@ -563,39 +1117,135 @@ def exposure_report_frame(
                 }
             )
     if not per_lineup:
-        return pd.DataFrame(columns=columns)
-    frame = pd.DataFrame(per_lineup)
-    grouped = (
-        frame.groupby(["key", "Name", "Team", "Position"], as_index=False)
-        .agg(Lineups=("key", "size"), **(
-            {"CPT count": ("slot", lambda s: int(s.eq("CPT").sum())),
-             "FLEX count": ("slot", lambda s: int(s.eq("FLEX").sum()))}
-            if show_slots
-            else {}
-        ))
-    )
-    grouped["Exported %"] = (grouped["Lineups"] / exported * 100).round(1)
+        grouped = pd.DataFrame(
+            columns=["key", "Name", "Team", "Position", "Lineups", "CPT count", "FLEX count"]
+        )
+    else:
+        frame = pd.DataFrame(per_lineup)
+        grouped = (
+            frame.groupby(["key", "Name", "Team", "Position"], as_index=False)
+            .agg(Lineups=("key", "size"), **(
+                {"CPT count": ("slot", lambda s: int(s.eq("CPT").sum())),
+                 "FLEX count": ("slot", lambda s: int(s.eq("FLEX").sum()))}
+                if show_slots
+                else {}
+            ))
+        )
+    if min_rows:
+        grouped = _apply_min_targets(
+            grouped,
+            min_rows,
+            show_slots=show_slots,
+            exported=exported,
+            requested_n=requested_n,
+        )
+    else:
+        if exported:
+            grouped["Exported %"] = (grouped["Lineups"] / exported * 100).round(1)
+        else:
+            grouped["Exported %"] = 0.0
+        if requested_n:
+            grouped["Requested %"] = (grouped["Lineups"] / requested_n * 100).round(1)
+        else:
+            grouped["Requested %"] = 0.0
+        grouped = grouped.sort_values(
+            ["Lineups", "Name"], ascending=[False, True], kind="mergesort"
+        ).reset_index(drop=True)
+    return grouped[columns]
+
+
+def _apply_min_targets(
+    grouped: pd.DataFrame,
+    min_rows: Sequence[Mapping[str, object]],
+    *,
+    show_slots: bool,
+    exported: int,
+    requested_n: int,
+) -> pd.DataFrame:
+    """Add minimum columns and players who were targeted but never rostered."""
+    needed: Dict[Identity, int] = {}
+    meta: Dict[Identity, Mapping[str, object]] = {}
+    for row in min_rows:
+        key = person_key(row.get("Name"), row.get("Team"))
+        if not key[0]:
+            continue
+        needed[key] = int(row.get("needed") or 0)
+        meta[key] = row
+    if grouped.empty:
+        grouped = pd.DataFrame(columns=["key", "Name", "Team", "Position", "Lineups"])
+    present = set(grouped["key"]) if "key" in grouped.columns else set()
+    extras = []
+    for key, row in meta.items():
+        if key in present:
+            continue
+        extra = {
+            "key": key,
+            "Name": str(row.get("Name") or "").strip(),
+            "Team": str(row.get("Team") or "").strip(),
+            "Position": _football_position(row.get("Position")),
+            "Lineups": 0,
+        }
+        if show_slots:
+            extra["CPT count"] = 0
+            extra["FLEX count"] = 0
+        extras.append(extra)
+    if extras:
+        grouped = pd.concat([grouped, pd.DataFrame(extras)], ignore_index=True)
+    grouped["Lineups"] = grouped["Lineups"].fillna(0).astype(int)
+    if show_slots:
+        for column in ("CPT count", "FLEX count"):
+            if column not in grouped.columns:
+                grouped[column] = 0
+            grouped[column] = grouped[column].fillna(0).astype(int)
+    if exported:
+        grouped["Exported %"] = (grouped["Lineups"] / exported * 100).round(1)
+    else:
+        grouped["Exported %"] = 0.0
     if requested_n:
         grouped["Requested %"] = (grouped["Lineups"] / requested_n * 100).round(1)
     else:
         grouped["Requested %"] = 0.0
-    grouped = grouped.sort_values(
-        ["Lineups", "Name"], ascending=[False, True], kind="mergesort"
-    ).reset_index(drop=True)
-    return grouped[columns]
+
+    def _met(key: Identity, count: int) -> str:
+        if key not in needed:
+            return ""
+        required = needed[key]
+        state = "Yes" if int(count) >= required else "No"
+        return f"{state} ({int(count)} of {required})"
+
+    grouped["Min needed"] = grouped["key"].map(lambda key: needed.get(key, pd.NA))
+    grouped["Min met"] = [
+        _met(key, count) for key, count in zip(grouped["key"], grouped["Lineups"])
+    ]
+    grouped["_unmet"] = grouped["Min met"].astype(str).str.startswith("No")
+    return (
+        grouped.sort_values(
+            ["_unmet", "Lineups", "Name"],
+            ascending=[False, False, True],
+            kind="mergesort",
+        )
+        .drop(columns=["_unmet"])
+        .reset_index(drop=True)
+    )
 
 
 def exposure_report_csv(
     lineups: Sequence[pd.DataFrame],
     requested: Optional[int] = None,
+    min_players: Optional[Sequence[Mapping[str, object]]] = None,
 ) -> str:
     """Exposure summary CSV.
 
     DraftKings rejects extra columns on the upload file, so exposure stays in
     this separate report. Showdown captain and flex rows are one player.
     ``Exported %`` uses the built set. ``Requested %`` uses ``requested``.
+    Minimum columns are present only when ``min_players`` is passed.
     """
-    return exposure_report_frame(lineups, requested=requested).to_csv(index=False)
+    return exposure_report_frame(
+        lineups,
+        requested=requested,
+        min_players=min_players,
+    ).to_csv(index=False)
 
 
 def _football_position(value: object) -> str:
