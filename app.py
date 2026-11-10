@@ -43,6 +43,12 @@ from src.env_config import (
     load_env,
 )
 from src.exporter import lineups_to_dk_upload_csv, upload_columns_for
+from src.lineup_rules import (
+    construction_check_frame,
+    construction_problem_messages,
+    normalize_spreads,
+)
+from src.lineup_rules import ConstructionSettings as _ConstructionSettings
 from src.optimizer import (
     DK_SALARY_CAP,
     SHOWDOWN_QB_MIN_PROJECTION,
@@ -333,6 +339,195 @@ def _game_script_buckets(preset: ContestPreset, lineup_count: int) -> List[GameS
     ]
 
 
+def _construction_controls(
+    preset: ContestPreset,
+    preset_cfg: PresetConfig,
+) -> Tuple[Dict[str, Any], List[str]]:
+    """On/off controls for the Large-Field lineup rules. Other presets default them off."""
+    st.markdown("**Lineup construction**")
+    st.caption(
+        "These rules choose who can share a lineup. They do not change a projection. "
+        "A defense counts toward the players from the quarterback's game. "
+        "It is never a pass catcher and never a bring-back."
+    )
+    primary_stack = st.checkbox(
+        "Primary stack",
+        value=bool(preset_cfg.primary_stack),
+        key=_preset_key(preset, "primary_stack"),
+        help=(
+            "The lineup has a quarterback, at least N of his team's WR/TE, and at least M "
+            "RB/WR/TE from the opposing team. The players from that game, including a DST "
+            "from either team, stay inside the min and max."
+        ),
+    )
+    pass_catchers = st.number_input(
+        "Pass catchers with the QB",
+        min_value=0,
+        max_value=4,
+        value=int(preset_cfg.primary_pass_catchers),
+        step=1,
+        disabled=not primary_stack,
+        key=_preset_key(preset, "primary_pass_catchers"),
+        help="At least this many WR/TE from the quarterback's team. A defense does not count.",
+    )
+    bring_backs = st.number_input(
+        "Bring-backs from the opposing team",
+        min_value=0,
+        max_value=4,
+        value=int(preset_cfg.primary_bring_backs),
+        step=1,
+        disabled=not primary_stack,
+        key=_preset_key(preset, "primary_bring_backs"),
+        help="At least this many RB, WR, or TE from the other team in the quarterback's game.",
+    )
+    game_min = st.number_input(
+        "Players from the QB's game (min)",
+        min_value=1,
+        max_value=9,
+        value=int(preset_cfg.primary_game_min),
+        step=1,
+        disabled=not primary_stack,
+        key=_preset_key(preset, "primary_game_min"),
+        help="Counts every player from either team in that game, including the defense.",
+    )
+    game_max = st.number_input(
+        "Players from the QB's game (max)",
+        min_value=1,
+        max_value=9,
+        value=int(preset_cfg.primary_game_max),
+        step=1,
+        disabled=not primary_stack,
+        key=_preset_key(preset, "primary_game_max"),
+        help="The defense counts toward this maximum. It is still not a pass catcher or a bring-back.",
+    )
+    bring_back_wr1 = st.checkbox(
+        "Bring-back must be the opposing WR1 (highest salary)",
+        value=bool(preset_cfg.primary_bring_back_wr1),
+        disabled=not primary_stack,
+        key=_preset_key(preset, "primary_bring_back_wr1"),
+        help=(
+            "WR1 is the highest-salary wide receiver on the opposing team. "
+            "A salary tie counts, so every WR at that salary qualifies. "
+            "This uses DraftKings salary, not the projection."
+        ),
+    )
+    mini_stack = st.checkbox(
+        "Secondary mini-stack",
+        value=bool(preset_cfg.mini_stack),
+        key=_preset_key(preset, "mini_stack"),
+        help=(
+            "A two-player same-game stack is at least two offensive players "
+            "(QB, RB, WR, or TE) from one game other than the quarterback's game. "
+            "Teammates count, and so do players on opposite sides of that game. "
+            "Each game counts once. A defense does not count toward the two players."
+        ),
+    )
+    mini_count = st.number_input(
+        "Extra two-player same-game stacks",
+        min_value=0,
+        max_value=2,
+        value=int(preset_cfg.mini_stack_count),
+        step=1,
+        disabled=not mini_stack,
+        key=_preset_key(preset, "mini_stack_count"),
+        help="How many games besides the quarterback's game must supply two offensive players.",
+    )
+    rb_dst = st.checkbox(
+        "RB + own DST for a big favorite",
+        value=bool(preset_cfg.rb_dst_favorite),
+        key=_preset_key(preset, "rb_dst_favorite"),
+        help=(
+            "The lineup's defense must come with a running back from the same team, "
+            "and that team must be favored by at least the margin below on the Vegas spread. "
+            "Exactly the margin counts. A missing spread does not, and is not filled in."
+        ),
+    )
+    favorite_margin = st.number_input(
+        "Favorite margin (points)",
+        min_value=0.0,
+        max_value=30.0,
+        value=float(preset_cfg.favorite_margin),
+        step=0.5,
+        disabled=not rb_dst,
+        key=_preset_key(preset, "favorite_margin"),
+        help="The team's own spread must be this many points or more in its favor. Exactly this number counts.",
+    )
+    ban_dogs = st.checkbox(
+        "Restrict underdog RBs",
+        value=bool(preset_cfg.ban_underdog_rbs),
+        key=_preset_key(preset, "ban_underdog_rbs"),
+        help=(
+            "Leave running backs off teams that are underdogs by at least the margin below. "
+            "This only removes them from the lineup. It does not change a projection. "
+            "Exactly the margin is excluded. A missing spread is not. A locked running back stays."
+        ),
+    )
+    underdog_margin = st.number_input(
+        "Underdog margin (points)",
+        min_value=0.0,
+        max_value=30.0,
+        value=float(preset_cfg.underdog_margin),
+        step=0.5,
+        disabled=not ban_dogs,
+        key=_preset_key(preset, "underdog_margin"),
+        help="A team dog by exactly this many points loses its running backs. One point less does not.",
+    )
+    settings = _ConstructionSettings(
+        primary_stack=bool(primary_stack),
+        pass_catchers=int(pass_catchers),
+        bring_backs=int(bring_backs),
+        game_min=int(game_min),
+        game_max=int(game_max),
+        bring_back_wr1=bool(bring_back_wr1),
+        mini_stack=bool(mini_stack),
+        mini_count=int(mini_count),
+        rb_dst_favorite=bool(rb_dst),
+        favorite_margin=float(favorite_margin),
+        ban_underdog_rbs=bool(ban_dogs),
+        underdog_margin=float(underdog_margin),
+    )
+    for message in construction_problem_messages(settings):
+        st.warning(message)
+    overrides = {
+        "primary_stack": settings.primary_stack,
+        "primary_pass_catchers": settings.pass_catchers,
+        "primary_bring_backs": settings.bring_backs,
+        "primary_game_min": settings.game_min,
+        "primary_game_max": settings.game_max,
+        "primary_bring_back_wr1": settings.bring_back_wr1,
+        "mini_stack": settings.mini_stack,
+        "mini_stack_count": settings.mini_count,
+        "rb_dst_favorite": settings.rb_dst_favorite,
+        "favorite_margin": settings.favorite_margin,
+        "ban_underdog_rbs": settings.ban_underdog_rbs,
+        "underdog_margin": settings.underdog_margin,
+    }
+    changed: List[str] = []
+    if settings.primary_stack != bool(preset_cfg.primary_stack):
+        changed.append("Primary stack")
+    elif settings.primary_stack and (
+        settings.pass_catchers != int(preset_cfg.primary_pass_catchers)
+        or settings.bring_backs != int(preset_cfg.primary_bring_backs)
+        or settings.game_min != int(preset_cfg.primary_game_min)
+        or settings.game_max != int(preset_cfg.primary_game_max)
+        or settings.bring_back_wr1 != bool(preset_cfg.primary_bring_back_wr1)
+    ):
+        changed.append("Primary stack")
+    if settings.mini_stack != bool(preset_cfg.mini_stack):
+        changed.append("Secondary mini-stack")
+    elif settings.mini_stack and settings.mini_count != int(preset_cfg.mini_stack_count):
+        changed.append("Secondary mini-stack")
+    if settings.rb_dst_favorite != bool(preset_cfg.rb_dst_favorite):
+        changed.append("Favorite RB + DST")
+    elif settings.rb_dst_favorite and float(settings.favorite_margin) != float(preset_cfg.favorite_margin):
+        changed.append("Favorite RB + DST")
+    if settings.ban_underdog_rbs != bool(preset_cfg.ban_underdog_rbs):
+        changed.append("Underdog RB restriction")
+    elif settings.ban_underdog_rbs and float(settings.underdog_margin) != float(preset_cfg.underdog_margin):
+        changed.append("Underdog RB restriction")
+    return overrides, changed
+
+
 def _collect_strategy_overrides(
     contest_format: ContestFormat,
     preset: ContestPreset,
@@ -486,6 +681,9 @@ def _collect_strategy_overrides(
             preset_cfg.flex_positions
         ):
             changed.append("Flex")
+        construction_overrides, construction_changed = _construction_controls(preset, preset_cfg)
+        overrides.update(construction_overrides)
+        changed.extend(construction_changed)
     else:
         min_default = int(preset_cfg.min_salary_cap or 0)
         max_default = int(preset_cfg.max_salary_cap or DK_SALARY_CAP)
@@ -769,6 +967,19 @@ def _apply_strategy_overrides(optimizer: Any, overrides: Dict[str, Any]) -> None
         optimizer.exclude_vs_dst = overrides["exclude_vs_dst"]
     if "flex_positions" in overrides and hasattr(optimizer, "flex_positions"):
         optimizer.flex_positions = overrides["flex_positions"]
+    if "primary_stack" in overrides and hasattr(optimizer, "primary_stack"):
+        optimizer.primary_stack = bool(overrides["primary_stack"])
+        optimizer.primary_pass_catchers = int(overrides["primary_pass_catchers"])
+        optimizer.primary_bring_backs = int(overrides["primary_bring_backs"])
+        optimizer.primary_game_min = int(overrides["primary_game_min"])
+        optimizer.primary_game_max = int(overrides["primary_game_max"])
+        optimizer.primary_bring_back_wr1 = bool(overrides["primary_bring_back_wr1"])
+        optimizer.mini_stack = bool(overrides["mini_stack"])
+        optimizer.mini_stack_count = int(overrides["mini_stack_count"])
+        optimizer.rb_dst_favorite = bool(overrides["rb_dst_favorite"])
+        optimizer.favorite_margin = float(overrides["favorite_margin"])
+        optimizer.ban_underdog_rbs = bool(overrides["ban_underdog_rbs"])
+        optimizer.underdog_margin = float(overrides["underdog_margin"])
 
     if "min_salary_cap" in overrides and hasattr(optimizer, "configure_showdown_rules"):
         optimizer.configure_showdown_rules(
@@ -1904,6 +2115,8 @@ if generate:
             jitter_seed=int(jitter_seed),
         )
         _apply_strategy_overrides(optimizer, strategy_overrides)
+        if hasattr(optimizer, "set_vegas_spreads"):
+            optimizer.set_vegas_spreads(normalize_spreads(solve_lines))
         if confirmed_qb_keys is not None and hasattr(optimizer, "set_confirmed_quarterbacks"):
             optimizer.set_confirmed_quarterbacks(confirmed_qb_keys)
         if solve_low_total and preset is not ContestPreset.SHOWDOWN_CASH:
@@ -1954,6 +2167,12 @@ if generate:
         min_report = getattr(optimizer, "last_min_report", None)
         if min_report is not None and min_report.message:
             limit_parts.append(min_report.message)
+        construction_report = getattr(optimizer, "last_construction_report", None)
+        if construction_report is not None and construction_report.message:
+            limit_parts.append(construction_report.message)
+        construction_applied = (
+            None if construction_report is None else construction_report.applied
+        )
         limit_message = " ".join(limit_parts) if limit_parts else None
         min_players = list(min_report.rows) if min_report is not None else None
         st.session_state.lineups = generated
@@ -1965,6 +2184,10 @@ if generate:
             "limit_message": limit_message,
             "min_players": min_players,
             "requested": int(lineup_count),
+            "construction_applied": construction_applied,
+            "construction_spreads": (
+                dict(getattr(optimizer, "vegas_spreads", {}) or {})
+            ),
         }
         override_note = (
             f" (overrides: {', '.join(all_changed)})" if all_changed else ""
@@ -2141,6 +2364,24 @@ if lineups:
                 ),
             },
         )
+        applied_rules = (used or {}).get("construction_applied") if used else None
+        if applied_rules is not None and applied_rules.any_enabled:
+            st.markdown("#### Lineup construction")
+            st.caption(
+                "A defense counts toward the quarterback's game total and is never a pass catcher "
+                "or a bring-back. A two-player same-game stack is two offensive players "
+                "(QB, RB, WR, or TE) from another game. WR1 is the highest-salary WR on the opposing team."
+            )
+            st.dataframe(
+                construction_check_frame(
+                    lineups,
+                    applied_rules,
+                    pool=pool,
+                    spreads=(used or {}).get("construction_spreads") or {},
+                ),
+                width="stretch",
+                hide_index=True,
+            )
 
     def _lineup_label(i: int) -> str:
         lu = lineups[i]
