@@ -2,7 +2,8 @@
 
 Weather adjustments use the **home** team's stadium. Enclosed / retractable
 roofs are treated as non-outdoor so wind downgrades are skipped (assume roof
-closed for DFS purposes). SoFi (LAR/LAC) is open-air and counted as outdoor.
+closed for DFS purposes). SoFi (LAR/LAC) has a fixed translucent roof canopy
+and is ``fixed_roof``.
 """
 
 from __future__ import annotations
@@ -176,8 +177,8 @@ STADIUMS: Dict[str, Stadium] = {
         "Inglewood, CA",
         33.9535,
         -118.3392,
-        True,
-        "outdoor",
+        False,
+        "fixed_roof",
     ),
     "LAR": Stadium(
         "SoFi Stadium",
@@ -185,8 +186,8 @@ STADIUMS: Dict[str, Stadium] = {
         "Inglewood, CA",
         33.9535,
         -118.3392,
-        True,
-        "outdoor",
+        False,
+        "fixed_roof",
     ),
     "LV": Stadium(
         "Allegiant Stadium",
