@@ -17,6 +17,8 @@ from pydfs_lineup_optimizer.settings import LineupPosition
 from pydfs_lineup_optimizer.solvers.constants import SolverSign
 from pydfs_lineup_optimizer.stacks import PlayersGroup, PositionsStack
 
+from .identity import install_person_uniqueness
+from .names import player_person_key
 from .parser import drop_inactive_players, is_inactive_injury, parse_dk_csv
 from .portfolio import (
     PortfolioIdentityRule,
@@ -142,6 +144,10 @@ def unique_quarterbacks(df: pd.DataFrame) -> pd.DataFrame:
         return empty
     qbs["Name"] = qbs["Name"].astype(str).str.strip()
     qbs["TeamAbbrev"] = qbs["TeamAbbrev"].astype(str).str.strip().str.upper()
+    qbs["_person"] = [
+        person_key(name, team, "QB")
+        for name, team in zip(qbs["Name"], qbs["TeamAbbrev"])
+    ]
     listed = pd.to_numeric(qbs[proj_col], errors="coerce")
     if "Sleeper" in qbs.columns:
         sleeper = pd.to_numeric(qbs["Sleeper"], errors="coerce")
@@ -165,7 +171,7 @@ def unique_quarterbacks(df: pd.DataFrame) -> pd.DataFrame:
     if "Sleeper" in qbs.columns:
         has_sleeper = (
             sleeper.notna()
-            .groupby([qbs["Name"], qbs["TeamAbbrev"]])
+            .groupby(qbs["_person"])
             .transform("any")
         )
         qbs.loc[has_sleeper.to_numpy() & sleeper.isna().to_numpy(), "Projection"] = pd.NA
@@ -178,8 +184,13 @@ def unique_quarterbacks(df: pd.DataFrame) -> pd.DataFrame:
         depth_pos = qbs["DepthPosition"].astype(str).str.strip().str.upper()
         qbs.loc[~depth_pos.eq("QB"), "DepthOrder"] = pd.NA
     grouped = (
-        qbs.groupby(["Name", "TeamAbbrev"], as_index=False)
-        .agg(Projection=("Projection", "max"), DepthOrder=("DepthOrder", "min"))
+        qbs.groupby("_person", as_index=False)
+        .agg(
+            Name=("Name", "first"),
+            TeamAbbrev=("TeamAbbrev", "first"),
+            Projection=("Projection", "max"),
+            DepthOrder=("DepthOrder", "min"),
+        )
         .sort_values(["Projection", "Name"], ascending=[False, True])
         .reset_index(drop=True)
     )
@@ -248,7 +259,12 @@ def _one_row_per_player(pool: pd.DataFrame) -> pd.DataFrame:
             frame = frame.loc[flex].copy()
     frame["Name"] = frame["Name"].astype(str).str.strip()
     frame["TeamAbbrev"] = frame["TeamAbbrev"].astype(str).str.strip().str.upper()
-    return frame.drop_duplicates(["Name", "TeamAbbrev"], keep="first")
+    positions = frame["Position"] if "Position" in frame.columns else [None] * len(frame)
+    frame["_person"] = [
+        person_key(name, team, position)
+        for name, team, position in zip(frame["Name"], frame["TeamAbbrev"], positions)
+    ]
+    return frame.drop_duplicates("_person", keep="first").drop(columns="_person")
 
 
 def _starters_at(
@@ -261,14 +277,11 @@ def _starters_at(
     if group.empty:
         return []
     if confirmed is not None and position == "QB":
-        allowed = {
-            (str(name).strip().casefold(), str(team).strip().upper())
-            for name, team in confirmed
-        }
+        allowed = {person_key(name, team, "QB") for name, team in confirmed}
         keys = [
             (str(row.Name).strip(), str(row.TeamAbbrev).strip().upper())
             for row in group.itertuples(index=False)
-            if (str(row.Name).strip().casefold(), str(row.TeamAbbrev).strip().upper()) in allowed
+            if person_key(row.Name, row.TeamAbbrev, "QB") in allowed
         ]
         return list(dict.fromkeys(keys))
     chosen: List[Tuple[str, str]] = []
@@ -869,7 +882,7 @@ class BaseNFLOptimizer:
                 positions = set(getattr(player, "original_positions", None) or ())
                 if "K" not in positions and "K" not in _player_positions(player):
                     continue
-                key = person_key(player.full_name, player.team)
+                key = player_person_key(player)
                 if default_allowed is None:
                     allowance[key] = kicker_allowed
                 else:
@@ -921,7 +934,7 @@ class BaseNFLOptimizer:
             else appearances_allowed(float(kicker_rate), portfolio_size)
         )
         for player in players:
-            key = person_key(player.full_name, player.team)
+            key = player_person_key(player)
             remaining_caps: List[int] = []
             if default_allowed is not None:
                 remaining_caps.append(int(default_allowed) - int(used.get(key, 0)))
@@ -989,8 +1002,9 @@ class BaseNFLOptimizer:
         found: List[tuple] = []
         seen = set()
         teams = frame[team_col] if team_col in frame.columns else [""] * len(frame)
-        for name, team in zip(frame["Name"], teams):
-            key = person_key(name, team)
+        positions = frame["Position"] if "Position" in frame.columns else [None] * len(frame)
+        for name, team, position in zip(frame["Name"], teams, positions):
+            key = person_key(name, team, position)
             if not key[0] or key in seen:
                 continue
             seen.add(key)
@@ -1006,7 +1020,11 @@ class BaseNFLOptimizer:
         for _, row in frame.iterrows():
             if str(row.get("ID")) not in self.locked_player_ids:
                 continue
-            key = person_key(row.get("Name"), row.get(team_col) if team_col in frame.columns else "")
+            key = person_key(
+                row.get("Name"),
+                row.get(team_col) if team_col in frame.columns else "",
+                row.get("Position"),
+            )
             if key[0] and key not in found:
                 found.append(key)
         return found
@@ -1023,8 +1041,9 @@ class BaseNFLOptimizer:
             return names
         team_col = "TeamAbbrev" if "TeamAbbrev" in frame.columns else "Team"
         teams = frame[team_col] if team_col in frame.columns else [""] * len(frame)
-        for name, team in zip(frame["Name"], teams):
-            key = person_key(name, team)
+        positions = frame["Position"] if "Position" in frame.columns else [None] * len(frame)
+        for name, team, position in zip(frame["Name"], teams, positions):
+            key = person_key(name, team, position)
             names.setdefault(key, str(name).strip())
         return names
 
@@ -1296,6 +1315,7 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
 
     def _build_optimizer(self, players: List[Player]):
         optimizer = get_optimizer(self.site, self.sport)
+        install_person_uniqueness(optimizer)
         self._apply_salary_caps(optimizer)
         self._apply_injury_filter(optimizer)
         optimizer.player_pool.load_players(players)
@@ -1731,10 +1751,7 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         locked: set[Tuple[str, str]] = set()
         names: Dict[Tuple[str, str], str] = {}
         for _, row in frame.iterrows():
-            key = (
-                str(row.get("Name") or "").strip().casefold(),
-                str(row.get("TeamAbbrev") or "").strip().upper(),
-            )
+            key = person_key(row.get("Name"), row.get("TeamAbbrev"), row.get("Position"))
             names.setdefault(key, str(row.get("Name") or "").strip())
             rate = _ownership_fraction(row.get("CaptainExposure"))
             if rate is not None:
@@ -1742,7 +1759,7 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             if _is_locked(row.get("Lock")):
                 locked.add(key)
         present = {
-            (player.full_name.strip().casefold(), str(player.team).strip().upper())
+            player_person_key(player)
             for player in players
             if "CPT" in player.positions
         }
@@ -1771,10 +1788,7 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         for player in players:
             if "CPT" not in player.positions:
                 continue
-            key = (
-                player.full_name.strip().casefold(),
-                str(player.team).strip().upper(),
-            )
+            key = player_person_key(player)
             rate = applied.get(key)
             if rate is None:
                 continue
@@ -1822,8 +1836,8 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         for player in players:
             if self._football_pos(player) != "QB":
                 continue
-            key = (player.full_name.strip(), str(player.team).strip().upper())
-            if key not in allowed:
+            key = player_person_key(player)
+            if key not in {person_key(name, team, "QB") for name, team in allowed}:
                 optimizer.player_pool.remove_player(player)
 
     def _flex_salary_floor(self) -> int:
@@ -1890,7 +1904,7 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
                 continue
             by_team.setdefault(player.team, []).append(player)
         for team_rbs in by_team.values():
-            distinct = {player.full_name for player in team_rbs}
+            distinct = {player_person_key(player) for player in team_rbs}
             if len(distinct) <= cap:
                 continue
             optimizer.add_players_group(PlayersGroup(team_rbs, max_from_group=cap))
@@ -1997,7 +2011,7 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             return
         quarterbacks = [player for player in players if self._football_pos(player) == "QB"]
         cap = int(self.max_quarterbacks)
-        distinct = {player.full_name for player in quarterbacks}
+        distinct = {player_person_key(player) for player in quarterbacks}
         if len(distinct) <= cap:
             return
         optimizer.add_players_group(PlayersGroup(quarterbacks, max_from_group=cap))
@@ -2079,14 +2093,14 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
     def _apply_starting_core(self, optimizer, players: List[Player]) -> None:
         """Require the starting quarterback and running back from each team.
 
-        Captain and flex rows both count, and the unique-player rule keeps a
+        Captain and flex rows both count, and the person-uniqueness rule keeps a
         player from filling two spots. The solve retries without this group
         when the starters cannot fit.
         """
         if not self.require_starting_core or self._player_df is None:
             return
         wanted = {
-            (name.casefold(), team)
+            person_key(name, team)
             for name, team in starting_showdown_core(
                 self._player_df,
                 self.confirmed_quarterbacks,
@@ -2097,13 +2111,9 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         chosen = [
             player
             for player in players
-            if (
-                player.full_name.strip().casefold(),
-                str(player.team).strip().upper(),
-            )
-            in wanted
+            if player_person_key(player) in wanted
         ]
-        distinct = {player.full_name.strip().casefold() for player in chosen}
+        distinct = {player_person_key(player) for player in chosen}
         if len(distinct) < 2:
             return
         optimizer.add_players_group(
@@ -2112,6 +2122,7 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
 
     def _build_optimizer(self, players: List[Player]):
         optimizer = get_optimizer(self.site, self.sport)
+        install_person_uniqueness(optimizer)
         # Optional window. Showdown presets leave $200–$2,000 under the DK cap.
         self._apply_salary_caps(optimizer)
         self._apply_injury_filter(optimizer)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import pandas as pd
 
 from .data_loader import projection_deltas
+from .names import person_key as _person_key
 
 CHOICE_COLUMNS = (
     "Include",
@@ -22,8 +23,9 @@ _POSITION_ORDER = ("QB", "RB", "WR", "TE", "FLEX", "DST", "K")
 _FLEX_POSITIONS = frozenset({"RB", "WR", "TE"})
 
 
-def person_key(name: object, team: object) -> tuple[str, str]:
-    return (str(name or "").strip().casefold(), str(team or "").strip().upper())
+def person_key(name: object, team: object, position: object = None) -> tuple[str, str]:
+    """Normalized name and team. Defenses are keyed by team. See ``names.person_key``."""
+    return _person_key(name, team, position)
 
 
 def collapse_for_editor(pool: pd.DataFrame, *, showdown: bool) -> pd.DataFrame:
@@ -450,7 +452,8 @@ def _group_key(frame: pd.DataFrame) -> pd.Series:
 def _key_list(frame: pd.DataFrame) -> list[tuple[str, str]]:
     names = frame["Name"] if "Name" in frame.columns else [""] * len(frame)
     teams = frame["TeamAbbrev"] if "TeamAbbrev" in frame.columns else [""] * len(frame)
-    return [person_key(name, team) for name, team in zip(names, teams)]
+    positions = frame["Position"] if "Position" in frame.columns else [None] * len(frame)
+    return [person_key(name, team, position) for name, team, position in zip(names, teams, positions)]
 
 
 def _projection_by_key(frame: pd.DataFrame) -> dict[tuple[str, str], float]:
@@ -461,7 +464,7 @@ def _projection_by_key(frame: pd.DataFrame) -> dict[tuple[str, str], float]:
         value = pd.to_numeric(row.get("Projection"), errors="coerce")
         if pd.isna(value):
             continue
-        found[person_key(row.get("Name"), row.get("TeamAbbrev"))] = float(value)
+        found[person_key(row.get("Name"), row.get("TeamAbbrev"), row.get("Position"))] = float(value)
     return found
 
 

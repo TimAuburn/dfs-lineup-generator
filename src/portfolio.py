@@ -8,12 +8,12 @@ second call, so its counters start over.
 
 This module is the portfolio layer around that solver:
 
-* Identity is ``person_key(name, team)`` from the player pool. That is the key
-  the editor already uses to collapse captain and flex, locks, includes, and
+* Identity is ``person_key(name, team)`` from ``names``. That is the key the
+  editor already uses to collapse captain and flex, locks, includes, and
   captain share. Classic has one salary row per player, so the key matches the
-  DraftKings id. Showdown captain and flex share it. A lineup still rosters a
-  person once: pydfs ``UniquePlayerRule`` groups by full name and keeps
-  captain-or-flex. This module does not change that rule.
+  DraftKings id. Showdown captain and flex share it. A lineup rosters a person
+  once because the optimizer's person-uniqueness rule groups by this key.
+  pydfs ``UniquePlayerRule`` groups by full name only and is not used.
 * Overlap is the size of the shared identity set for every pair in the final
   export, including pairs that came from different tiers, presets' internal
   batches, or game-script buckets.
@@ -54,17 +54,20 @@ import pandas as pd
 from pydfs_lineup_optimizer.rules import OptimizerRule
 from pydfs_lineup_optimizer.solvers.constants import SolverSign
 
+from .names import person_key as _person_key
+from .names import player_person_key
+
 Identity = Tuple[str, str]
 
 
-def person_key(name: object, team: object) -> Identity:
+def person_key(name: object, team: object, position: object = None) -> Identity:
     """Same identity the player pool uses for captain and flex.
 
-    ``player_pool.person_key`` is the editor's key: casefolded name and upper
-    team. It lives there to avoid an import cycle with the optimizer, and the
-    portfolio tests lock the two functions together.
+    The implementation lives in ``names.person_key`` so the editor, the
+    Sleeper join, and this portfolio cannot drift. Tests lock the two
+    wrappers together. ``position`` selects the defense-by-team key.
     """
-    return (str(name or "").strip().casefold(), str(team or "").strip().upper())
+    return _person_key(name, team, position)
 
 
 def appearances_allowed(rate: Optional[float], total: int) -> int:
@@ -105,8 +108,9 @@ def lineup_identities(lineup: pd.DataFrame) -> List[Identity]:
     found: List[Identity] = []
     seen: set[Identity] = set()
     teams = lineup[team_col] if team_col in lineup.columns else [""] * len(lineup)
-    for name, team in zip(lineup["Name"], teams):
-        key = person_key(name, team)
+    positions = lineup["Position"] if "Position" in lineup.columns else [None] * len(lineup)
+    for name, team, position in zip(lineup["Name"], teams, positions):
+        key = person_key(name, team, position)
         if key in seen or not key[0]:
             continue
         seen.add(key)
@@ -454,7 +458,7 @@ class PortfolioIdentityRule(OptimizerRule):
         self.variables: Dict[Identity, list] = {}
         self.blocked: set[Identity] = set()
         for player, variable in players_dict.items():
-            key = person_key(player.full_name, player.team)
+            key = player_person_key(player)
             self.variables.setdefault(key, []).append(variable)
         for key in set(self.variables) | set(self.used):
             allowed = self.allowance.get(key, self.default_allowed)
@@ -489,7 +493,7 @@ class PortfolioIdentityRule(OptimizerRule):
     def _record(self, lineup) -> None:
         seen: set[Identity] = set()
         for player in lineup:
-            key = person_key(player.full_name, player.team)
+            key = player_person_key(player)
             if not key[0] or key in seen:
                 continue
             seen.add(key)
@@ -540,7 +544,11 @@ def exposure_report_frame(
         seen: set[Identity] = set()
         team_col = "Team" if "Team" in lineup.columns else "TeamAbbrev"
         for _, row in lineup.iterrows():
-            key = person_key(row.get("Name"), row.get(team_col) if team_col in lineup.columns else "")
+            key = person_key(
+                row.get("Name"),
+                row.get(team_col) if team_col in lineup.columns else "",
+                row.get("Position"),
+            )
             if not key[0] or key in seen:
                 continue
             seen.add(key)
