@@ -12,6 +12,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from src.data_loader import apply_low_total_kicker_cap, kicker_captain_exposure_cap
 from src.exporter import lineups_to_dk_upload_csv
 from src.optimizer import NFLClassicOptimizer, NFLShowdownOptimizer
 from src.parser import parse_dk_csv
@@ -460,6 +461,133 @@ def test_salary_floor_and_the_window_are_not_forced_into_agreement():
     assert "built 0" in message
     assert (optimizer.min_salary_cap, optimizer.max_salary_cap, optimizer.max_unused_salary) == before
     assert optimizer.salary_floor is True
+
+
+def test_shortfall_names_the_rule_and_keeps_the_overlap_detail():
+    """One extra lineup is enough to name the rule. The overlap text stays."""
+    rows = _salary_pool()
+    rows += _pair("WR", "BUF C", 80, "BUF", 6000, 18)
+    calls = []
+    original = NFLShowdownOptimizer._consume_lineups
+
+    def _record(self, optimizer, count, players, prior):
+        calls.append((int(count), len(list(prior or []))))
+        return original(self, optimizer, count, players, prior)
+
+    NFLShowdownOptimizer._consume_lineups = _record
+    try:
+        optimizer, lineups = _generate(
+            rows,
+            n=4,
+            salary_floor=True,
+            max_unused_salary=1_500,
+            min_salary_cap=None,
+            max_salary_cap=None,
+            max_repeating_players=5,
+        )
+    finally:
+        NFLShowdownOptimizer._consume_lineups = original
+    assert len(lineups) == 3
+    message = optimizer.last_shortfall.message
+    assert RULE_SALARY_FLOOR in message
+    assert "not loosened" in message
+    assert "Max overlap 5" in message
+    assert "share 5" in message
+    assert "at capacity" in message
+    # The batch is solved once. Each rule check asks for one lineup on top
+    # of the lineups already built, not for the whole request again.
+    assert calls[0] == (4, 0)
+    assert calls[1:]
+    assert all(count == 1 and prior_n == len(lineups) for count, prior_n in calls[1:])
+
+
+def test_low_total_kicker_cap_is_skipped_while_the_captain_ban_is_on():
+    assert kicker_captain_exposure_cap(
+        low_scoring=True,
+        ban_k_dst_captain=False,
+        cash_preset=False,
+    ) == 0.10
+    assert kicker_captain_exposure_cap(
+        low_scoring=True,
+        ban_k_dst_captain=True,
+        cash_preset=False,
+    ) is None
+    assert kicker_captain_exposure_cap(
+        low_scoring=True,
+        ban_k_dst_captain=False,
+        cash_preset=True,
+    ) is None
+    assert kicker_captain_exposure_cap(
+        low_scoring=False,
+        ban_k_dst_captain=False,
+        cash_preset=False,
+    ) is None
+
+    banned = NFLShowdownOptimizer()
+    banned.ban_k_dst_captain = True
+    banned.allow_kicker_captain = False
+    assert apply_low_total_kicker_cap(banned, low_scoring=True, cash_preset=False) is None
+    assert banned.kicker_max_exposure is None
+    assert banned.allow_kicker_captain is False
+
+    open_captain = NFLShowdownOptimizer()
+    open_captain.ban_k_dst_captain = False
+    assert apply_low_total_kicker_cap(
+        open_captain, low_scoring=True, cash_preset=False
+    ) == 0.10
+    assert open_captain.kicker_max_exposure == 0.10
+    assert open_captain.allow_kicker_captain is True
+
+
+def test_solver_budget_follows_a_slate_cap_other_than_50000():
+    """A cap above or below $50,000 is the solver budget, not the pydfs default."""
+    high = parse_dk_csv(MOCK_SHOWDOWN)
+    high.attrs["salary_cap"] = 60_000
+    optimizer = NFLShowdownOptimizer()
+    optimizer.jitter_pct = (0.0, 0.0)
+    optimizer.jitter_seed = 42
+    optimizer.load_from_dataframe(high)
+    optimizer.configure_showdown_rules(
+        min_salary_cap=55_000,
+        max_salary_cap=None,
+        game_script_correlation=False,
+        max_k_dst_combined=None,
+        max_kickers=None,
+        ban_k_dst_captain=False,
+        min_players_per_team_enabled=False,
+        salary_floor=False,
+        flex_min_salary=None,
+    )
+    optimizer.set_lineup_count(1)
+    try:
+        lineups = optimizer.generate_lineups()
+    except Exception as exc:  # noqa: BLE001 - the assertion is the raw solver text
+        raise AssertionError(str(exc)) from exc
+    spent = int(lineups[0].attrs["salary"])
+    assert 55_000 <= spent <= 60_000
+    assert "Min salary greater than max budget" not in str(getattr(optimizer.last_shortfall, "message", ""))
+
+    low = parse_dk_csv(MOCK_SHOWDOWN)
+    low.attrs["salary_cap"] = 45_000
+    capped = NFLShowdownOptimizer()
+    capped.jitter_pct = (0.0, 0.0)
+    capped.jitter_seed = 42
+    capped.load_from_dataframe(low)
+    capped.configure_showdown_rules(
+        min_salary_cap=40_000,
+        max_salary_cap=None,
+        game_script_correlation=False,
+        max_k_dst_combined=None,
+        max_kickers=None,
+        ban_k_dst_captain=False,
+        min_players_per_team_enabled=False,
+        salary_floor=False,
+        flex_min_salary=None,
+    )
+    capped.set_lineup_count(1)
+    lineups = capped.generate_lineups()
+    spent = int(lineups[0].attrs["salary"])
+    assert 40_000 <= spent <= 45_000
 
 
 def test_seed_42_classic_is_unchanged_and_showdown_rules_off_match_main():

@@ -32,7 +32,8 @@ from src.database import (
     search_player_performance,
 )
 from src.data_loader import (
-    KICKER_CAPTAIN_MAX_EXPOSURE,
+    apply_low_total_kicker_cap,
+    kicker_captain_exposure_cap,
     lines_to_frame,
     low_scoring_showdown,
     projection_adjustment_labels,
@@ -1950,7 +1951,7 @@ if st.session_state.player_pool is not None and "TeamAbbrev" in st.session_state
 low_scoring_game = contest_format is ContestFormat.SHOWDOWN and low_scoring_showdown(
     vegas_lines, slate_teams
 )
-if low_scoring_game:
+if low_scoring_game and not strategy_overrides.get("ban_k_dst_captain"):
     strategy_overrides["allow_kicker_captain"] = True
 
 actual_cfg = config_with_overrides(
@@ -1983,11 +1984,18 @@ wind_labels = weather_adjustment_labels(st.session_state.player_pool, weather_by
 if wind_labels:
     extra_setting_rows.append(("Wind weather", "No adjustment", ", ".join(wind_labels)))
 if low_scoring_game:
+    exposure_cap = kicker_captain_exposure_cap(
+        low_scoring=True,
+        ban_k_dst_captain=bool(strategy_overrides.get("ban_k_dst_captain")),
+        cash_preset=preset is ContestPreset.SHOWDOWN_CASH,
+    )
     extra_setting_rows.append(
         (
             "Kicker exposure",
             "No cap",
-            "10% (game total ≤ 38.5)",
+            "No cap"
+            if exposure_cap is None
+            else f"{int(round(exposure_cap * 100))}% (game total ≤ 38.5)",
         )
     )
 live_setting_rows = format_settings_comparison(
@@ -2010,19 +2018,6 @@ for warning in vegas_warnings:
     st.warning(warning)
 if drop_stale_scoring_session(st.session_state):
     st.session_state.sleeper_version = int(st.session_state.get("sleeper_version") or 0) + 1
-lineups = st.session_state.lineups
-_generated_for_export = st.session_state.generated_run or {}
-_requested_lineups = _generated_for_export.get("requested")
-_min_players_for_export = (_generated_for_export or {}).get("min_players")
-exposure_csv = (
-    exposure_report_csv(
-        lineups,
-        requested=None if _requested_lineups is None else int(_requested_lineups),
-        min_players=_min_players_for_export,
-    )
-    if lineups
-    else ""
-)
 download_name = (
     "dk_nfl_showdown_upload.csv" if is_showdown else "dk_nfl_classic_upload.csv"
 )
@@ -2399,7 +2394,6 @@ st.caption("Pick a contest preset and export multi-entry lineups from the player
 export_headers = ",".join(upload_columns_for(contest_format))
 st.caption(f"Export template: `{export_headers}`")
 
-upload_check, upload_csv = _prepare_dk_upload(lineups, contest_format, is_showdown)
 generate_col, download_col = st.columns([1.2, 1.6], gap="medium")
 with generate_col:
     generate = st.button(
@@ -2408,35 +2402,64 @@ with generate_col:
         width="stretch",
         disabled=pool is None,
     )
-with download_col:
-    st.download_button(
-        "Download DK Upload CSV",
-        data=upload_csv,
-        file_name=download_name,
-        mime="text/csv",
-        type="secondary",
-        width="stretch",
-        disabled=(
-            not bool(lineups)
-            or upload_check is None
-            or upload_check.blocked
-        ),
-    )
-    st.download_button(
-        "Download exposure report",
-        data=exposure_csv,
-        file_name=exposure_name,
-        mime="text/csv",
-        type="secondary",
-        width="stretch",
-        disabled=not bool(lineups),
-        help=(
-            "One row per real player. Showdown captain and flex count together. "
-            "This is not the DraftKings upload."
-        ),
-    )
+# Filled after this run's generate attempt. A failure clears the stored
+# lineups first, so the same render cannot offer the previous CSV.
+export_slot = download_col.empty()
+upload_slot = st.empty()
+_exports_painted = False
 
-_render_upload_check(upload_check, have_lineups=bool(lineups))
+
+def _paint_exports() -> None:
+    """Download buttons and the upload check for the lineups stored right now."""
+    global _exports_painted
+    if _exports_painted:
+        return
+    _exports_painted = True
+    current = list(st.session_state.lineups or [])
+    upload_check, upload_csv = _prepare_dk_upload(current, contest_format, is_showdown)
+    generated_for_export = st.session_state.generated_run or {}
+    requested = generated_for_export.get("requested")
+    min_players = generated_for_export.get("min_players")
+    exposure_csv = (
+        exposure_report_csv(
+            current,
+            requested=None if requested is None else int(requested),
+            min_players=min_players,
+        )
+        if current
+        else ""
+    )
+    with export_slot.container():
+        st.download_button(
+            "Download DK Upload CSV",
+            data=upload_csv,
+            file_name=download_name,
+            mime="text/csv",
+            type="secondary",
+            width="stretch",
+            disabled=(
+                not bool(current)
+                or upload_check is None
+                or upload_check.blocked
+            ),
+            key="download_dk_upload",
+        )
+        st.download_button(
+            "Download exposure report",
+            data=exposure_csv,
+            file_name=exposure_name,
+            mime="text/csv",
+            type="secondary",
+            width="stretch",
+            disabled=not bool(current),
+            help=(
+                "One row per real player. Showdown captain and flex count together. "
+                "This is not the DraftKings upload."
+            ),
+            key="download_exposure_report",
+        )
+    with upload_slot.container():
+        _render_upload_check(upload_check, have_lineups=bool(current))
 
 if st.session_state.error:
     st.error(st.session_state.error)
@@ -2472,6 +2495,7 @@ with st.container(border=True):
     _render_settings_comparison(live_setting_rows)
 
 if pool is None:
+    _paint_exports()
     st.info("Open Player pool and upload a DraftKings salary file before generating lineups.")
     st.stop()
 
@@ -2496,6 +2520,7 @@ if generate:
         st.session_state.lineups = []
         st.session_state.generated_run = None
         st.error(" ".join(blockers))
+        _paint_exports()
         st.stop()
     sleeper_summary = st.session_state.sleeper_summary
     contract_ok = session_contract_current(st.session_state.player_pool, sleeper_summary)
@@ -2507,6 +2532,8 @@ if generate:
         if not contract_ok:
             drop_stale_scoring_session(st.session_state)
             st.session_state.sleeper_version = int(st.session_state.get("sleeper_version") or 0) + 1
+            st.session_state.lineups = []
+            st.session_state.generated_run = None
             st.error(
                 "Stored projections are missing current DraftKings scoring metadata and were not used."
             )
@@ -2514,6 +2541,7 @@ if generate:
             st.session_state.lineups = []
             st.session_state.generated_run = None
             st.error(sleeper_status_caption(sleeper_summary, st.session_state.player_pool))
+        _paint_exports()
         st.stop()
     progress = st.progress(0, text="Building optimizer…")
     try:
@@ -2554,9 +2582,11 @@ if generate:
                 optimizer.set_vegas_spreads(normalize_spreads(solve_lines))
         if confirmed_qb_keys is not None and hasattr(optimizer, "set_confirmed_quarterbacks"):
             optimizer.set_confirmed_quarterbacks(confirmed_qb_keys)
-        if solve_low_total and preset is not ContestPreset.SHOWDOWN_CASH:
-            optimizer.allow_kicker_captain = True
-            optimizer.kicker_max_exposure = KICKER_CAPTAIN_MAX_EXPOSURE
+        apply_low_total_kicker_cap(
+            optimizer,
+            low_scoring=solve_low_total,
+            cash_preset=preset is ContestPreset.SHOWDOWN_CASH,
+        )
         optimizer.set_exposure_limits(
             min_exposure_pct=float(min_exposure_pct) if use_min_exposure else None,
             max_exposure_pct=float(max_exposure_pct) if use_max_exposure else None,
@@ -2853,3 +2883,5 @@ if lineups:
                 ),
             },
         )
+
+_paint_exports()

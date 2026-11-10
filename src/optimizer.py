@@ -2072,6 +2072,34 @@ class _EitherTeamSplitRule(OptimizerRule):
         )
 
 
+def _diagnostic_suffix(shortfall: Optional[PortfolioShortfall]) -> str:
+    """Overlap and solver detail already written for this short set.
+
+    The rule sentence is added beside this text. A shortfall that only says
+    the solver stopped, with no limit named, is not repeated once a rule is.
+    """
+    if shortfall is None or not shortfall.message:
+        return ""
+    prefix = (
+        f"Requested {int(shortfall.requested)} lineups and built {int(shortfall.built)}."
+    )
+    text = shortfall.message.strip()
+    suffix = text[len(prefix):].strip() if text.startswith(prefix) else text
+    if not suffix:
+        return ""
+    markers = (
+        "Candidate limits",
+        "Limits sufficient",
+        "Also at capacity",
+        "Binding limit:",
+        "Solver-reported",
+        "blocks another lineup",
+    )
+    if not any(marker in suffix for marker in markers):
+        return ""
+    return suffix
+
+
 class NFLShowdownOptimizer(BaseNFLOptimizer):
     """DraftKings NFL Showdown (Captain Mode) lineup generator."""
 
@@ -2727,10 +2755,11 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         bounds = self.salary_resolution()
         if bounds.conflict:
             raise RuntimeError(shortfall_message(self.lineup_count, 0, bounds.conflict))
-        ceiling = int(bounds.maximum)
-        site_budget = int(getattr(pydfs_optimizer.settings, "budget", None) or self.salary_cap)
-        if self.max_salary_cap is not None or ceiling < site_budget:
-            pydfs_optimizer.settings.budget = ceiling
+        # pydfs captain mode starts at $50,000. The conflict check uses the
+        # slate cap, so the solver budget is that same ceiling. Leaving the
+        # site default in place lets a higher minimum raise the raw
+        # "Min salary greater than max budget" error.
+        pydfs_optimizer.settings.budget = int(bounds.maximum)
         if bounds.minimum is not None:
             pydfs_optimizer.set_min_salary_cap(float(bounds.minimum))
 
@@ -2816,11 +2845,20 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             f"(spend at least ${spend:,} of the ${cap:,} cap)."
         )
 
-    def _can_reach(self, players: List[Player], count: int, **overrides: bool) -> bool:
-        """Whether ``count`` lineups exist after turning the named rules off.
+    def _can_reach(
+        self,
+        players: List[Player],
+        count: int,
+        prior: Optional[Sequence[pd.DataFrame]] = None,
+        **overrides: bool,
+    ) -> bool:
+        """Whether ``count`` more lineups exist after turning the named rules off.
 
-        The returned lineups are discarded. Exposure and the rule flags are
-        put back, so this does not loosen the lineup that was exported.
+        ``prior`` is the lineups already exported. The check asks for one new
+        lineup against that set instead of rebuilding the whole batch, which
+        is what made a short 150-lineup run several times slower than the
+        solve. The returned lineups are discarded. Exposure and the rule
+        flags are put back, so this does not loosen the lineup that was exported.
         """
         saved_flags = {name: getattr(self, name) for name in overrides}
         saved_core = self.require_starting_core
@@ -2840,7 +2878,12 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
                 player.max_exposure = maximum
             try:
                 optimizer = self._build_optimizer(players)
-                raw = self._consume_lineups(optimizer, int(count), players, [])
+                raw = self._consume_lineups(
+                    optimizer,
+                    int(count),
+                    players,
+                    list(prior or []),
+                )
             except (GenerateLineupException, RuntimeError):
                 return False
             return len(raw) >= int(count)
@@ -2857,14 +2900,15 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
     def _attribute_showdown_shortfall(
         self,
         players: List[Player],
-        built: int,
+        frames: Sequence[pd.DataFrame],
         requested: int,
     ) -> Optional[str]:
         """Name the showdown rule that stops the next lineup, if one does.
 
-        A rule is named only when turning that rule off allows another lineup
-        and the others stay on. A combination is named when no single rule is
-        enough. Other limits keep the existing shortfall text.
+        A rule is named only when turning that rule off allows one more lineup
+        on top of the lineups already built, and the others stay on. A
+        combination is named when no single rule is enough. Each check is one
+        lineup. Other limits keep the existing shortfall text.
         """
         flags = {
             "ban_k_dst_captain": bool(self.ban_k_dst_captain),
@@ -2874,12 +2918,12 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         active = [name for name, enabled in flags.items() if enabled]
         if not active:
             return None
-        target = int(built) + 1
-        single = [
-            name
-            for name in active
-            if self._can_reach(players, target, **{name: False})
-        ]
+        exported = list(frames)
+
+        def opens(overrides: Dict[str, bool]) -> bool:
+            return self._can_reach(players, 1, exported, **overrides)
+
+        single = [name for name in active if opens({name: False})]
         if len(single) == 1:
             return (
                 f"{self._rule_cause_text(single[0])} "
@@ -2891,11 +2935,7 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
                 f"{detail} Together they blocked another lineup. "
                 "Neither rule was loosened."
             )
-        if len(active) > 1 and self._can_reach(
-            players,
-            target,
-            **{name: False for name in active},
-        ):
+        if len(active) > 1 and opens({name: False for name in active}):
             detail = " ".join(self._rule_cause_text(name) for name in active)
             return (
                 f"{detail} Together they blocked another lineup. "
@@ -2903,14 +2943,24 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             )
         return None
 
-    def _remember_rule_shortfall(self, requested: int, built: int, cause: str) -> str:
+    def _remember_rule_shortfall(
+        self,
+        requested: int,
+        built: int,
+        cause: str,
+        diagnostic: Optional[PortfolioShortfall] = None,
+    ) -> str:
         message = shortfall_message(requested, built, cause)
+        suffix = _diagnostic_suffix(diagnostic)
+        if suffix:
+            message = f"{message} {suffix}"
+        candidates = () if diagnostic is None else tuple(diagnostic.candidates)
         self.last_shortfall = PortfolioShortfall(
             requested=int(requested),
             built=int(built),
             message=message,
             proven=(cause,),
-            candidates=(),
+            candidates=candidates,
         )
         return message
 
@@ -2975,9 +3025,12 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
                 frames = self._optimize_showdown(players, count)
         except GenerateLineupException as exc:
             self._solver_constraint_notes = list(getattr(exc, "invalid_constraints", []) or [])
-            rule_cause = self._attribute_showdown_shortfall(players, 0, count)
+            diagnostic = self.explain_lineup_shortfall([], count)
+            rule_cause = self._attribute_showdown_shortfall(players, [], count)
             if rule_cause:
-                raise RuntimeError(self._remember_rule_shortfall(count, 0, rule_cause)) from exc
+                raise RuntimeError(
+                    self._remember_rule_shortfall(count, 0, rule_cause, diagnostic)
+                ) from exc
             if self._limits_configured():
                 self._finalize_min_report([], count)
                 self.last_shortfall = self.explain_lineup_shortfall([], count)
@@ -2985,9 +3038,10 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             raise
         self._finish_shortfall(frames, count)
         if len(frames) < count:
-            rule_cause = self._attribute_showdown_shortfall(players, len(frames), count)
+            diagnostic = self.last_shortfall
+            rule_cause = self._attribute_showdown_shortfall(players, frames, count)
             if rule_cause:
-                self._remember_rule_shortfall(count, len(frames), rule_cause)
+                self._remember_rule_shortfall(count, len(frames), rule_cause, diagnostic)
         return frames
 
     def _optimize_showdown(self, players: List[Player], count: int) -> List[pd.DataFrame]:

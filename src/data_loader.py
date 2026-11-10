@@ -17,6 +17,41 @@ ITT_BOOST = 1.05
 ITT_PENALTY = 0.95
 KICKER_CAPTAIN_MAX_EXPOSURE = 0.10
 
+
+def kicker_captain_exposure_cap(
+    *,
+    low_scoring: bool,
+    ban_k_dst_captain: bool,
+    cash_preset: bool,
+) -> Optional[float]:
+    """Exposure cap that limited kicker captains on a game total of 38.5 or less.
+
+    The cap is not applied while kickers and defenses cannot be captain, and
+    cash presets never used it. A kicker can still be FLEX with no extra cap.
+    """
+    if cash_preset or not low_scoring or ban_k_dst_captain:
+        return None
+    return KICKER_CAPTAIN_MAX_EXPOSURE
+
+
+def apply_low_total_kicker_cap(
+    optimizer,
+    *,
+    low_scoring: bool,
+    cash_preset: bool,
+) -> Optional[float]:
+    """Turn on the low-total kicker-captain cap, or leave exposure unchanged."""
+    cap = kicker_captain_exposure_cap(
+        low_scoring=bool(low_scoring),
+        ban_k_dst_captain=bool(getattr(optimizer, "ban_k_dst_captain", False)),
+        cash_preset=bool(cash_preset),
+    )
+    if cap is None:
+        return None
+    optimizer.allow_kicker_captain = True
+    optimizer.kicker_max_exposure = cap
+    return cap
+
 VEGAS_EDITOR_COLUMNS = ["Game", "Team", "Spread", "Over/Under", "ITT"]
 NO_SLATE_ODDS_WARNING = (
     "No Vegas odds cover this slate. Implied team totals were not applied."
