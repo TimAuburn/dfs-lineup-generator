@@ -1404,10 +1404,12 @@ _requested_lineups = _generated_for_export.get("requested")
 csv_text = (
     lineups_to_dk_upload_csv(lineups, contest_format=contest_format) if lineups else ""
 )
+_min_players_for_export = (_generated_for_export or {}).get("min_players")
 exposure_csv = (
     exposure_report_csv(
         lineups,
         requested=None if _requested_lineups is None else int(_requested_lineups),
+        min_players=_min_players_for_export,
     )
     if lineups
     else ""
@@ -1929,9 +1931,14 @@ if generate:
                 "salary_max": DK_SALARY_CAP,
                 "flex_positions": strategy_overrides.get("flex_positions"),
             }
-        limit_message = None
+        limit_parts = []
         if getattr(optimizer, "last_shortfall", None) is not None:
-            limit_message = optimizer.last_shortfall.message
+            limit_parts.append(optimizer.last_shortfall.message)
+        min_report = getattr(optimizer, "last_min_report", None)
+        if min_report is not None and min_report.message:
+            limit_parts.append(min_report.message)
+        limit_message = " ".join(limit_parts) if limit_parts else None
+        min_players = list(min_report.rows) if min_report is not None else None
         st.session_state.lineups = generated
         st.session_state.generated_run = {
             "preset": preset.value,
@@ -1939,6 +1946,7 @@ if generate:
             "rows": live_setting_rows,
             "rule_check": rule_check,
             "limit_message": limit_message,
+            "min_players": min_players,
             "requested": int(lineup_count),
         }
         override_note = (
@@ -1984,12 +1992,14 @@ if lineups:
             hide_index=True,
         )
     requested_count = (used or {}).get("requested") if used else None
+    min_players = (used or {}).get("min_players") if used else None
     exposure = player_exposure_table(
         lineups,
         requested=None if requested_count is None else int(requested_count),
+        min_players=min_players,
     )
     st.markdown("#### Player exposure")
-    st.caption(
+    exposure_caption = (
         "Each person is counted once per lineup. Showdown captain and flex are the same player. "
         "Lineups is the count. Exported % is the share of the lineups that were built. "
         "Requested % is the share of the number you asked for. "
@@ -1997,6 +2007,13 @@ if lineups:
         "The DraftKings upload file is unchanged and does not include this table; "
         "use Download exposure report for the same numbers."
     )
+    if "Min needed" in exposure.columns:
+        exposure_caption += (
+            " Min needed is the ceiling of the minimum share of the lineups you asked for, "
+            "so 50% of 5 is 3. Min met compares Lineups with that target. "
+            "A player who was never rostered stays on this table."
+        )
+    st.caption(exposure_caption)
     exposure_config = {
         "Lineups": st.column_config.NumberColumn("Lineups", format="%d"),
         "Exported %": st.column_config.NumberColumn(
@@ -2013,6 +2030,16 @@ if lineups:
     if "CPT count" in exposure.columns:
         exposure_config["CPT count"] = st.column_config.NumberColumn("CPT count", format="%d")
         exposure_config["FLEX count"] = st.column_config.NumberColumn("FLEX count", format="%d")
+    if "Min needed" in exposure.columns:
+        exposure_config["Min needed"] = st.column_config.NumberColumn(
+            "Min needed",
+            format="%d",
+            help="Appearances required across the lineups you asked for.",
+        )
+        exposure_config["Min met"] = st.column_config.TextColumn(
+            "Min met",
+            help="Yes when Lineups is at least Min needed. The counts are in parentheses.",
+        )
     st.dataframe(
         exposure,
         width="stretch",

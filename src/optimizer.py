@@ -20,9 +20,16 @@ from pydfs_lineup_optimizer.stacks import PlayersGroup, PositionsStack
 from .parser import drop_inactive_players, is_inactive_injury, parse_dk_csv
 from .portfolio import (
     PortfolioIdentityRule,
+    PortfolioMinExposureRule,
     PortfolioRuleState,
     appearances_allowed,
+    appearances_needed,
     batch_team_stack_exposures,
+    classic_roster_slots,
+    evaluate_min_exposure,
+    exposure_counts,
+    min_force_groups,
+    showdown_roster_slots,
     solver_rate_for_remaining,
     explain_shortfall,
     exposure_report_csv,
@@ -30,6 +37,7 @@ from .portfolio import (
     lineup_identities,
     normalize_stack_spec,
     person_key,
+    position_tokens,
     team_stack_counts,
 )
 from .presets import ContestFormat
@@ -316,6 +324,18 @@ def _player_positions(player: Player) -> set[str]:
     for pos in player.positions:
         tokens.update(_position_tokens(pos))
     return tokens
+
+
+def _football_position_set(player: Player) -> frozenset[str]:
+    """Football positions for one solver row. Captain and flex labels are not positions."""
+    tokens: set[str] = set()
+    for pos in getattr(player, "original_positions", None) or ():
+        tokens.update(position_tokens(pos))
+    if tokens:
+        return frozenset(tokens)
+    for pos in player.positions:
+        tokens.update(position_tokens(pos))
+    return frozenset(tokens)
 
 
 def _opponent_team(player: Player) -> Optional[str]:
@@ -655,6 +675,15 @@ class BaseNFLOptimizer:
         self.portfolio_lineups: Optional[List[pd.DataFrame]] = None
         self._inside_portfolio: bool = False
         self.last_shortfall = None
+        self.last_min_report = None
+        self._min_targets: Dict[tuple, int] = {}
+        self._min_allowed: Dict[tuple, Optional[int]] = {}
+        self._min_positions: Dict[tuple, frozenset] = {}
+        self._min_names: Dict[tuple, str] = {}
+        self._min_teams: Dict[tuple, str] = {}
+        self._min_position_labels: Dict[tuple, str] = {}
+        self._min_priority: Dict[tuple, float] = {}
+        self._min_slot_defs: tuple = ()
         self._solver_constraint_notes: List[str] = []
 
     def set_locked_players(self, player_ids: Optional[Sequence[str]]) -> None:
@@ -681,7 +710,9 @@ class BaseNFLOptimizer:
         self._players = dataframe_to_players(
             self._player_df,
             contest_format=ContestFormat(self.contest_format),
-            min_exposure=self.min_exposure,
+            # The portfolio rule counts a person once. pydfs would round a
+            # global minimum separately for a captain row and a flex row.
+            min_exposure=None,
             max_exposure=self.max_exposure,
         )
         return self._player_df
@@ -773,7 +804,7 @@ class BaseNFLOptimizer:
         return dataframe_to_players(
             jittered,
             contest_format=ContestFormat(self.contest_format),
-            min_exposure=self.min_exposure,
+            min_exposure=None,
             max_exposure=self.max_exposure,
         )
 
@@ -847,8 +878,17 @@ class BaseNFLOptimizer:
         players: Sequence[Player],
         prior_frames: Sequence[pd.DataFrame],
         batch_size: int,
+        *,
+        relax_min: bool = False,
+        skip_min: Optional[Sequence[tuple]] = None,
+        use_min_groups: bool = True,
     ) -> None:
-        """Add identity limits when pydfs would count the wrong player or batch."""
+        """Add identity limits when pydfs would count the wrong player or batch.
+
+        ``relax_min`` keeps the max and overlap rules and adds no minimum
+        constraint. A reserved set that cannot be rostered uses that path for
+        the rest of the batch.
+        """
         portfolio_size = int(self.portfolio_size or batch_size)
         overlap = self._active_overlap_cap()
         showdown = ContestFormat(self.contest_format) is ContestFormat.SHOWDOWN
@@ -859,7 +899,17 @@ class BaseNFLOptimizer:
         # pydfs allows one extra lineup when the percentage is not a whole number.
         enforce_exposure = exposure is not None
         enforce_kicker = bool(showdown and kicker is not None)
-        if not (enforce_overlap or enforce_exposure or enforce_kicker):
+        self._note_min_pool(pydfs_optimizer, portfolio_size)
+        min_remaining, min_groups = self._min_batch_state(
+            pydfs_optimizer,
+            prior_frames,
+            portfolio_size,
+            skip_min=skip_min or (),
+        )
+        if not use_min_groups:
+            min_groups = ()
+        enforce_min = (not relax_min) and any(count > 0 for count in min_remaining.values())
+        if not (enforce_overlap or enforce_exposure or enforce_kicker or enforce_min or relax_min):
             return
         allowance: Dict[tuple, int] = {}
         default_allowed = appearances_allowed(exposure, portfolio_size) if enforce_exposure else None
@@ -890,6 +940,7 @@ class BaseNFLOptimizer:
                 default_allowed if enforce_exposure else None,
                 kicker if enforce_kicker else None,
             )
+        prior_count = len(prior_frames)
         pydfs_optimizer._portfolio_limits = PortfolioRuleState(
             portfolio_size=portfolio_size,
             overlap_cap=None if overlap is None else int(overlap),
@@ -898,8 +949,18 @@ class BaseNFLOptimizer:
             allowance=allowance,
             prior_used=used,
             prior_history=history,
+            min_remaining={} if relax_min else min_remaining,
+            min_groups=() if relax_min else min_groups,
+            min_after=max(0, portfolio_size - prior_count - int(batch_size)),
+            min_batch=int(batch_size),
+            min_relax=bool(relax_min),
+            min_priority=dict(self._min_priority),
+            min_roster=len(self._min_roster_slots()),
         )
-        pydfs_optimizer.add_new_rule(PortfolioIdentityRule)
+        if enforce_overlap or enforce_exposure or enforce_kicker:
+            pydfs_optimizer.add_new_rule(PortfolioIdentityRule)
+        if enforce_min or relax_min:
+            pydfs_optimizer.add_new_rule(PortfolioMinExposureRule)
 
     def _tighten_solver_exposure(
         self,
@@ -942,33 +1003,188 @@ class BaseNFLOptimizer:
         return False
 
     def _consume_lineups(self, pydfs_optimizer, count: int, players: Sequence[Player], prior_frames: Sequence[pd.DataFrame]):
-        """Run one pydfs batch. A partial result is kept; an empty one is raised."""
+        """Run one pydfs batch. A partial result is kept; an empty one is raised.
+
+        When a minimum makes the next lineup infeasible, that minimum is
+        relaxed for the rest of this batch and the solve continues. Later
+        batches still reserve whatever appearances remain. A max is not raised.
+        """
+        saved_max = [(player, player.max_exposure) for player in players]
         self._arm_portfolio_rule(pydfs_optimizer, players, prior_frames, count)
-        exclude = None
+        exclude = self._overlap_exclude(pydfs_optimizer, prior_frames)
+        raw = []
+        remaining = int(count)
+        relaxed = False
+        self._solver_constraint_notes = []
+        while remaining > 0:
+            produced = []
+            try:
+                for lineup in pydfs_optimizer.optimize(
+                    remaining,
+                    max_exposure=self.max_exposure,
+                    exclude_lineups=exclude,
+                ):
+                    produced.append(lineup)
+                raw.extend(produced)
+                break
+            except GenerateLineupException as exc:
+                self._solver_constraint_notes = list(getattr(exc, "invalid_constraints", []) or [])
+                raw.extend(produced)
+                remaining = int(count) - len(raw)
+                if relaxed or remaining <= 0 or not self._min_targets:
+                    if not raw:
+                        raise
+                    break
+                relaxed = True
+                partial = [self.format_lineup(lineup) for lineup in raw]
+                carried = list(prior_frames) + partial
+                raw.extend(
+                    self._consume_min_line_by_line(
+                        pydfs_optimizer,
+                        players,
+                        carried,
+                        remaining,
+                        saved_max,
+                    )
+                )
+                break
+        if len(raw) >= int(count):
+            self._solver_constraint_notes = []
+        return raw
+
+    def _consume_min_line_by_line(
+        self,
+        pydfs_optimizer,
+        players: Sequence[Player],
+        prior_frames: Sequence[pd.DataFrame],
+        count: int,
+        saved_max: Sequence[tuple],
+    ):
+        """Place each remaining lineup, dropping one reserved player at a time.
+
+        A reserved set that does not fit is reduced by the lowest projection
+        first. Players who still fit stay reserved. The whole minimum is
+        dropped only when no reserved player can be added to that lineup.
+        """
+        built = []
+        carried = list(prior_frames)
+        for _ in range(int(count)):
+            skipped: List[tuple] = []
+            use_groups = True
+            placed = False
+            while not placed:
+                for player, rate in saved_max:
+                    player.max_exposure = rate
+                self._arm_portfolio_rule(
+                    pydfs_optimizer,
+                    players,
+                    carried,
+                    1,
+                    skip_min=skipped,
+                    use_min_groups=use_groups,
+                )
+                exclude = self._overlap_exclude(
+                    pydfs_optimizer,
+                    carried,
+                    include_uniqueness=True,
+                )
+                try:
+                    lineup = next(
+                        pydfs_optimizer.optimize(
+                            1,
+                            max_exposure=self.max_exposure,
+                            exclude_lineups=exclude,
+                        )
+                    )
+                except GenerateLineupException as exc:
+                    self._solver_constraint_notes = list(
+                        getattr(exc, "invalid_constraints", []) or []
+                    )
+                    state = getattr(pydfs_optimizer, "_portfolio_limits", None)
+                    if use_groups and state is not None and state.min_groups:
+                        use_groups = False
+                        continue
+                    forced = []
+                    if state is not None and not state.min_relax:
+                        left = 1 + int(state.min_after)
+                        forced = [
+                            key
+                            for key, need in state.min_remaining.items()
+                            if int(need) >= left and key not in skipped
+                        ]
+                        # Overflow locks are not only the deadline set. Drop the
+                        # lowest projection still being required.
+                        if not forced:
+                            forced = [
+                                key
+                                for key, need in state.min_remaining.items()
+                                if int(need) > 0 and key not in skipped
+                            ]
+                    if forced:
+                        skipped.append(self._lowest_projection_identity(players, forced))
+                        continue
+                    for player, rate in saved_max:
+                        player.max_exposure = rate
+                    self._arm_portfolio_rule(
+                        pydfs_optimizer,
+                        players,
+                        carried,
+                        1,
+                        relax_min=True,
+                    )
+                    exclude = self._overlap_exclude(
+                        pydfs_optimizer,
+                        carried,
+                        include_uniqueness=True,
+                    )
+                    try:
+                        lineup = next(
+                            pydfs_optimizer.optimize(
+                                1,
+                                max_exposure=self.max_exposure,
+                                exclude_lineups=exclude,
+                            )
+                        )
+                    except GenerateLineupException as inner:
+                        self._solver_constraint_notes = list(
+                            getattr(inner, "invalid_constraints", []) or []
+                        )
+                        return built
+                built.append(lineup)
+                carried.append(self.format_lineup(lineup))
+                placed = True
+        return built
+
+    def _lowest_projection_identity(self, players: Sequence[Player], keys: Sequence[tuple]) -> tuple:
+        wanted = set(keys)
+        best_key = next(iter(wanted))
+        best_score = None
+        for player in players:
+            key = person_key(player.full_name, player.team)
+            if key not in wanted:
+                continue
+            score = float(player.fppg)
+            if "CPT" in getattr(player, "positions", ()):
+                score = score / 1.5
+            if best_score is None or score < best_score:
+                best_score = score
+                best_key = key
+        return best_key
+
+    def _overlap_exclude(self, pydfs_optimizer, frames: Sequence[pd.DataFrame], *, include_uniqueness: bool = False):
+        """Prior lineups passed into pydfs, when this batch has to see them."""
+        if not frames:
+            return None
         overlap = self._active_overlap_cap()
-        if (
-            prior_frames
-            and ContestFormat(self.contest_format) is not ContestFormat.SHOWDOWN
+        classic_overlap = (
+            ContestFormat(self.contest_format) is not ContestFormat.SHOWDOWN
             and overlap is not None
             and int(overlap) >= 1
-        ):
-            # Removed and zero-exposure players are not in the solver dictionary.
-            available = pydfs_optimizer.player_pool.filtered_players
-            exclude = _lineups_for_overlap(prior_frames, available) or None
-        raw = []
-        self._solver_constraint_notes = []
-        try:
-            for lineup in pydfs_optimizer.optimize(
-                count,
-                max_exposure=self.max_exposure,
-                exclude_lineups=exclude,
-            ):
-                raw.append(lineup)
-        except GenerateLineupException as exc:
-            self._solver_constraint_notes = list(getattr(exc, "invalid_constraints", []) or [])
-            if not raw:
-                raise
-        return raw
+        )
+        if not classic_overlap and not include_uniqueness:
+            return None
+        available = pydfs_optimizer.player_pool.filtered_players
+        return _lineups_for_overlap(frames, available) or None
 
     def _limits_configured(self) -> bool:
         if self.max_exposure is not None or self.min_exposure is not None:
@@ -1044,9 +1260,141 @@ class BaseNFLOptimizer:
             display_names=self._display_names(),
         )
 
+    def _reset_min_tracking(self) -> None:
+        self._min_targets = {}
+        self._min_allowed = {}
+        self._min_positions = {}
+        self._min_names = {}
+        self._min_teams = {}
+        self._min_position_labels = {}
+        self._min_priority = {}
+        self._min_slot_defs = ()
+        self.last_min_report = None
+
+    def _min_roster_slots(self):
+        if ContestFormat(self.contest_format) is ContestFormat.SHOWDOWN and hasattr(self, "_captain_positions_allowed"):
+            return showdown_roster_slots(self._captain_positions_allowed())
+        if ContestFormat(self.contest_format) is ContestFormat.SHOWDOWN:
+            return showdown_roster_slots(("QB", "RB", "WR", "TE"))
+        return classic_roster_slots(getattr(self, "flex_positions", None))
+
+    def _note_min_pool(self, pydfs_optimizer, portfolio_size: int) -> None:
+        """Remember every eligible identity's requested minimum.
+
+        Later batches add players the earlier salary window had removed.
+        Players who are never eligible are not given a minimum.
+        """
+        if self.min_exposure is None or float(self.min_exposure) <= 0.0:
+            return
+        needed = appearances_needed(self.min_exposure, portfolio_size)
+        if needed <= 0:
+            return
+        self._min_slot_defs = self._min_roster_slots()
+        for player in pydfs_optimizer.player_pool.filtered_players:
+            key = person_key(player.full_name, player.team)
+            if not key[0]:
+                continue
+            positions = _football_position_set(player)
+            score = float(player.fppg)
+            if "CPT" in getattr(player, "positions", ()):
+                score = score / 1.5
+            current_score = self._min_priority.get(key)
+            self._min_priority[key] = score if current_score is None else min(current_score, score)
+            self._min_targets[key] = needed
+            self._min_names.setdefault(key, str(player.full_name).strip())
+            self._min_teams.setdefault(key, str(player.team or "").strip().upper())
+            self._min_positions[key] = self._min_positions.get(key, frozenset()) | positions
+            self._min_position_labels[key] = "/".join(sorted(self._min_positions[key]))
+            allowance = self._identity_allowance(player, portfolio_size)
+            current = self._min_allowed.get(key, allowance)
+            if allowance is None:
+                self._min_allowed.setdefault(key, None)
+            elif current is None:
+                self._min_allowed[key] = allowance
+            else:
+                self._min_allowed[key] = min(int(current), int(allowance))
+
+    def _identity_allowance(self, player: Player, portfolio_size: int) -> Optional[int]:
+        """Identity cap from the global max and a kicker cap. Captain % is not an identity cap."""
+        caps: List[int] = []
+        if self.max_exposure is not None:
+            caps.append(appearances_allowed(self.max_exposure, portfolio_size))
+        kicker = getattr(self, "kicker_max_exposure", None)
+        if kicker is not None and self._player_is_kicker(player):
+            caps.append(appearances_allowed(float(kicker), portfolio_size))
+        if not caps:
+            return None
+        return min(caps)
+
+    def _min_batch_state(
+        self,
+        pydfs_optimizer,
+        prior_frames: Sequence[pd.DataFrame],
+        portfolio_size: int,
+        skip_min: Sequence[tuple] = (),
+    ):
+        used = exposure_counts(prior_frames)
+        present = {
+            person_key(player.full_name, player.team)
+            for player in pydfs_optimizer.player_pool.filtered_players
+        }
+        skipped = set(skip_min)
+        remaining: Dict[tuple, int] = {}
+        for key, needed in self._min_targets.items():
+            if key not in present or key in skipped:
+                continue
+            still = max(0, int(needed) - int(used.get(key, 0)))
+            cap = self._min_allowed.get(key)
+            if cap is not None:
+                room = max(0, int(cap) - int(used.get(key, 0)))
+                still = min(still, room)
+            if still > 0:
+                remaining[key] = still
+        positions = {
+            key: self._min_positions.get(key, frozenset())
+            for key in remaining
+        }
+        extra = []
+        for attr, token in (
+            ("max_kickers", "K"),
+            ("max_dst", "DST"),
+            ("max_quarterbacks", "QB"),
+        ):
+            value = getattr(self, attr, None)
+            if value is not None:
+                extra.append((frozenset({token}), int(value)))
+        groups = min_force_groups(positions, self._min_roster_slots(), extra)
+        return remaining, groups
+
+    def _limit_failure_message(self) -> str:
+        parts = []
+        if self.last_shortfall is not None and self.last_shortfall.message:
+            parts.append(self.last_shortfall.message)
+        report = self.last_min_report
+        if report is not None and report.message:
+            parts.append(report.message)
+        return " ".join(parts) or "The solver could not build a lineup."
+
+    def _finalize_min_report(self, lineups: Sequence[pd.DataFrame], requested: int) -> None:
+        if not self._min_targets or self.min_exposure is None or float(self.min_exposure) <= 0.0:
+            self.last_min_report = None
+            return
+        self.last_min_report = evaluate_min_exposure(
+            lineups,
+            needed=self._min_targets,
+            allowed=self._min_allowed,
+            positions=self._min_positions,
+            slots=self._min_slot_defs or self._min_roster_slots(),
+            requested=int(requested),
+            names=self._min_names,
+            teams=self._min_teams,
+            position_labels=self._min_position_labels,
+        )
+
     def _finish_shortfall(self, frames: Sequence[pd.DataFrame], requested: int) -> None:
         if self._inside_portfolio:
             return
+        self._finalize_min_report(frames, requested)
         if len(frames) >= int(requested):
             self.last_shortfall = None
             return
@@ -1416,6 +1764,7 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
         if not self._inside_portfolio:
             self.last_shortfall = None
             self.portfolio_size = count
+            self._reset_min_tracking()
         prior = self._prior_frames(existing_lineups)
         self._active_prior_lineups = prior
         self._active_batch_size = count
@@ -1433,8 +1782,9 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
             if self._inside_portfolio:
                 raw_lineups = []
             elif self._limits_configured():
+                self._finalize_min_report([], count)
                 self.last_shortfall = self.explain_lineup_shortfall([], count)
-                raise RuntimeError(self.last_shortfall.message) from exc
+                raise RuntimeError(self._limit_failure_message()) from exc
             else:
                 raise
         frames = [self.format_lineup(lineup) for lineup in raw_lineups]
@@ -2150,6 +2500,7 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         if not self._inside_portfolio:
             self.last_shortfall = None
             self.portfolio_size = count
+            self._reset_min_tracking()
         players = self._players_for_optimize()
         try:
             if self.require_starting_core:
@@ -2166,8 +2517,9 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         except GenerateLineupException as exc:
             self._solver_constraint_notes = list(getattr(exc, "invalid_constraints", []) or [])
             if self._limits_configured():
+                self._finalize_min_report([], count)
                 self.last_shortfall = self.explain_lineup_shortfall([], count)
-                raise RuntimeError(self.last_shortfall.message) from exc
+                raise RuntimeError(self._limit_failure_message()) from exc
             raise
         self._finish_shortfall(frames, count)
         return frames
@@ -2316,6 +2668,9 @@ def optimize_tiered_salaries(
     optimizer._inside_portfolio = True
     optimizer.portfolio_size = int(total_n)
     optimizer.last_shortfall = None
+    reset_min = getattr(optimizer, "_reset_min_tracking", None)
+    if reset_min is not None:
+        reset_min()
     try:
         if standard_n:
             optimizer.set_max_salary_cap(standard_cap)
@@ -2331,6 +2686,9 @@ def optimize_tiered_salaries(
             optimizer.last_shortfall = optimizer.explain_lineup_shortfall(lineups, total_n)
         else:
             optimizer.last_shortfall = None
+        finalize_min = getattr(optimizer, "_finalize_min_report", None)
+        if finalize_min is not None:
+            finalize_min(lineups, total_n)
     finally:
         optimizer._inside_portfolio = previous_inside
         optimizer.portfolio_size = previous_size
@@ -2381,6 +2739,9 @@ def optimize_game_scripts(
     optimizer._inside_portfolio = True
     optimizer.portfolio_size = requested
     optimizer.last_shortfall = None
+    reset_min = getattr(optimizer, "_reset_min_tracking", None)
+    if reset_min is not None:
+        reset_min()
     try:
         optimizer.set_qb_stack(
             True, pass_catchers=1, bring_back=True, bring_back_position="SKILL"
@@ -2412,6 +2773,9 @@ def optimize_game_scripts(
             optimizer.last_shortfall = optimizer.explain_lineup_shortfall(prior, requested)
         else:
             optimizer.last_shortfall = None
+        finalize_min = getattr(optimizer, "_finalize_min_report", None)
+        if finalize_min is not None:
+            finalize_min(prior, requested)
         return prior
     finally:
         optimizer._inside_portfolio = previous_inside
@@ -2441,15 +2805,22 @@ def game_script_summary(lineups: Sequence[pd.DataFrame]) -> pd.DataFrame:
 def player_exposure_table(
     lineups: Sequence[pd.DataFrame],
     requested: Optional[int] = None,
+    min_players: Optional[Sequence[dict]] = None,
 ) -> pd.DataFrame:
     """How often each real player appears, highest count first.
 
     Showdown captain and flex rows of the same name and team are one player.
     ``Exported %`` is the share of the lineups that were built. ``Requested %``
-    is the share of ``requested``. The DraftKings upload file cannot carry
-    this table; use ``exposure_report_csv`` for a separate summary.
+    is the share of ``requested``. ``min_players`` adds each minimum and
+    whether the count met it, including a player who was never rostered.
+    The DraftKings upload file cannot carry this table; use
+    ``exposure_report_csv`` for a separate summary.
     """
-    return exposure_report_frame(lineups, requested=requested)
+    return exposure_report_frame(
+        lineups,
+        requested=requested,
+        min_players=min_players,
+    )
 
 
 def get_nfl_optimizer(contest_format: ContestFormat | str) -> BaseNFLOptimizer:
