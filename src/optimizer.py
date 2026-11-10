@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -18,6 +18,16 @@ from pydfs_lineup_optimizer.solvers.constants import SolverSign
 from pydfs_lineup_optimizer.stacks import PlayersGroup, PositionsStack
 
 from .identity import install_person_uniqueness
+from .lineup_rules import (
+    ConstructionSettings,
+    dropped_rule_message,
+    install_construction_rule,
+    normalize_spreads,
+    plan_construction,
+    report_from_messages,
+    underdog_running_backs,
+    verify_lineups,
+)
 from .names import player_person_key
 from .parser import drop_inactive_players, is_inactive_injury, parse_dk_csv
 from .portfolio import (
@@ -698,6 +708,8 @@ class BaseNFLOptimizer:
         self._min_priority: Dict[tuple, float] = {}
         self._min_slot_defs: tuple = ()
         self._solver_constraint_notes: List[str] = []
+        # Jittered pool captured before lineup rules run. Rules do not edit it.
+        self.last_projected_frame: Optional[pd.DataFrame] = None
 
     def set_locked_players(self, player_ids: Optional[Sequence[str]]) -> None:
         """Force these player IDs into the lineup. Empty clears the locks."""
@@ -814,6 +826,7 @@ class BaseNFLOptimizer:
             position_jitter_sds=self.position_jitter_sds,
             seed=self.jitter_seed,
         )
+        self.last_projected_frame = jittered.copy()
         return dataframe_to_players(
             jittered,
             contest_format=ContestFormat(self.contest_format),
@@ -1392,6 +1405,9 @@ class BaseNFLOptimizer:
         report = self.last_min_report
         if report is not None and report.message:
             parts.append(report.message)
+        construction = getattr(self, "last_construction_report", None)
+        if construction is not None and construction.message:
+            parts.append(construction.message)
         return " ".join(parts) or "The solver could not build a lineup."
 
     def _finalize_min_report(self, lineups: Sequence[pd.DataFrame], requested: int) -> None:
@@ -1414,6 +1430,9 @@ class BaseNFLOptimizer:
         if self._inside_portfolio:
             return
         self._finalize_min_report(frames, requested)
+        finalize_rules = getattr(self, "_finalize_construction_report", None)
+        if finalize_rules is not None:
+            finalize_rules(frames)
         if len(frames) >= int(requested):
             self.last_shortfall = None
             return
@@ -1595,6 +1614,179 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
         self.flex_positions: Optional[Tuple[str, ...]] = None
         # None leaves cheap skill players eligible. Cash sets this to $4,200.
         self.min_skill_salary: Optional[int] = None
+        # Large-field lineup rules. Off leaves the solver on the previous path.
+        self.primary_stack: bool = False
+        self.primary_pass_catchers: int = 2
+        self.primary_bring_backs: int = 1
+        self.primary_game_min: int = 4
+        self.primary_game_max: int = 5
+        self.primary_bring_back_wr1: bool = False
+        self.mini_stack: bool = False
+        self.mini_stack_count: int = 1
+        self.rb_dst_favorite: bool = False
+        self.favorite_margin: float = 7.0
+        self.ban_underdog_rbs: bool = False
+        self.underdog_margin: float = 7.0
+        self.vegas_spreads: Dict[str, float] = {}
+        self._construction_unmet: List[str] = []
+        self._construction_dropped: set[str] = set()
+        self._construction_applied: ConstructionSettings = ConstructionSettings()
+        self.last_construction_report = None
+
+    def set_vegas_spreads(self, lines: Optional[Mapping[str, object]]) -> None:
+        """Store signed spreads for lineup rules. This does not change projections."""
+        self.vegas_spreads = normalize_spreads(lines)
+
+    def construction_settings(self) -> ConstructionSettings:
+        return ConstructionSettings(
+            primary_stack=bool(self.primary_stack),
+            pass_catchers=int(self.primary_pass_catchers),
+            bring_backs=int(self.primary_bring_backs),
+            game_min=int(self.primary_game_min),
+            game_max=int(self.primary_game_max),
+            bring_back_wr1=bool(self.primary_bring_back_wr1),
+            mini_stack=bool(self.mini_stack),
+            mini_count=int(self.mini_stack_count),
+            rb_dst_favorite=bool(self.rb_dst_favorite),
+            favorite_margin=float(self.favorite_margin),
+            ban_underdog_rbs=bool(self.ban_underdog_rbs),
+            underdog_margin=float(self.underdog_margin),
+        )
+
+    def _reset_construction_tracking(self) -> None:
+        self._construction_unmet = []
+        self._construction_dropped = set()
+        self._construction_applied = ConstructionSettings()
+        self.last_construction_report = None
+
+    def _apply_lineup_construction(
+        self,
+        optimizer,
+        players: Sequence[Player],
+        *,
+        skip: Optional[set[str]] = None,
+        record: bool = True,
+    ) -> None:
+        """Add lineup rules that are still feasible. Projections are not edited."""
+        settings = self.construction_settings()
+        skipped = set(skip or ())
+        if "primary" in skipped:
+            settings = replace(settings, primary_stack=False, bring_back_wr1=False)
+        if "mini" in skipped:
+            settings = replace(settings, mini_stack=False)
+        if "favorite" in skipped:
+            settings = replace(settings, rb_dst_favorite=False)
+        if "dogs" in skipped:
+            settings = replace(settings, ban_underdog_rbs=False)
+        if not settings.any_enabled:
+            self._construction_applied = settings
+            return
+        plan = plan_construction(
+            players,
+            settings,
+            self.vegas_spreads,
+            self.locked_player_ids,
+        )
+        if plan.applied.ban_underdog_rbs:
+            for player in underdog_running_backs(
+                players,
+                self.vegas_spreads,
+                plan.applied.underdog_margin,
+                self.locked_player_ids,
+            ):
+                optimizer.player_pool.remove_player(player)
+        install_construction_rule(optimizer, plan.applied, self.vegas_spreads)
+        self._construction_applied = plan.applied
+        if record:
+            self._construction_unmet.extend(plan.messages)
+            self._construction_dropped.update(plan.dropped)
+
+    def _finalize_construction_report(self, frames: Sequence[pd.DataFrame]) -> None:
+        applied = self._construction_applied
+        if "primary" in self._construction_dropped:
+            applied = replace(applied, primary_stack=False, bring_back_wr1=False)
+        if "mini" in self._construction_dropped:
+            applied = replace(applied, mini_stack=False)
+        if "favorite" in self._construction_dropped:
+            applied = replace(applied, rb_dst_favorite=False)
+        if "dogs" in self._construction_dropped:
+            applied = replace(applied, ban_underdog_rbs=False)
+        extras = verify_lineups(
+            frames,
+            applied,
+            pool=self._player_df,
+            spreads=self.vegas_spreads,
+            locked_ids=self.locked_player_ids,
+        )
+        self.last_construction_report = report_from_messages(
+            [*self._construction_unmet, *extras],
+            applied,
+        )
+
+    def _solve_with_construction(
+        self,
+        players: Sequence[Player],
+        count: int,
+        prior: Sequence[pd.DataFrame],
+        skip: set[str],
+        *,
+        record: bool,
+    ):
+        optimizer = self._build_optimizer(players, skip_rules=skip, record_rules=record)
+        return self._consume_lineups(optimizer, count, players, prior)
+
+    def _relax_construction(
+        self,
+        players: Sequence[Player],
+        count: int,
+        prior: Sequence[pd.DataFrame],
+    ):
+        """Build without a rule that made the whole batch infeasible, and name it."""
+        requested = self.construction_settings()
+        if not requested.any_enabled:
+            return None
+        order = ("primary", "mini", "favorite", "dogs")
+        enabled = {
+            "primary": requested.primary_stack,
+            "mini": requested.mini_stack,
+            "favorite": requested.rb_dst_favorite,
+            "dogs": requested.ban_underdog_rbs,
+        }
+        active = [
+            rule
+            for rule in order
+            if enabled[rule] and rule not in self._construction_dropped
+        ]
+        if not active:
+            return None
+        bare_skip = set(active) | set(self._construction_dropped)
+        try:
+            bare = self._solve_with_construction(
+                players, count, prior, bare_skip, record=False
+            )
+        except GenerateLineupException:
+            return None
+        if not bare:
+            return None
+        kept_skip = set(bare_skip)
+        best = bare
+        for rule in order:
+            if rule not in active:
+                continue
+            trial_skip = kept_skip - {rule}
+            try:
+                trial = self._solve_with_construction(
+                    players, count, prior, trial_skip, record=False
+                )
+            except GenerateLineupException:
+                trial = []
+            if len(trial) < len(best):
+                self._construction_unmet.append(dropped_rule_message(rule))
+                self._construction_dropped.add(rule)
+                continue
+            kept_skip = trial_skip
+            best = trial
+        return best
 
     def set_qb_stack(
         self,
@@ -1661,7 +1853,13 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
                 )
             )
 
-    def _build_optimizer(self, players: List[Player]):
+    def _build_optimizer(
+        self,
+        players: List[Player],
+        *,
+        skip_rules=(),
+        record_rules: bool = True,
+    ):
         optimizer = get_optimizer(self.site, self.sport)
         install_person_uniqueness(optimizer)
         self._apply_salary_caps(optimizer)
@@ -1716,6 +1914,12 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
         self._apply_locked_players(optimizer)
         self._apply_exclude_vs_dst(optimizer)
         self._apply_ownership_cap(optimizer)
+        self._apply_lineup_construction(
+            optimizer,
+            players,
+            skip=set(skip_rules),
+            record=record_rules,
+        )
         return optimizer
 
     def _apply_skill_salary_floor(self, optimizer, players: List[Player]) -> None:
@@ -1785,6 +1989,7 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
             self.last_shortfall = None
             self.portfolio_size = count
             self._reset_min_tracking()
+            self._reset_construction_tracking()
         prior = self._prior_frames(existing_lineups)
         self._active_prior_lineups = prior
         self._active_batch_size = count
@@ -1799,13 +2004,18 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
             raw_lineups = self._consume_lineups(optimizer, count, players, prior)
         except GenerateLineupException as exc:
             self._solver_constraint_notes = list(getattr(exc, "invalid_constraints", []) or [])
-            if self._inside_portfolio:
+            relaxed = self._relax_construction(players, count, prior)
+            if relaxed is not None:
+                raw_lineups = relaxed
+            elif self._inside_portfolio:
                 raw_lineups = []
             elif self._limits_configured():
                 self._finalize_min_report([], count)
+                self._finalize_construction_report([])
                 self.last_shortfall = self.explain_lineup_shortfall([], count)
                 raise RuntimeError(self._limit_failure_message()) from exc
             else:
+                self._finalize_construction_report([])
                 raise
         frames = [self.format_lineup(lineup) for lineup in raw_lineups]
         if game_script:
@@ -2682,6 +2892,9 @@ def optimize_tiered_salaries(
     reset_min = getattr(optimizer, "_reset_min_tracking", None)
     if reset_min is not None:
         reset_min()
+    reset_rules = getattr(optimizer, "_reset_construction_tracking", None)
+    if reset_rules is not None:
+        reset_rules()
     try:
         if standard_n:
             optimizer.set_max_salary_cap(standard_cap)
@@ -2700,6 +2913,9 @@ def optimize_tiered_salaries(
         finalize_min = getattr(optimizer, "_finalize_min_report", None)
         if finalize_min is not None:
             finalize_min(lineups, total_n)
+        finalize_rules = getattr(optimizer, "_finalize_construction_report", None)
+        if finalize_rules is not None:
+            finalize_rules(lineups)
     finally:
         optimizer._inside_portfolio = previous_inside
         optimizer.portfolio_size = previous_size
@@ -2721,6 +2937,11 @@ _GAME_SCRIPT_FIELDS = (
     "flex_positions",
     "exclude_vs_dst",
     "max_repeating_players",
+    "primary_stack",
+    "mini_stack",
+    "rb_dst_favorite",
+    "ban_underdog_rbs",
+    "primary_bring_back_wr1",
 )
 
 
@@ -2753,10 +2974,18 @@ def optimize_game_scripts(
     reset_min = getattr(optimizer, "_reset_min_tracking", None)
     if reset_min is not None:
         reset_min()
+    reset_rules = getattr(optimizer, "_reset_construction_tracking", None)
+    if reset_rules is not None:
+        reset_rules()
     try:
         optimizer.set_qb_stack(
             True, pass_catchers=1, bring_back=True, bring_back_position="SKILL"
         )
+        optimizer.primary_stack = False
+        optimizer.mini_stack = False
+        optimizer.rb_dst_favorite = False
+        optimizer.ban_underdog_rbs = False
+        optimizer.primary_bring_back_wr1 = False
         optimizer.require_wr_in_stack = False
         optimizer.slate_aware_gpp = False
         optimizer.flex_positions = GAME_SCRIPT_FLEX
@@ -2787,6 +3016,9 @@ def optimize_game_scripts(
         finalize_min = getattr(optimizer, "_finalize_min_report", None)
         if finalize_min is not None:
             finalize_min(prior, requested)
+        finalize_rules = getattr(optimizer, "_finalize_construction_report", None)
+        if finalize_rules is not None:
+            finalize_rules(prior)
         return prior
     finally:
         optimizer._inside_portfolio = previous_inside

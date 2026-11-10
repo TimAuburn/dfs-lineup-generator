@@ -107,6 +107,20 @@ class PresetConfig:
     # Showdown cash tries to roster both starting QBs and both starting RBs.
     require_starting_core: bool = False
     allow_kicker_captain: bool = False
+    # Large-field lineup construction. Off on every preset except Large-Field GPP.
+    # These choose roster shape. They do not change a projection.
+    primary_stack: bool = False
+    primary_pass_catchers: int = 2
+    primary_bring_backs: int = 1
+    primary_game_min: int = 4
+    primary_game_max: int = 5
+    primary_bring_back_wr1: bool = False
+    mini_stack: bool = False
+    mini_stack_count: int = 1
+    rb_dst_favorite: bool = False
+    favorite_margin: float = 7.0
+    ban_underdog_rbs: bool = False
+    underdog_margin: float = 7.0
     # Showdown cash captain pool. None keeps the default CPT positions.
     captain_positions: Optional[Tuple[str, ...]] = None
     captain_min_salary: Optional[int] = None
@@ -162,12 +176,26 @@ PRESET_CONFIGS: Dict[ContestPreset, PresetConfig] = {
         max_repeating_players=5,
         max_cumulative_ownership=1.25,
         max_player_exposure=0.50,
+        primary_stack=True,
+        primary_pass_catchers=2,
+        primary_bring_backs=1,
+        primary_game_min=4,
+        primary_game_max=5,
+        primary_bring_back_wr1=False,
+        mini_stack=True,
+        mini_stack_count=1,
+        rb_dst_favorite=True,
+        favorite_margin=7.0,
+        ban_underdog_rbs=False,
+        underdog_margin=7.0,
         tiered_salary=True,
         tiered_leave_ratio=0.40,
         tiered_discount_floor=49_200,
         tiered_discount_cap=49_700,
         description=(
             "Large-field multi-entry: QB + WR + WR/TE, skill bring-back, "
+            "4–5 players from the quarterback's game, one other two-player "
+            "same-game stack, and a favorite's DST paired with that team's RB. "
             "FLEX is WR or RB, slate-aware overlap, 50% player exposure, "
             "salary from $49,200 to $50,000."
         ),
@@ -336,6 +364,7 @@ def format_preset_summary(config: PresetConfig) -> List[Tuple[str, str]]:
             rows.append(("Stacks", stack))
         else:
             rows.append(("Stacks", "None"))
+        rows.extend(_construction_summary_rows(config))
         rows.append(("Flex", flex_position_label(config.flex_positions)))
         if config.min_skill_salary is not None:
             rows.append(("Skill salary floor", f"${config.min_skill_salary:,}"))
@@ -455,6 +484,67 @@ def format_preset_summary(config: PresetConfig) -> List[Tuple[str, str]]:
     return rows
 
 
+def _points_label(value: float) -> str:
+    number = float(value)
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:g}"
+
+
+def _construction_summary_rows(config: PresetConfig) -> List[Tuple[str, str]]:
+    """Lineup-construction rows. Cash and small-field stay Off unless overridden."""
+    if config.primary_stack:
+        primary = (
+            f"QB + at least {int(config.primary_pass_catchers)} WR/TE + "
+            f"at least {int(config.primary_bring_backs)} bring-back (RB/WR/TE). "
+            "DST is not a pass catcher or a bring-back."
+        )
+        window = (
+            f"{int(config.primary_game_min)}–{int(config.primary_game_max)}, including DST"
+        )
+        if config.primary_bring_back_wr1:
+            wr1 = "Yes — highest-salary WR on the opposing team"
+        else:
+            wr1 = "No"
+    else:
+        primary = "Off"
+        window = "Off"
+        wr1 = "Off"
+    if config.mini_stack:
+        count = int(config.mini_stack_count)
+        if count == 0:
+            mini = "On, at least 0 (no extra stack required)"
+        else:
+            mini = (
+                f"At least {count} game(s) with 2 offensive players "
+                "outside the QB's game"
+            )
+    else:
+        mini = "Off"
+    if config.rb_dst_favorite:
+        favorite = (
+            "DST paired with a same-team RB, favored by at least "
+            f"{_points_label(config.favorite_margin)}"
+        )
+    else:
+        favorite = "Off"
+    if config.ban_underdog_rbs:
+        dogs = (
+            "Exclude RBs on teams that are underdogs by at least "
+            f"{_points_label(config.underdog_margin)}"
+        )
+    else:
+        dogs = "Off"
+    return [
+        ("Primary stack", primary),
+        ("QB game players", window),
+        ("Bring-back WR1", wr1),
+        ("Secondary mini-stack", mini),
+        ("Favorite RB + DST", favorite),
+        ("Underdog RB restriction", dogs),
+    ]
+
+
 def _tiered_salary_label(config: PresetConfig) -> str:
     if not config.tiered_salary:
         return "Off"
@@ -540,6 +630,19 @@ def apply_preset(
         optimizer.flex_positions = config.flex_positions
     if hasattr(optimizer, "min_skill_salary"):
         optimizer.min_skill_salary = config.min_skill_salary
+    if hasattr(optimizer, "primary_stack"):
+        optimizer.primary_stack = bool(config.primary_stack)
+        optimizer.primary_pass_catchers = int(config.primary_pass_catchers)
+        optimizer.primary_bring_backs = int(config.primary_bring_backs)
+        optimizer.primary_game_min = int(config.primary_game_min)
+        optimizer.primary_game_max = int(config.primary_game_max)
+        optimizer.primary_bring_back_wr1 = bool(config.primary_bring_back_wr1)
+        optimizer.mini_stack = bool(config.mini_stack)
+        optimizer.mini_stack_count = int(config.mini_stack_count)
+        optimizer.rb_dst_favorite = bool(config.rb_dst_favorite)
+        optimizer.favorite_margin = float(config.favorite_margin)
+        optimizer.ban_underdog_rbs = bool(config.ban_underdog_rbs)
+        optimizer.underdog_margin = float(config.underdog_margin)
 
     if hasattr(optimizer, "configure_showdown_rules"):
         optimizer.configure_showdown_rules(
