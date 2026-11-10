@@ -52,15 +52,15 @@ def test_blank_env_keys_are_none(tmp_path, monkeypatch):
 
 
 def test_indoor_stadium_map():
-    expected_indoor = {"ARI", "ATL", "DAL", "DET", "HOU", "IND", "LV", "MIN", "NO"}
+    expected_indoor = {"ARI", "ATL", "DAL", "DET", "HOU", "IND", "LAC", "LAR", "LV", "MIN", "NO"}
     assert set(indoor_teams()) == expected_indoor
     assert INDOOR_TEAM_ABBREVS == expected_indoor
     for team in expected_indoor:
         assert is_outdoor_stadium(team) is False
         assert STADIUMS[team].is_outdoor is False
-    # SoFi is outdoor for both LA clubs.
-    assert is_outdoor_stadium("LAR") is True
-    assert is_outdoor_stadium("LAC") is True
+    # SoFi's fixed canopy is enclosed for both LA clubs, same as LV and MIN.
+    assert STADIUMS["LAC"].enclosure == "fixed_roof"
+    assert STADIUMS["LAR"].enclosure == "fixed_roof"
     assert is_outdoor_stadium("BUF") is True
     # Unknown abbrev defaults to outdoor (do not skip wind silently).
     assert is_outdoor_stadium("XYZ") is True
@@ -167,11 +167,111 @@ def test_apply_weather_downgrades_outdoor_high_wind_only():
     assert by_name["Bass"] == pytest.approx(8.0 * WIND_K_FACTOR)
     assert by_name["BillsDST"] == pytest.approx(7.0)
     assert by_name["Prescott"] == pytest.approx(18.0)  # indoor, ignore wind
-    assert by_name["Stafford"] == pytest.approx(16.0)  # outdoor but under threshold
+    assert by_name["Stafford"] == pytest.approx(16.0)  # SoFi is enclosed
 
     labels = weather_adjustment_labels(pool, weather)
     assert any(label.startswith("BUF wind 22") for label in labels)
     assert not any(label.startswith("DAL") for label in labels)
+
+
+def test_sofi_home_games_skip_the_wind_adjustment(tmp_path, monkeypatch):
+    """LAC and LAR home games are enclosed, so wind above the threshold is not applied."""
+    wind = WIND_THRESHOLD_MPH + 7.0
+    assert should_apply_wind("LAC", wind) is False
+    assert should_apply_wind("LAR", wind) is False
+    assert should_apply_wind("LV", wind) is False
+    assert should_apply_wind("MIN", wind) is False
+    assert should_apply_wind("BUF", wind) is True
+
+    pool = pd.DataFrame(
+        [
+            {
+                "Name": "Herbert",
+                "TeamAbbrev": "LAC",
+                "Position": "QB",
+                "Projection": 20.0,
+                "Game Info": "DEN@LAC 04:25PM ET",
+            },
+            {
+                "Name": "Johnston",
+                "TeamAbbrev": "LAC",
+                "Position": "WR",
+                "Projection": 12.0,
+                "Game Info": "DEN@LAC 04:25PM ET",
+            },
+            {
+                "Name": "Dicker",
+                "TeamAbbrev": "LAC",
+                "Position": "K",
+                "Projection": 8.0,
+                "Game Info": "DEN@LAC 04:25PM ET",
+            },
+            {
+                "Name": "Stafford",
+                "TeamAbbrev": "LAR",
+                "Position": "QB",
+                "Projection": 18.0,
+                "Game Info": "SEA@LAR 04:05PM ET",
+            },
+            {
+                "Name": "Nacua",
+                "TeamAbbrev": "LAR",
+                "Position": "WR",
+                "Projection": 16.0,
+                "Game Info": "SEA@LAR 04:05PM ET",
+            },
+            {
+                "Name": "Karty",
+                "TeamAbbrev": "LAR",
+                "Position": "K",
+                "Projection": 9.0,
+                "Game Info": "SEA@LAR 04:05PM ET",
+            },
+            {
+                "Name": "Allen",
+                "TeamAbbrev": "BUF",
+                "Position": "QB",
+                "Projection": 22.0,
+                "Game Info": "KC@BUF 01:00PM ET",
+            },
+        ]
+    )
+    weather = {
+        home: {"home_team": home, "wind_mph": wind, "is_outdoor": home == "BUF"}
+        for home in ("LAC", "LAR", "BUF")
+    }
+    adjusted = apply_weather_projections(pool, weather)
+    by_name = dict(zip(adjusted["Name"], adjusted["Projection"]))
+    assert by_name["Herbert"] == pytest.approx(20.0)
+    assert by_name["Johnston"] == pytest.approx(12.0)
+    assert by_name["Dicker"] == pytest.approx(8.0)
+    assert by_name["Stafford"] == pytest.approx(18.0)
+    assert by_name["Nacua"] == pytest.approx(16.0)
+    assert by_name["Karty"] == pytest.approx(9.0)
+    assert by_name["Allen"] == pytest.approx(22.0 * WIND_PASS_FACTOR)
+
+    calls: list[str] = []
+
+    def _refuse(url: str, timeout: float = 20):
+        calls.append(url)
+        raise AssertionError(url)
+
+    monkeypatch.setattr("src.weather._http_get", _refuse)
+    fetched = fetch_weather_for_homes(
+        ["LAC", "LAR"],
+        force_refresh=True,
+        cache_path=tmp_path / "weather.json",
+        now=datetime(2026, 11, 8, 12, 0),
+    )
+    assert calls == []
+    assert fetched["LAC"]["is_outdoor"] is False
+    assert fetched["LAR"]["is_outdoor"] is False
+    assert fetched["LAC"]["applies_wind"] is False
+    assert fetched["LAR"]["applies_wind"] is False
+    assert fetched["LAC"]["wind_mph"] is None
+    assert fetched["LAR"]["wind_mph"] is None
+    assert fetched["LAC"]["phrase"] == "Indoor / enclosed — weather skipped"
+    assert fetched["LAR"]["phrase"] == "Indoor / enclosed — weather skipped"
 
 
 def test_parse_weather_payload_sets_applies_wind():

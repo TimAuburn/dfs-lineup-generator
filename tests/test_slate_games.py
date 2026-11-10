@@ -5,12 +5,15 @@ Lineup ids with every game on are the same ones main produces for seed 42.
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
 
 from src.exporter import CLASSIC_UPLOAD_COLUMNS, lineups_to_dk_upload_csv
+from src.kickoff_forecast import forecasts_for_matchups, weather_label
 from src.lineup_rules import ConstructionSettings, active_game_shortfall
 from src.optimizer import NFLClassicOptimizer, NFLShowdownOptimizer, games_from_pool
 from src.parser import parse_dk_csv
@@ -100,6 +103,34 @@ def test_table_shows_source_total_and_favorite():
     assert "Fetched:" in odds_source_caption(1_700_000_000.0)
     assert "not fetched" in odds_source_caption(None)
     assert "National Weather Service hourly" in forecast_source_caption(None)
+
+
+def test_sofi_home_game_shows_dome_and_skips_nws(tmp_path):
+    """A LAC or LAR home game is enclosed in the games table and does not call NWS."""
+
+    def explode(url: str):
+        raise AssertionError(f"NWS was called for a SoFi home game: {url}")
+
+    pool = pd.DataFrame(
+        [
+            _player("Matthew Stafford", "LAR", "1", "SEA@LAR 11/08/2026 04:05PM ET", position="QB"),
+            _player("Justin Herbert", "LAC", "2", "DEN@LAC 11/08/2026 04:25PM ET", position="QB"),
+        ]
+    )
+    matchups = matchups_from_pool(pool)
+    forecasts = forecasts_for_matchups(
+        matchups,
+        slate_key="sofi",
+        cache_path=tmp_path / "kickoff.json",
+        http_get=explode,
+        now=datetime(2026, 11, 8, 13, 0, tzinfo=ZoneInfo("America/New_York")),
+    )
+    labels = {item.game: weather_label(item) for item in forecasts}
+    frame = games_table_frame(matchups, {}, labels)
+    assert list(frame["Matchup"]) == ["SEA @ LAR", "DEN @ LAC"]
+    assert list(frame["Weather"]) == ["🏟️ Dome", "🏟️ Dome"]
+    assert {item.status for item in forecasts} == {"dome"}
+    assert {item.summary for item in forecasts} == {"Dome"}
 
 
 def test_missing_total_or_spread_is_missing_and_not_zero():
