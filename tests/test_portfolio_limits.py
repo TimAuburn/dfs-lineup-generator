@@ -6,6 +6,7 @@ each other, and Showdown captain and flex rows each received their own cap.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -43,15 +44,19 @@ def test_person_key_matches_the_player_pool():
     ("rate", "total", "allowed"),
     [
         (0.5, 4, 2),
-        (0.4, 6, 3),
-        (0.5, 1, 1),
+        (0.4, 6, 2),
+        (0.25, 4, 1),
+        (0.5, 1, 0),
+        (0.1, 4, 0),
         (0.3, 20, 6),
         (0.0, 4, 0),
         (None, 4, 4),
     ],
 )
-def test_appearances_allowed_matches_total_exposure_strategy(rate, total, allowed):
+def test_appearances_allowed_is_floor_of_rate_times_requested(rate, total, allowed):
     assert appearances_allowed(rate, total) == allowed
+    if rate is not None and rate > 0:
+        assert allowed == math.floor(float(rate) * total + 1e-9)
 
 
 def _assert_limits(lineups, *, requested, overlap, exposure, stack_rate=None, stack_spec=()):
@@ -59,10 +64,12 @@ def _assert_limits(lineups, *, requested, overlap, exposure, stack_rate=None, st
     if overlap is not None:
         assert pairwise_overlap(lineups) <= int(overlap)
     if exposure is not None:
-        allowed = appearances_allowed(float(exposure), requested)
+        allowed = math.floor(float(exposure) * requested + 1e-9)
+        assert allowed == appearances_allowed(float(exposure), requested)
         assert all(count <= allowed for count in exposure_counts(lineups).values())
     if stack_rate is not None:
-        allowed = appearances_allowed(float(stack_rate), requested)
+        allowed = math.floor(float(stack_rate) * requested + 1e-9)
+        assert allowed == appearances_allowed(float(stack_rate), requested)
         usage = team_stack_counts(lineups, stack_spec)
         assert all(count <= allowed for count in usage.values())
 
@@ -109,11 +116,13 @@ def test_showdown_exposure_combines_captain_and_flex_for_josh_allen():
     assert counts[person_key("Josh Allen", "BUF")] <= 2
     _assert_limits(lineups, requested=4, overlap=None, exposure=0.5)
 
-    table = player_exposure_table(lineups)
+    table = player_exposure_table(lineups, requested=4)
     allen = table.loc[table["Name"].eq("Josh Allen")].iloc[0]
     assert int(allen["Lineups"]) == counts[person_key("Josh Allen", "BUF")]
     assert int(allen["CPT count"]) + int(allen["FLEX count"]) == int(allen["Lineups"])
     assert list(table["Name"]).count("Josh Allen") == 1
+    assert float(allen["Exported %"]) == pytest.approx(int(allen["Lineups"]) / 4 * 100, abs=0.05)
+    assert float(allen["Requested %"]) == pytest.approx(int(allen["Lineups"]) / 4 * 100, abs=0.05)
 
     upload = lineups_to_dk_upload_csv(lineups, contest_format="showdown")
     assert upload.splitlines()[0].split(",") == SHOWDOWN_UPLOAD_COLUMNS
@@ -121,6 +130,64 @@ def test_showdown_exposure_combines_captain_and_flex_for_josh_allen():
     assert report.splitlines()[0].startswith("Name,Team,Position,Lineups")
     assert "Josh Allen" in report
     assert "Exposure" not in upload
+
+
+def test_forty_percent_of_six_allows_at_most_two_on_the_single_batch_path():
+    """40% of 6 is 2. pydfs rounding would allow a third lineup."""
+    pool = parse_dk_csv(MOCK_CLASSIC)
+    pool.loc[pool["Name"].eq("Patrick Mahomes"), ["Projection", "AvgPointsPerGame"]] = 80
+    optimizer = NFLClassicOptimizer()
+    optimizer.load_from_dataframe(pool)
+    optimizer.set_qb_stack(enabled=False)
+    optimizer.set_max_repeating_players(None)
+    optimizer.jitter_pct = (0.0, 0.0)
+    optimizer.set_exposure_limits(max_exposure_pct=40)
+    lineups = optimizer.generate_lineups(6)
+    assert len(lineups) == 6
+    assert optimizer.last_shortfall is None
+    counts = exposure_counts(lineups)
+    assert counts[person_key("Patrick Mahomes", "KC")] == 2
+    assert all(count <= math.floor(0.40 * 6 + 1e-9) for count in counts.values())
+
+
+def test_forty_percent_of_six_holds_across_salary_tiers():
+    pool = parse_dk_csv(MOCK_CLASSIC)
+    pool.loc[pool["Name"].eq("Patrick Mahomes"), ["Projection", "AvgPointsPerGame"]] = 80
+    optimizer = NFLClassicOptimizer()
+    optimizer.load_from_dataframe(pool)
+    optimizer.set_qb_stack(enabled=False)
+    optimizer.set_max_repeating_players(None)
+    optimizer.jitter_pct = (0.0, 0.0)
+    optimizer.set_exposure_limits(max_exposure_pct=40)
+    lineups = optimize_tiered_salaries(
+        optimizer,
+        total_n=6,
+        leave_money_ratio=0.4,
+        standard_cap=50_000,
+        discount_cap=46_000,
+        discount_floor=40_000,
+    )
+    assert len(lineups) == 6
+    counts = exposure_counts(lineups)
+    assert counts[person_key("Patrick Mahomes", "KC")] == 2
+    assert all(count <= 2 for count in counts.values())
+
+
+def test_positive_exposure_below_one_lineup_allows_zero_and_names_the_cap():
+    optimizer = NFLClassicOptimizer()
+    optimizer.load_from_csv(MOCK_CLASSIC)
+    optimizer.set_qb_stack(enabled=False)
+    optimizer.set_max_repeating_players(None)
+    optimizer.jitter_pct = (0.0, 0.0)
+    optimizer.set_exposure_limits(max_exposure_pct=40)
+    with pytest.raises(RuntimeError, match="0 appearances"):
+        optimizer.generate_lineups(2)
+    shortfall = optimizer.last_shortfall
+    assert shortfall is not None
+    assert shortfall.built == 0
+    assert shortfall.requested == 2
+    assert "40%" in shortfall.message
+    assert "below one lineup" in shortfall.message
 
 
 def test_infeasible_overlap_returns_fewer_lineups_and_names_the_limit():

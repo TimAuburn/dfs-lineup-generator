@@ -17,13 +17,15 @@ This module is the portfolio layer around that solver:
 * Overlap is the size of the shared identity set for every pair in the final
   export, including pairs that came from different tiers, presets' internal
   batches, or game-script buckets.
-* Exposure and team-stack exposure use the same allowance as pydfs
-  ``TotalExposureStrategy`` on the requested portfolio size: a rate bans the
-  next lineup once ``rate <= used / requested``. The first appearance is
-  allowed whenever the rate is positive, because usage starts at zero. A rate
-  of zero allows nobody. ``set_max_repeating_players`` cannot express an
-  overlap of zero (it rejects values below 1), so overlap of zero is enforced
-  here.
+* Player exposure and team-stack exposure allow ``floor(rate * requested)``
+  appearances. A small epsilon keeps a whole number such as ``0.5 * 4`` from
+  being stored as ``1.999999999``. A positive rate that floors to 0 allows no
+  appearances: one lineup would already be more than the cap, and the shortfall
+  message names that cap. pydfs ``TotalExposureStrategy`` allows one more
+  appearance whenever ``rate * n`` is not an integer, and it ignores a rate of
+  0. This layer does not use that rounding. ``set_max_repeating_players``
+  cannot express an overlap of zero (it rejects values below 1), so overlap of
+  zero is enforced here.
 * Team-stack exposure, when the Classic solver has one, is the existing
   ``PositionsStack`` (same positions). A later batch passes
   ``max_exposure_per_team`` so that strategy allows only the uses still left
@@ -68,10 +70,11 @@ def person_key(name: object, team: object) -> Identity:
 def appearances_allowed(rate: Optional[float], total: int) -> int:
     """How many lineups one player or stack may occupy.
 
-    Matches ``TotalExposureStrategy.is_reached_exposure``: the next lineup is
-    banned once ``rate <= used / total``. ``None`` means no cap. A non-positive
-    rate allows zero. ``total`` is the requested portfolio size, not the
-    shorter export produced when the solver stops early.
+    ``floor(rate * total)`` after adding ``1e-9``, so ``0.5 * 4`` stays 2 and
+    ``0.4 * 6`` stays 2. ``None`` means no cap. A non-positive rate allows
+    zero. A positive rate whose product is below 1 also allows zero: the
+    first lineup would already exceed the cap. ``total`` is the requested
+    portfolio size.
     """
     total = int(total)
     if total <= 0:
@@ -80,7 +83,7 @@ def appearances_allowed(rate: Optional[float], total: int) -> int:
         return total
     if float(rate) <= 0.0:
         return 0
-    allowed = math.floor(float(rate) * total - 1e-9) + 1
+    allowed = math.floor(float(rate) * total + 1e-9)
     return max(0, min(total, allowed))
 
 
@@ -197,6 +200,22 @@ def team_stack_counts(
     return counts
 
 
+def solver_rate_for_remaining(remaining: int, batch_size: int) -> float:
+    """pydfs exposure fraction that allows at most ``remaining`` uses.
+
+    ``TotalExposureStrategy`` allows another lineup while ``rate > used / batch``.
+    ``remaining / batch`` can round up and allow one extra. ``(remaining - 0.5) /
+    batch`` allows exactly ``remaining``. A zero return does not ban by itself,
+    because pydfs treats a zero rate as uncapped; the caller removes the player
+    or adds a hard constraint.
+    """
+    if remaining <= 0 or batch_size <= 0:
+        return 0.0
+    if remaining >= batch_size:
+        return 1.0
+    return (int(remaining) - 0.5) / float(batch_size)
+
+
 def batch_team_stack_exposures(
     *,
     rate: float,
@@ -207,9 +226,10 @@ def batch_team_stack_exposures(
 ) -> Tuple[Dict[str, float], List[str]]:
     """Per-team ``PositionsStack`` rates for one batch, plus teams to block.
 
-    The returned rate is what pydfs should be given so this batch uses the
-    team at most ``remaining`` more times. Teams with no uses left are listed
-    separately; a zero rate would not ban them.
+    The returned rate is a pydfs ``TotalExposureStrategy`` fraction whose
+    allowance is exactly the floor-count still left. ``(remaining - 0.5) /
+    batch`` keeps that strategy from rounding up to one extra lineup. Teams
+    with nothing left are listed separately; a zero rate would not ban them.
     """
     allowed = appearances_allowed(rate, portfolio_size)
     per_team: Dict[str, float] = {}
@@ -220,10 +240,7 @@ def batch_team_stack_exposures(
         if remaining <= 0:
             blocked.append(str(team))
             continue
-        if remaining >= batch_size:
-            per_team[str(team)] = 1.0
-        else:
-            per_team[str(team)] = (remaining - 0.5) / float(batch_size)
+        per_team[str(team)] = solver_rate_for_remaining(remaining, batch_size)
     return per_team, blocked
 
 
@@ -288,9 +305,16 @@ def explain_shortfall(
         allowed = appearances_allowed(max_exposure, requested)
         at_cap = [key for key, count in counts.items() if count >= allowed]
         under = [key for key in eligible_set if counts.get(key, 0) < allowed]
-        if eligible_set and len(under) < int(roster_size):
+        percent = float(max_exposure) * 100
+        if allowed <= 0 and eligible_set:
             proven.append(
-                f"Max player exposure {float(max_exposure) * 100:.0f}% blocks another lineup: "
+                f"Max player exposure {percent:.0f}% allows 0 appearances in "
+                f"{requested} requested lineups. The cap is below one lineup, "
+                "so using a player would exceed it."
+            )
+        elif eligible_set and len(under) < int(roster_size):
+            proven.append(
+                f"Max player exposure {percent:.0f}% blocks another lineup: "
                 f"a player may appear in {allowed} of {requested} requested lineups, "
                 f"{len(under)} eligible players are still under that, and a lineup needs {int(roster_size)}."
             )
@@ -316,7 +340,13 @@ def explain_shortfall(
         allowed = appearances_allowed(stack_exposure, requested)
         usage = team_stack_counts(lineups, stack_spec)
         at_cap = sorted(team for team, count in usage.items() if count >= allowed)
-        if at_cap:
+        if allowed <= 0:
+            proven.append(
+                f"Team stack exposure {float(stack_exposure) * 100:.0f}% allows 0 stacks "
+                f"in {requested} requested lineups. The cap is below one lineup, "
+                "so a team stack would exceed it."
+            )
+        elif at_cap:
             candidates.append(
                 "Team stack exposure "
                 f"{float(stack_exposure) * 100:.0f}%: {', '.join(at_cap)} "
@@ -426,9 +456,9 @@ class PortfolioIdentityRule(OptimizerRule):
         for player, variable in players_dict.items():
             key = person_key(player.full_name, player.team)
             self.variables.setdefault(key, []).append(variable)
-        for key, count in self.used.items():
+        for key in set(self.variables) | set(self.used):
             allowed = self.allowance.get(key, self.default_allowed)
-            if allowed is not None and count >= allowed:
+            if allowed is not None and self.used.get(key, 0) >= allowed:
                 self.blocked.add(key)
 
     def apply_for_iteration(self, solver, result):
@@ -470,10 +500,19 @@ class PortfolioIdentityRule(OptimizerRule):
         self.history.append(seen)
 
 
-def exposure_report_frame(lineups: Sequence[pd.DataFrame]) -> pd.DataFrame:
-    """One row per real player. This is not a DraftKings upload file."""
-    columns = ["Name", "Team", "Position", "Lineups", "Exposure %"]
-    total = len(lineups)
+def exposure_report_frame(
+    lineups: Sequence[pd.DataFrame],
+    requested: Optional[int] = None,
+) -> pd.DataFrame:
+    """One row per real player. This is not a DraftKings upload file.
+
+    ``Lineups`` is the count. ``Exported %`` divides by the lineups that were
+    built. ``Requested %`` divides by the number the user asked for, so a
+    short export does not look like a higher cap.
+    """
+    columns = ["Name", "Team", "Position", "Lineups", "Exported %", "Requested %"]
+    exported = len(lineups)
+    requested_n = exported if requested is None else max(0, int(requested))
     # Classic also has a FLEX roster slot. Captain count columns are Showdown-only.
     show_slots = any(
         "Slot" in lineup.columns and lineup["Slot"].astype(str).str.upper().eq("CPT").any()
@@ -481,8 +520,17 @@ def exposure_report_frame(lineups: Sequence[pd.DataFrame]) -> pd.DataFrame:
         if lineup is not None and not lineup.empty
     )
     if show_slots:
-        columns = ["Name", "Team", "Position", "Lineups", "CPT count", "FLEX count", "Exposure %"]
-    if total == 0:
+        columns = [
+            "Name",
+            "Team",
+            "Position",
+            "Lineups",
+            "CPT count",
+            "FLEX count",
+            "Exported %",
+            "Requested %",
+        ]
+    if exported == 0:
         return pd.DataFrame(columns=columns)
 
     per_lineup: List[dict] = []
@@ -518,20 +566,28 @@ def exposure_report_frame(lineups: Sequence[pd.DataFrame]) -> pd.DataFrame:
             else {}
         ))
     )
-    grouped["Exposure %"] = (grouped["Lineups"] / total * 100).round(1)
+    grouped["Exported %"] = (grouped["Lineups"] / exported * 100).round(1)
+    if requested_n:
+        grouped["Requested %"] = (grouped["Lineups"] / requested_n * 100).round(1)
+    else:
+        grouped["Requested %"] = 0.0
     grouped = grouped.sort_values(
         ["Lineups", "Name"], ascending=[False, True], kind="mergesort"
     ).reset_index(drop=True)
     return grouped[columns]
 
 
-def exposure_report_csv(lineups: Sequence[pd.DataFrame]) -> str:
+def exposure_report_csv(
+    lineups: Sequence[pd.DataFrame],
+    requested: Optional[int] = None,
+) -> str:
     """Exposure summary CSV.
 
     DraftKings rejects extra columns on the upload file, so exposure stays in
     this separate report. Showdown captain and flex rows are one player.
+    ``Exported %`` uses the built set. ``Requested %`` uses ``requested``.
     """
-    return exposure_report_frame(lineups).to_csv(index=False)
+    return exposure_report_frame(lineups, requested=requested).to_csv(index=False)
 
 
 def _football_position(value: object) -> str:

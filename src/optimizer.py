@@ -23,6 +23,7 @@ from .portfolio import (
     PortfolioRuleState,
     appearances_allowed,
     batch_team_stack_exposures,
+    solver_rate_for_remaining,
     explain_shortfall,
     exposure_report_csv,
     exposure_report_frame,
@@ -854,7 +855,9 @@ class BaseNFLOptimizer:
         exposure = self.max_exposure
         kicker = getattr(self, "kicker_max_exposure", None)
         enforce_overlap = overlap is not None and (showdown or int(overlap) < 1)
-        enforce_exposure = exposure is not None and (showdown or bool(prior_frames))
+        # Every batch, including the first tier and a single Classic solve.
+        # pydfs allows one extra lineup when the percentage is not a whole number.
+        enforce_exposure = exposure is not None
         enforce_kicker = bool(showdown and kicker is not None)
         if not (enforce_overlap or enforce_exposure or enforce_kicker):
             return
@@ -878,6 +881,15 @@ class BaseNFLOptimizer:
             history.append(set(identities))
             for key in identities:
                 used[key] = used.get(key, 0) + 1
+        if enforce_exposure or enforce_kicker:
+            self._tighten_solver_exposure(
+                players,
+                used,
+                batch_size,
+                portfolio_size,
+                default_allowed if enforce_exposure else None,
+                kicker if enforce_kicker else None,
+            )
         pydfs_optimizer._portfolio_limits = PortfolioRuleState(
             portfolio_size=portfolio_size,
             overlap_cap=None if overlap is None else int(overlap),
@@ -888,6 +900,46 @@ class BaseNFLOptimizer:
             prior_history=history,
         )
         pydfs_optimizer.add_new_rule(PortfolioIdentityRule)
+
+    def _tighten_solver_exposure(
+        self,
+        players: Sequence[Player],
+        used: Dict[tuple, int],
+        batch_size: int,
+        portfolio_size: int,
+        default_allowed: Optional[int],
+        kicker_rate: Optional[float],
+    ) -> None:
+        """Set each player's pydfs rate so that strategy cannot beat the floor.
+
+        The identity rule is the combined captain/flex count. This fraction
+        stops a single row, and the first batch, from using pydfs's extra lineup.
+        """
+        kicker_allowed = (
+            None
+            if kicker_rate is None
+            else appearances_allowed(float(kicker_rate), portfolio_size)
+        )
+        for player in players:
+            key = person_key(player.full_name, player.team)
+            remaining_caps: List[int] = []
+            if default_allowed is not None:
+                remaining_caps.append(int(default_allowed) - int(used.get(key, 0)))
+            if kicker_allowed is not None and self._player_is_kicker(player):
+                remaining_caps.append(int(kicker_allowed) - int(used.get(key, 0)))
+            if not remaining_caps:
+                continue
+            rate = solver_rate_for_remaining(min(remaining_caps), batch_size)
+            current = player.max_exposure
+            if current is None or current > rate:
+                player.max_exposure = rate
+
+    @staticmethod
+    def _player_is_kicker(player: Player) -> bool:
+        positions = set(getattr(player, "original_positions", None) or ())
+        if "K" in positions or "K" in _player_positions(player):
+            return True
+        return False
 
     def _consume_lineups(self, pydfs_optimizer, count: int, players: Sequence[Player], prior_frames: Sequence[pd.DataFrame]):
         """Run one pydfs batch. A partial result is kept; an empty one is raised."""
@@ -900,7 +952,9 @@ class BaseNFLOptimizer:
             and overlap is not None
             and int(overlap) >= 1
         ):
-            exclude = _lineups_for_overlap(prior_frames, players) or None
+            # Removed and zero-exposure players are not in the solver dictionary.
+            available = pydfs_optimizer.player_pool.filtered_players
+            exclude = _lineups_for_overlap(prior_frames, available) or None
         raw = []
         self._solver_constraint_notes = []
         try:
@@ -1261,14 +1315,9 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
             per_team = None
             blocked: List[str] = []
             prior = list(getattr(self, "_active_prior_lineups", None) or [])
-            batch_size = getattr(self, "_active_batch_size", None)
-            portfolio_size = self.portfolio_size
-            if (
-                stack_exposure is not None
-                and prior
-                and batch_size
-                and portfolio_size
-            ):
+            batch_size = getattr(self, "_active_batch_size", None) or self.lineup_count
+            portfolio_size = self.portfolio_size or batch_size
+            if stack_exposure is not None and batch_size and portfolio_size:
                 usage = team_stack_counts(prior, normalize_stack_spec(spec))
                 teams = sorted({str(player.team) for player in players if player.team})
                 per_team, blocked = batch_team_stack_exposures(
@@ -2389,14 +2438,18 @@ def game_script_summary(lineups: Sequence[pd.DataFrame]) -> pd.DataFrame:
     )
 
 
-def player_exposure_table(lineups: Sequence[pd.DataFrame]) -> pd.DataFrame:
-    """How often each real player appears, highest exposure first.
+def player_exposure_table(
+    lineups: Sequence[pd.DataFrame],
+    requested: Optional[int] = None,
+) -> pd.DataFrame:
+    """How often each real player appears, highest count first.
 
     Showdown captain and flex rows of the same name and team are one player.
-    The DraftKings upload file cannot carry this table; use
-    ``exposure_report_csv`` for a separate summary.
+    ``Exported %`` is the share of the lineups that were built. ``Requested %``
+    is the share of ``requested``. The DraftKings upload file cannot carry
+    this table; use ``exposure_report_csv`` for a separate summary.
     """
-    return exposure_report_frame(lineups)
+    return exposure_report_frame(lineups, requested=requested)
 
 
 def get_nfl_optimizer(contest_format: ContestFormat | str) -> BaseNFLOptimizer:
