@@ -76,6 +76,7 @@ from src.player_pool import (
     generation_pool,
     locked_player_ids,
     position_choices,
+    person_key,
     projections_for_solve,
     set_captain,
     set_included,
@@ -90,6 +91,7 @@ from src.sleeper import (
     scoring_fallback_lines,
     scoring_metadata_current,
     sleeper_status_caption,
+    unmatched_players_warning,
 )
 from src.vegas_cache import (
     coverage_warnings,
@@ -1501,6 +1503,9 @@ if view == "Player pool":
         )
         st.stop()
     st.caption(sleeper_status_caption(st.session_state.sleeper_summary, pool))
+    unmatched_warning = unmatched_players_warning(st.session_state.sleeper_summary)
+    if unmatched_warning:
+        st.warning(unmatched_warning)
     fallback_line = scoring_fallback_lines(pool)
     if fallback_line:
         st.warning(fallback_line)
@@ -1532,7 +1537,16 @@ if view == "Player pool":
         if inactive_in_pool
         else ""
     )
-    player_count = pool["Name"].astype(str).str.strip().str.casefold().nunique()
+    teams = pool["TeamAbbrev"] if "TeamAbbrev" in pool.columns else [""] * len(pool)
+    positions = pool["Position"] if "Position" in pool.columns else [None] * len(pool)
+    player_count = len({
+        key
+        for key in (
+            person_key(name, team, position)
+            for name, team, position in zip(pool["Name"], teams, positions)
+        )
+        if key[0]
+    })
     st.caption(
         f"{player_count} players · {len(pool)} salary rows · {roster_n}-player roster · "
         f"salary cap ${DK_SALARY_CAP:,}{injury_note}."
@@ -1840,6 +1854,9 @@ if pool is None:
     st.info("Open Player pool and upload a DraftKings salary file before generating lineups.")
     st.stop()
 
+optimizer_unmatched = unmatched_players_warning(st.session_state.sleeper_summary)
+if optimizer_unmatched:
+    st.warning(optimizer_unmatched)
 working_pool = generation_pool(pool, showdown=is_showdown).reset_index(drop=True)
 locked_ids = locked_player_ids(working_pool, showdown=is_showdown)
 

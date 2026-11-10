@@ -34,7 +34,7 @@ def _record(first, last, team, position, points, injury=None):
 
 def test_normalize_player_name_drops_punctuation_and_suffixes():
     assert normalize_player_name("D.J. Moore") == "dj moore"
-    assert normalize_player_name("Amon-Ra St. Brown") == "amon-ra st brown"
+    assert normalize_player_name("Amon-Ra St. Brown") == "amon ra st brown"
     assert normalize_player_name("Kenneth Walker III") == "kenneth walker"
 
 

@@ -9,6 +9,8 @@ from typing import Any, Mapping, Optional, Sequence
 
 import pandas as pd
 
+from .names import person_key
+
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB_PATH = ROOT / "data" / "dfs_tracker.db"
 _GAME_DATE = re.compile(r"(\d{1,2})/(\d{1,2})/(\d{4})")
@@ -35,7 +37,7 @@ CREATE TABLE IF NOT EXISTS player_performance (
     salary INTEGER,
     ownership_pct REAL,
     actual_fpts REAL,
-    UNIQUE(contest_id, player_name, position) ON CONFLICT REPLACE
+    UNIQUE(contest_id, player_name, team, position) ON CONFLICT REPLACE
 );
 
 CREATE TABLE IF NOT EXISTS contest_standings (
@@ -59,6 +61,60 @@ CREATE TABLE IF NOT EXISTS monitored_contests (
 """
 
 
+def _migrate_player_identity(conn: sqlite3.Connection) -> None:
+    """Keep two same-name players when they are on different teams.
+
+    Older archives uniquely keyed ``(contest_id, player_name, position)``, so
+    the second club replaced the first. The key now includes team. Rows that
+    were already collapsed cannot be recovered.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'player_performance'"
+    ).fetchone()
+    if row is None or not row[0]:
+        return
+    sql = " ".join(str(row[0]).lower().split())
+    if "unique(contest_id, player_name, team, position)" in sql:
+        return
+    # foreign_keys cannot change inside a transaction. The rebuild itself is
+    # one transaction so a failure restores player_performance.
+    conn.execute("PRAGMA foreign_keys = OFF")
+    statements = (
+        "ALTER TABLE player_performance RENAME TO player_performance_old",
+        """
+        CREATE TABLE player_performance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contest_id TEXT REFERENCES slates(contest_id),
+            player_name TEXT,
+            position TEXT,
+            team TEXT,
+            salary INTEGER,
+            ownership_pct REAL,
+            actual_fpts REAL,
+            UNIQUE(contest_id, player_name, team, position) ON CONFLICT REPLACE
+        )
+        """,
+        """
+        INSERT INTO player_performance (
+            contest_id, player_name, position, team, salary, ownership_pct, actual_fpts
+        )
+        SELECT contest_id, player_name, position, team, salary, ownership_pct, actual_fpts
+        FROM player_performance_old
+        """,
+        "DROP TABLE player_performance_old",
+    )
+    try:
+        conn.execute("BEGIN")
+        for statement in statements:
+            conn.execute(statement)
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
 def connect(path: Optional[str | Path] = None) -> sqlite3.Connection:
     """Open the archive database, creating the file and schema when needed."""
     db_path = Path(path) if path else DEFAULT_DB_PATH
@@ -68,6 +124,7 @@ def connect(path: Optional[str | Path] = None) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(_SCHEMA)
+    _migrate_player_identity(conn)
     return conn
 
 
@@ -149,11 +206,12 @@ def _salary_players(pool: pd.DataFrame, slate_type: str) -> list[dict[str, Any]]
         position = str(player.get("Position") or "").split("/")[0].strip().upper()
         if position == "DEF":
             position = "DST"
-        if not name or not position or (name.casefold(), position) in seen:
+        team = str(player.get("TeamAbbrev") or "").strip().upper() or None
+        identity = person_key(name, team, position)
+        if not name or not position or identity in seen:
             continue
         salary = pd.to_numeric(player.get("Salary"), errors="coerce")
-        team = str(player.get("TeamAbbrev") or "").strip().upper() or None
-        seen.add((name.casefold(), position))
+        seen.add(identity)
         rows.append(
             {
                 "player_name": name,

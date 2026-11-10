@@ -14,6 +14,7 @@ from urllib.request import Request, urlopen
 
 import pandas as pd
 
+from .names import person_key
 from .parser import parse_dk_csv
 from .presets import ContestFormat
 
@@ -366,16 +367,29 @@ def _apply_salaries(players: list[dict[str, Any]], source: _IO, slate_type: str)
     pool = parse_dk_csv(_as_buffer(source), contest_format=fmt)
     if fmt is ContestFormat.SHOWDOWN:
         pool = _without_captain_rows(pool)
-    by_name: dict[str, tuple[Optional[int], Optional[str]]] = {}
+    by_identity: dict[tuple[str, str], tuple[Optional[int], Optional[str]]] = {}
+    by_name: dict[str, list[tuple[Optional[int], Optional[str]]]] = {}
     for _, row in pool.iterrows():
-        key = str(row["Name"]).strip().casefold()
-        if not key or key in by_name:
-            continue
         salary = pd.to_numeric(row["Salary"], errors="coerce")
         team = str(row.get("TeamAbbrev") or "").strip().upper() or None
-        by_name[key] = (None if pd.isna(salary) else int(round(float(salary))), team)
+        payload = (None if pd.isna(salary) else int(round(float(salary))), team)
+        identity = person_key(row.get("Name"), row.get("TeamAbbrev"), row.get("Position"))
+        if identity[0] and identity not in by_identity:
+            by_identity[identity] = payload
+        name = identity[0] if identity[0] != "dst" else person_key(row.get("Name"), row.get("TeamAbbrev"))[0]
+        if name:
+            by_name.setdefault(name, []).append(payload)
     for player in players:
-        hit = by_name.get(str(player["player_name"]).strip().casefold())
+        position = player.get("position")
+        known_team = str(player.get("team") or "").strip()
+        if known_team:
+            hit = by_identity.get(person_key(player.get("player_name"), known_team, position))
+        else:
+            # Standings lineups have no team. Attach a salary only when that
+            # normalized name belongs to one team, never across two clubs.
+            hits = by_name.get(person_key(player.get("player_name"), "")[0], [])
+            clubs = {team for _, team in hits if team}
+            hit = hits[0] if len(clubs) == 1 and hits else None
         if not hit:
             continue
         player["salary"], player["team"] = hit

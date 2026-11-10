@@ -29,7 +29,7 @@ instead of being copied from the retrieval time.
 from __future__ import annotations
 
 import json
-import re
+import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +41,7 @@ from urllib.request import Request, urlopen
 import pandas as pd
 
 from .dk_scoring import SCORING_VERSION, canon_scoring_position, score_projection
+from .names import normalize_player_name
 from .parser import canon_injury_status, injury_status_for_player, is_inactive_injury
 from .slate_week import (
     ScheduledGame,
@@ -65,13 +66,12 @@ USER_AGENT = "dfs-lineup-generator (https://github.com/TimAuburn/dfs-lineup-gene
 # Prefer a new download after one hour. Never apply a copy older than six.
 DEFAULT_TTL_SECONDS = 60 * 60
 MAX_CACHE_AGE_SECONDS = 6 * 60 * 60
+# Slate identity for a saved index. Name spelling is not part of this contract:
+# match_sleeper_pool runs stored names through normalize_player_name again.
 MATCH_CACHE_VERSION = 1
 
-_NAME_SUFFIXES = frozenset({"jr", "sr", "ii", "iii", "iv", "v"})
-_STATUS_TAG_RE = re.compile(
-    r"\((?:q|o|d|ir|ir-r|irr|pup|sus|na|nwt|p|out|doubtful|questionable|probable|suspended)\)",
-    re.IGNORECASE,
-)
+_log = logging.getLogger(__name__)
+
 _DST_POSITIONS = frozenset({"DST", "DEF"})
 _SKILL_POSITIONS = frozenset({"QB", "RB", "WR", "TE", "K", "FB"})
 _SLEEPER_ID_COLUMNS = ("SleeperID", "Sleeper Id", "sleeper_id")
@@ -86,15 +86,6 @@ _INJURY_RANK = {
     "PROBABLE": 10,
 }
 _FETCH_ERRORS = (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError)
-
-
-def normalize_player_name(name: object) -> str:
-    """Lowercase name without punctuation, generational suffixes, or ``(Q)`` tags."""
-    text = _STATUS_TAG_RE.sub(" ", str(name or ""))
-    text = text.lower().replace(".", "").replace("'", "").replace("’", "").replace(",", " ")
-    text = re.sub(r"[^a-z\s-]", " ", text)
-    parts = [part for part in text.split() if part and part not in _NAME_SUFFIXES]
-    return " ".join(parts)
 
 
 def _primary_position(position: object) -> str:
@@ -532,6 +523,18 @@ def _qb_without_weekly_status(status: str, position: object, depth_rows: list[di
     return status
 
 
+def _renormalize_candidates(rows: list[dict]) -> None:
+    """Apply the current name normalizer to names already stored on a candidate.
+
+    A saved index was normalized when it was written. Running the function
+    again turns the older hyphenated form into the spaced form without
+    changing the slate-matching contract.
+    """
+    for row in rows:
+        if isinstance(row, dict):
+            row["name"] = normalize_player_name(row.get("name"))
+
+
 def match_sleeper_pool(pool: pd.DataFrame, index: object) -> tuple[pd.DataFrame, dict]:
     """Apply one matched identity to each row.
 
@@ -546,6 +549,8 @@ def match_sleeper_pool(pool: pd.DataFrame, index: object) -> tuple[pd.DataFrame,
         return updated, report
     projections = _candidate_rows(index, "projections")
     depth = _candidate_rows(index, "depth")
+    _renormalize_candidates(projections)
+    _renormalize_candidates(depth)
     if "Projection" not in updated.columns:
         updated["Projection"] = pd.to_numeric(updated.get("AvgPointsPerGame", 0.0), errors="coerce")
     updated["Projection"] = pd.to_numeric(updated["Projection"], errors="coerce").astype(float)
@@ -710,6 +715,13 @@ def match_sleeper_pool(pool: pd.DataFrame, index: object) -> tuple[pd.DataFrame,
     report["ppr_fallback_rows"] = int(updated["Scoring"].eq("PPR fallback").sum()) if len(updated) else 0
     report["rows"] = int(len(updated))
     report["inactive_rows"] = int(updated["Injury"].map(is_inactive_injury).sum())
+    for item in report["unmatched"]:
+        _log.warning(
+            "unmatched player name=%s team=%s position=%s",
+            item.get("name"),
+            item.get("team"),
+            item.get("position"),
+        )
     return updated, report
 
 
@@ -1494,6 +1506,24 @@ def scoring_approximation_lines(pool: pd.DataFrame) -> str:
         "Defense points-allowed tiers are expected values from the average "
         f"allowed, not a realized tier ({team_list}). "
         "Yards allowed are not a DraftKings category."
+    )
+
+
+def unmatched_players_warning(summary: Optional[dict]) -> str:
+    """Visible warning listing players whose projection and injury did not attach.
+
+    Empty when matching did not run or every player matched. The text names
+    the player, team, and position only.
+    """
+    if not isinstance(summary, dict) or not summary.get("matching_ran"):
+        return ""
+    entries = [item for item in (summary.get("unmatched") or []) if isinstance(item, dict)]
+    if not entries:
+        return ""
+    return (
+        "These players did not match a Sleeper projection or injury record. "
+        "DraftKings averages were kept and no injury status was attached: "
+        f"{_names(entries, limit=12)}."
     )
 
 
