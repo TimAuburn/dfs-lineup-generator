@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -44,6 +45,7 @@ from src.env_config import (
 )
 from src.exporter import lineups_to_dk_upload_csv, upload_columns_for
 from src.lineup_rules import (
+    active_game_shortfall,
     construction_check_frame,
     construction_problem_messages,
     normalize_spreads,
@@ -72,6 +74,20 @@ from src.optimizer import (
 )
 from src.dk_scoring import SCORING_VERSION
 from src.parser import DKCSVValidationError, is_inactive_injury, parse_dk_csv
+from src.kickoff_forecast import forecasts_for_matchups, weather_label
+from src.slate_games import (
+    disabled_for_slate,
+    forecast_source_caption,
+    game_key,
+    games_table_frame,
+    generation_blockers,
+    matchups_from_pool,
+    odds_fetched_at,
+    odds_source_caption,
+    pool_without_games,
+    spreads_for_pool,
+    with_disabled,
+)
 from src.player_pool import (
     apply_pool_edits,
     carry_choices,
@@ -157,6 +173,7 @@ def _init_state() -> None:
         "weather_source_json": None,
         "sleeper_summary": None,
         "sleeper_version": 0,
+        "disabled_games_by_slate": {},
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -274,14 +291,137 @@ def _extra_setting_rows(
     return rows
 
 
+def _disabled_game_keys() -> List[str]:
+    """Classic games turned off for the loaded slate. Showdown never filters."""
+    if ContestFormat(st.session_state.get("contest_format")) is ContestFormat.SHOWDOWN:
+        return []
+    pool = st.session_state.get("player_pool")
+    if not isinstance(pool, pd.DataFrame):
+        return []
+    signature = str(st.session_state.get("pool_signature") or "")
+    games = [game.key for game in matchups_from_pool(pool)]
+    return disabled_for_slate(
+        st.session_state.get("disabled_games_by_slate"),
+        signature,
+        games,
+    )
+
+
+def _toggle_is_off(value: object) -> bool:
+    if value is None:
+        return False
+    try:
+        if pd.isna(value):
+            return False
+    except (TypeError, ValueError):
+        pass
+    return not bool(value)
+
+
+def _load_kickoff_forecasts(matchups, slate_key: str):
+    """Hourly kickoff forecast. Pytest runs stay off the network."""
+    kwargs = {"slate_key": slate_key}
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        def _refuse(_url: str):
+            raise OSError("kickoff forecast is not called from tests")
+
+        kwargs["http_get"] = _refuse
+        kwargs["cache_path"] = Path("/tmp/dfs-kickoff-pytest-cache.json")
+    try:
+        return forecasts_for_matchups(matchups, **kwargs)
+    except Exception:
+        return []
+
+
+def _render_slate_games(pool: pd.DataFrame, lines: dict, *, showdown: bool) -> None:
+    """Games, odds, kickoff weather, and Classic on/off toggles."""
+    matchups = matchups_from_pool(pool)
+    if not matchups:
+        return
+    signature = str(st.session_state.get("pool_signature") or "slate")
+    store = st.session_state.get("disabled_games_by_slate") or {}
+    disabled = (
+        []
+        if showdown
+        else disabled_for_slate(store, signature, [game.key for game in matchups])
+    )
+    forecasts = _load_kickoff_forecasts(matchups, signature)
+    labels = {item.game: weather_label(item) for item in forecasts}
+    frame = games_table_frame(
+        matchups,
+        lines,
+        labels,
+        disabled,
+        showdown=showdown,
+    )
+    fetched = [item.fetched_at for item in forecasts if item.fetched_at is not None]
+    st.markdown("#### Games")
+    st.caption(odds_source_caption(odds_fetched_at()))
+    st.caption(forecast_source_caption(max(fetched) if fetched else None))
+    st.caption(
+        "Stadium coordinates and roof type come from the local stadium table. "
+        "Dome and closed-roof games show Dome and skip the forecast. "
+        "A retractable roof shows the hourly forecast and is marked retractable. "
+        "A missing total, spread, or forecast stays missing and does not block lineups."
+    )
+    if showdown:
+        st.caption("Showdown is one game, so there is no on/off toggle.")
+        st.dataframe(frame, hide_index=True, width="stretch")
+        return
+    edited = st.data_editor(
+        frame,
+        hide_index=True,
+        width="stretch",
+        num_rows="fixed",
+        height=min(56 + 36 * max(len(frame), 1), 520),
+        disabled=[column for column in frame.columns if column != "On"],
+        column_config={
+            "On": st.column_config.CheckboxColumn(
+                "On",
+                default=True,
+                help="Off removes every player in this game, including the defense, from generation.",
+            ),
+            "Matchup": st.column_config.TextColumn("Matchup"),
+            "Kickoff": st.column_config.TextColumn("Kickoff"),
+            "Total": st.column_config.TextColumn(
+                "Total",
+                help="Game over/under from The Odds API. Missing stays missing.",
+            ),
+            "Spread": st.column_config.TextColumn(
+                "Spread",
+                help="Favorite and the signed line. Missing stays missing.",
+            ),
+            "Weather": st.column_config.TextColumn("Weather", width="large"),
+        },
+        key=f"slate_games_{signature}",
+    )
+    turned_off: List[str] = []
+    if "On" in edited.columns and "Matchup" in edited.columns:
+        for _, row in edited.iterrows():
+            if not _toggle_is_off(row.get("On")):
+                continue
+            key = game_key(row.get("Matchup"))
+            if key:
+                turned_off.append(key)
+    st.session_state.disabled_games_by_slate = with_disabled(store, signature, turned_off)
+
+
 def _game_script_buckets(preset: ContestPreset, lineup_count: int) -> List[GameScriptBucket]:
     """Editable per-game lineup counts and salary caps for a loaded Classic pool."""
     pool = st.session_state.get("player_pool")
     games = games_from_pool(pool) if isinstance(pool, pd.DataFrame) else []
+    disabled = set(_disabled_game_keys())
+    if disabled:
+        games = [game for game in games if game not in disabled]
     if not games:
         st.caption("Upload a salary file to assign lineups to games.")
         return []
     signature = st.session_state.get("pool_signature") or "none"
+    if disabled:
+        signature = (
+            f"{signature}_"
+            + hashlib.sha1(",".join(sorted(disabled)).encode()).hexdigest()[:8]
+        )
     default = pd.DataFrame(
         {
             "Game": games,
@@ -935,6 +1075,26 @@ def _collect_strategy_overrides(
             game_script_buckets = _game_script_buckets(preset, int(lineup_count))
 
     return overrides, changed, game_script_buckets
+
+
+def _construction_settings_from_overrides(overrides: Dict[str, Any]) -> _ConstructionSettings | None:
+    """Classic construction knobs currently on screen. Showdown has none."""
+    if "primary_stack" not in overrides:
+        return None
+    return _ConstructionSettings(
+        primary_stack=bool(overrides["primary_stack"]),
+        pass_catchers=int(overrides["primary_pass_catchers"]),
+        bring_backs=int(overrides["primary_bring_backs"]),
+        game_min=int(overrides["primary_game_min"]),
+        game_max=int(overrides["primary_game_max"]),
+        bring_back_wr1=bool(overrides["primary_bring_back_wr1"]),
+        mini_stack=bool(overrides["mini_stack"]),
+        mini_count=int(overrides["mini_stack_count"]),
+        rb_dst_favorite=bool(overrides["rb_dst_favorite"]),
+        favorite_margin=float(overrides["favorite_margin"]),
+        ban_underdog_rbs=bool(overrides["ban_underdog_rbs"]),
+        underdog_margin=float(overrides["underdog_margin"]),
+    )
 
 
 def _showdown_team_abbrevs() -> List[str]:
@@ -1762,6 +1922,7 @@ if view == "Player pool":
         f"{player_count} players · {len(pool)} salary rows · {roster_n}-player roster · "
         f"salary cap ${DK_SALARY_CAP:,}{injury_note}."
     )
+    _render_slate_games(pool, vegas_lines, showdown=is_showdown)
     if is_showdown:
         st.caption(
             "One row per player, priced at the flex salary. "
@@ -2068,10 +2229,25 @@ if pool is None:
 optimizer_unmatched = unmatched_players_warning(st.session_state.sleeper_summary)
 if optimizer_unmatched:
     st.warning(optimizer_unmatched)
+disabled_games = [] if is_showdown else _disabled_game_keys()
 working_pool = generation_pool(pool, showdown=is_showdown).reset_index(drop=True)
+if disabled_games:
+    working_pool = pool_without_games(working_pool, disabled_games).reset_index(drop=True)
 locked_ids = locked_player_ids(working_pool, showdown=is_showdown)
 
 if generate:
+    blockers = generation_blockers(
+        pool,
+        disabled_games,
+        showdown=is_showdown,
+        min_exposure_pct=float(min_exposure_pct) if use_min_exposure else None,
+        settings=_construction_settings_from_overrides(strategy_overrides),
+    )
+    if blockers:
+        st.session_state.lineups = []
+        st.session_state.generated_run = None
+        st.error(" ".join(blockers))
+        st.stop()
     sleeper_summary = st.session_state.sleeper_summary
     contract_ok = session_contract_current(st.session_state.player_pool, sleeper_summary)
     if (
@@ -2115,8 +2291,18 @@ if generate:
             jitter_seed=int(jitter_seed),
         )
         _apply_strategy_overrides(optimizer, strategy_overrides)
+        if disabled_games and not is_showdown and hasattr(optimizer, "construction_settings"):
+            rule_blocks = active_game_shortfall(
+                len(games_from_pool(solve_pool)),
+                optimizer.construction_settings(),
+            )
+            if rule_blocks:
+                raise RuntimeError(" ".join(rule_blocks))
         if hasattr(optimizer, "set_vegas_spreads"):
-            optimizer.set_vegas_spreads(normalize_spreads(solve_lines))
+            if disabled_games:
+                optimizer.set_vegas_spreads(spreads_for_pool(solve_lines, solve_pool))
+            else:
+                optimizer.set_vegas_spreads(normalize_spreads(solve_lines))
         if confirmed_qb_keys is not None and hasattr(optimizer, "set_confirmed_quarterbacks"):
             optimizer.set_confirmed_quarterbacks(confirmed_qb_keys)
         if solve_low_total and preset is not ContestPreset.SHOWDOWN_CASH:

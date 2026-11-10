@@ -264,6 +264,37 @@ def stack_floor(settings: ConstructionSettings) -> int:
     return 1 + int(settings.pass_catchers) + int(settings.bring_backs)
 
 
+def active_game_shortfall(n_games: int, settings: ConstructionSettings) -> tuple[str, ...]:
+    """Name construction rules the games still on cannot host.
+
+    A mini-stack is a two-player offensive stack from a game other than the
+    quarterback's game, so it needs that extra game. This does not change a
+    projection and does not fill in a spread.
+    """
+    messages: list[str] = []
+    games = int(n_games)
+    if settings.primary_stack and games < 1:
+        messages.append(
+            _unmet(
+                RULE_PRIMARY,
+                "No game is on, so the primary stack has no game to use.",
+            )
+        )
+    if settings.mini_stack and int(settings.mini_count) > 0:
+        needed = 1 + int(settings.mini_count)
+        if games < needed:
+            other = max(0, games - 1)
+            messages.append(
+                _unmet(
+                    RULE_MINI,
+                    "A mini-stack needs a game other than the primary one. "
+                    f"{games} game(s) are on, so {other} other game(s) remain "
+                    f"and this rule needs {int(settings.mini_count)}.",
+                )
+            )
+    return tuple(messages)
+
+
 def construction_problem_messages(settings: ConstructionSettings) -> tuple[str, ...]:
     """Settings that cannot be built, named before the solver runs."""
     messages: list[str] = []
