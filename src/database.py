@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Mapping, NamedTuple, Optional, Sequence
 
 import pandas as pd
 
@@ -14,6 +16,14 @@ from .names import person_key
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB_PATH = ROOT / "data" / "dfs_tracker.db"
 _GAME_DATE = re.compile(r"(\d{1,2})/(\d{1,2})/(\d{4})")
+
+# Columns added after the first archive schema. Existing rows keep NULL here.
+_SLATE_ARCHIVE_COLUMNS = ("content_hash", "imported_at", "archive_note")
+_SLATE_HASH_INDEX_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_slates_content_hash
+ON slates(content_hash)
+WHERE content_hash IS NOT NULL AND content_hash != ''
+"""
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS slates (
@@ -25,7 +35,10 @@ CREATE TABLE IF NOT EXISTS slates (
     total_entries INTEGER,
     entry_fee REAL,
     cash_cutline REAL,
-    first_place_score REAL
+    first_place_score REAL,
+    content_hash TEXT,
+    imported_at TEXT,
+    archive_note TEXT
 );
 
 CREATE TABLE IF NOT EXISTS player_performance (
@@ -115,6 +128,60 @@ def _migrate_player_identity(conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA foreign_keys = ON")
 
 
+def _slate_column_names(conn: sqlite3.Connection) -> list[str]:
+    return [str(row[1]) for row in conn.execute("PRAGMA table_info(slates)")]
+
+
+def _slate_hash_index_exists(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1 FROM sqlite_master
+        WHERE type = 'index' AND name = 'idx_slates_content_hash'
+        """
+    ).fetchone()
+    return row is not None
+
+
+def _migrate_slate_archive(conn: sqlite3.Connection) -> None:
+    """Add file hash, import time, and note columns without rewriting contests.
+
+    Older archives stored one row per contest id. A standings file with no id
+    in the name was saved under ``{date}-{slate_type}-{name}``, so two such
+    files shared a key and the later import replaced the earlier one. New
+    columns record the file hash used to tell those imports apart. Rows that
+    are already stored keep their contest ids and every existing value.
+
+    Columns are added in place. Renaming ``slates`` would rewrite child
+    foreign keys to the temporary name, including when foreign keys are off,
+    and dropping that temporary table would leave those references dangling.
+    """
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'slates'"
+    ).fetchone()
+    conn.commit()
+    if row is None:
+        return
+    present = set(_slate_column_names(conn))
+    has_index = _slate_hash_index_exists(conn)
+    # The reads above open a transaction. Close it so BEGIN below is the
+    # whole migration, matching _migrate_player_identity.
+    conn.commit()
+    missing = [name for name in _SLATE_ARCHIVE_COLUMNS if name not in present]
+    if not missing and has_index:
+        return
+    statements = [f"ALTER TABLE slates ADD COLUMN {name} TEXT" for name in missing]
+    if not has_index:
+        statements.append(_SLATE_HASH_INDEX_SQL)
+    try:
+        conn.execute("BEGIN")
+        for statement in statements:
+            conn.execute(statement)
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
 def connect(path: Optional[str | Path] = None) -> sqlite3.Connection:
     """Open the archive database, creating the file and schema when needed."""
     db_path = Path(path) if path else DEFAULT_DB_PATH
@@ -125,7 +192,55 @@ def connect(path: Optional[str | Path] = None) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(_SCHEMA)
     _migrate_player_identity(conn)
+    _migrate_slate_archive(conn)
     return conn
+
+
+DUPLICATE_ARCHIVE_MESSAGE = (
+    "This file was already imported. The duplicate was skipped, "
+    "and the existing archive entry was left unchanged."
+)
+
+
+class ImportResult(NamedTuple):
+    """Outcome of one standings import. ``status`` is imported, duplicate, or kept_both."""
+
+    status: str
+    message: str
+    contest_id: str
+    note: str
+
+
+def file_content_hash(payload: bytes) -> str:
+    """SHA-256 hex digest of an uploaded contest or results file."""
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _import_timestamp(imported_at: str) -> str:
+    text = str(imported_at or "").strip()
+    if text:
+        return text
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _blank_to_none(value: object) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _kept_both_note(source_contest_id: str) -> str:
+    return (
+        f"Kept alongside contest {source_contest_id} because this file's content differs."
+    )
+
+
+def _kept_both_message(source_contest_id: str, archive_key: str) -> str:
+    return (
+        f"Contest {source_contest_id} is already in the archive with different content. "
+        f"The existing entry was kept, and this file was stored separately as {archive_key}."
+    )
 
 
 def salary_contest_id(file_signature: str) -> str:
@@ -245,89 +360,210 @@ def save_contest(
     db_path: Optional[str | Path] = None,
 ) -> None:
     """Replace one contest's slate, players, and standings in a single transaction."""
-    contest_id = str(slate_meta.get("contest_id") or "").strip()
-    if not contest_id:
-        raise ValueError("contest_id is required")
-
     conn = connect(db_path)
     try:
         with conn:
-            conn.execute(
-                """
-                INSERT INTO slates (
-                    contest_id, slate_name, sport, slate_type, contest_date,
-                    total_entries, entry_fee, cash_cutline, first_place_score
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(contest_id) DO UPDATE SET
-                    slate_name = excluded.slate_name,
-                    sport = excluded.sport,
-                    slate_type = excluded.slate_type,
-                    contest_date = excluded.contest_date,
-                    total_entries = excluded.total_entries,
-                    entry_fee = excluded.entry_fee,
-                    cash_cutline = excluded.cash_cutline,
-                    first_place_score = excluded.first_place_score
-                """,
-                (
-                    contest_id,
-                    slate_meta.get("slate_name"),
-                    slate_meta.get("sport") or "NFL",
-                    slate_meta.get("slate_type"),
-                    slate_meta.get("contest_date"),
-                    slate_meta.get("total_entries"),
-                    slate_meta.get("entry_fee"),
-                    slate_meta.get("cash_cutline"),
-                    slate_meta.get("first_place_score"),
-                ),
-            )
-            conn.execute(
-                "DELETE FROM player_performance WHERE contest_id = ?",
-                (contest_id,),
-            )
-            conn.execute(
-                "DELETE FROM contest_standings WHERE contest_id = ?",
-                (contest_id,),
-            )
-            conn.executemany(
-                """
-                INSERT INTO player_performance (
-                    contest_id, player_name, position, team, salary,
-                    ownership_pct, actual_fpts
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        contest_id,
-                        player.get("player_name"),
-                        player.get("position"),
-                        player.get("team"),
-                        player.get("salary"),
-                        player.get("ownership_pct"),
-                        player.get("actual_fpts"),
-                    )
-                    for player in players
-                ],
-            )
-            conn.executemany(
-                """
-                INSERT INTO contest_standings (
-                    contest_id, entry_id, entry_name, rank, points, lineup
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        contest_id,
-                        str(row.get("entry_id") or ""),
-                        row.get("entry_name"),
-                        row.get("rank"),
-                        row.get("points"),
-                        row.get("lineup"),
-                    )
-                    for row in standings
-                ],
+            _write_contest(conn, slate_meta, players, standings, replace=True)
+    finally:
+        conn.close()
+
+
+def import_standings(
+    slate_meta: Mapping[str, Any],
+    players: Sequence[Mapping[str, Any]],
+    standings: Sequence[Mapping[str, Any]],
+    content_hash: str,
+    source_contest_id: str = "",
+    imported_at: str = "",
+    db_path: Optional[str | Path] = None,
+) -> ImportResult:
+    """Store one contest or results file without replacing a different file.
+
+    ``source_contest_id`` is the id from the file name. A blank id is stored
+    under ``{content_hash}-{imported_at}`` so it does not share the parsed
+    fallback key. The same content hash is skipped. A known contest id whose
+    stored file differs is kept beside the original under a distinct key.
+    """
+    digest = str(content_hash or "").strip().lower()
+    if not digest:
+        raise ValueError("content_hash is required")
+    source_id = str(source_contest_id or "").strip()
+    stamp = _import_timestamp(imported_at)
+    conn = connect(db_path)
+    try:
+        with conn:
+            return _import_standings_in_transaction(
+                conn,
+                slate_meta,
+                players,
+                standings,
+                digest,
+                source_id,
+                stamp,
             )
     finally:
         conn.close()
+
+
+def _import_standings_in_transaction(
+    conn: sqlite3.Connection,
+    slate_meta: Mapping[str, Any],
+    players: Sequence[Mapping[str, Any]],
+    standings: Sequence[Mapping[str, Any]],
+    digest: str,
+    source_id: str,
+    stamp: str,
+) -> ImportResult:
+    existing_hash = conn.execute(
+        "SELECT contest_id FROM slates WHERE content_hash = ?",
+        (digest,),
+    ).fetchone()
+    if existing_hash is not None:
+        return ImportResult(
+            "duplicate",
+            DUPLICATE_ARCHIVE_MESSAGE,
+            str(existing_hash["contest_id"]),
+            "",
+        )
+
+    occupant = None
+    if source_id:
+        occupant = conn.execute(
+            "SELECT contest_id, content_hash FROM slates WHERE contest_id = ?",
+            (source_id,),
+        ).fetchone()
+
+    note = ""
+    status = "imported"
+    if source_id and occupant is None:
+        key = source_id
+    elif source_id:
+        key = f"{source_id}~{digest}"
+        note = _kept_both_note(source_id)
+        status = "kept_both"
+    else:
+        key = f"{digest}-{stamp}"
+
+    if _contest_row(conn, key) is not None:
+        key = f"{key}~{stamp}"
+        if source_id:
+            note = _kept_both_note(source_id)
+            status = "kept_both"
+    message = _kept_both_message(source_id, key) if status == "kept_both" else ""
+    slate = dict(slate_meta)
+    slate["contest_id"] = key
+    slate["content_hash"] = digest
+    slate["imported_at"] = stamp
+    slate["archive_note"] = note or None
+    _write_contest(conn, slate, players, standings, replace=False)
+    return ImportResult(status, message, key, note)
+
+
+def _contest_row(conn: sqlite3.Connection, contest_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT contest_id, content_hash FROM slates WHERE contest_id = ?",
+        (contest_id,),
+    ).fetchone()
+
+
+def _write_contest(
+    conn: sqlite3.Connection,
+    slate_meta: Mapping[str, Any],
+    players: Sequence[Mapping[str, Any]],
+    standings: Sequence[Mapping[str, Any]],
+    replace: bool,
+) -> None:
+    """Insert one contest. ``replace`` updates an existing contest id in place."""
+    contest_id = str(slate_meta.get("contest_id") or "").strip()
+    if not contest_id:
+        raise ValueError("contest_id is required")
+    conflict = ""
+    if replace:
+        conflict = """
+            ON CONFLICT(contest_id) DO UPDATE SET
+                slate_name = excluded.slate_name,
+                sport = excluded.sport,
+                slate_type = excluded.slate_type,
+                contest_date = excluded.contest_date,
+                total_entries = excluded.total_entries,
+                entry_fee = excluded.entry_fee,
+                cash_cutline = excluded.cash_cutline,
+                first_place_score = excluded.first_place_score,
+                content_hash = COALESCE(excluded.content_hash, slates.content_hash),
+                imported_at = COALESCE(excluded.imported_at, slates.imported_at),
+                archive_note = COALESCE(excluded.archive_note, slates.archive_note)
+        """
+    conn.execute(
+        f"""
+        INSERT INTO slates (
+            contest_id, slate_name, sport, slate_type, contest_date,
+            total_entries, entry_fee, cash_cutline, first_place_score,
+            content_hash, imported_at, archive_note
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        {conflict}
+        """,
+        (
+            contest_id,
+            slate_meta.get("slate_name"),
+            slate_meta.get("sport") or "NFL",
+            slate_meta.get("slate_type"),
+            slate_meta.get("contest_date"),
+            slate_meta.get("total_entries"),
+            slate_meta.get("entry_fee"),
+            slate_meta.get("cash_cutline"),
+            slate_meta.get("first_place_score"),
+            _blank_to_none(slate_meta.get("content_hash")),
+            _blank_to_none(slate_meta.get("imported_at")),
+            _blank_to_none(slate_meta.get("archive_note")),
+        ),
+    )
+    if replace:
+        conn.execute(
+            "DELETE FROM player_performance WHERE contest_id = ?",
+            (contest_id,),
+        )
+        conn.execute(
+            "DELETE FROM contest_standings WHERE contest_id = ?",
+            (contest_id,),
+        )
+    conn.executemany(
+        """
+        INSERT INTO player_performance (
+            contest_id, player_name, position, team, salary,
+            ownership_pct, actual_fpts
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                contest_id,
+                player.get("player_name"),
+                player.get("position"),
+                player.get("team"),
+                player.get("salary"),
+                player.get("ownership_pct"),
+                player.get("actual_fpts"),
+            )
+            for player in players
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO contest_standings (
+            contest_id, entry_id, entry_name, rank, points, lineup
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                contest_id,
+                str(row.get("entry_id") or ""),
+                row.get("entry_name"),
+                row.get("rank"),
+                row.get("points"),
+                row.get("lineup"),
+            )
+            for row in standings
+        ],
+    )
 
 
 def get_recent_slates(
@@ -338,8 +574,9 @@ def get_recent_slates(
     query = """
         SELECT
             contest_date AS "Date",
-            contest_id AS "Contest ID",
             slate_name AS "Slate Name",
+            COALESCE(archive_note, '') AS "Note",
+            contest_id AS "Contest ID",
             slate_type AS "Slate Type",
             total_entries AS "Total Entries",
             cash_cutline AS "Cash Cutline",
