@@ -58,8 +58,8 @@ STADIUMS: Dict[str, Stadium] = {
         "Highmark Stadium",
         "BUF",
         "Orchard Park, NY",
-        42.7738,
-        -78.7870,
+        42.77306,
+        -78.79222,
         True,
         "outdoor",
     ),
@@ -136,7 +136,7 @@ STADIUMS: Dict[str, Stadium] = {
         "outdoor",
     ),
     "HOU": Stadium(
-        "NRG Stadium",
+        "Reliant Stadium",
         "HOU",
         "Houston, TX",
         29.6847,
@@ -163,7 +163,7 @@ STADIUMS: Dict[str, Stadium] = {
         "outdoor",
     ),
     "KC": Stadium(
-        "GEHA Field at Arrowhead Stadium",
+        "Arrowhead Stadium",
         "KC",
         "Kansas City, MO",
         39.0489,
