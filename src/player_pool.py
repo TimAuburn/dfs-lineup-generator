@@ -132,9 +132,9 @@ def apply_pool_edits(
 
     displayed_projection = _projection_by_key(displayed)
     for _, edit in edited.iterrows():
-        key = person_key(edit.get("Name"), edit.get("TeamAbbrev"))
+        key = person_key(edit.get("Name"), edit.get("TeamAbbrev"), edit.get("Position"))
         mask = pd.Series(
-            [person_key(name, team) == key for name, team in _key_list(updated)],
+            [item == key for item in _key_list(updated)],
             index=updated.index,
         )
         if not bool(mask.any()):
@@ -177,12 +177,13 @@ def clear_projection_overrides(pool: pd.DataFrame, shown: pd.DataFrame) -> pd.Da
         or "ProjectionOverride" not in updated.columns
     ):
         return updated
+    positions = shown["Position"] if "Position" in shown.columns else [None] * len(shown)
     keys = {
-        person_key(name, team)
-        for name, team in zip(shown["Name"], shown["TeamAbbrev"])
+        person_key(name, team, position)
+        for name, team, position in zip(shown["Name"], shown["TeamAbbrev"], positions)
     }
     mask = pd.Series(
-        [person_key(name, team) in keys for name, team in _key_list(updated)],
+        [item in keys for item in _key_list(updated)],
         index=updated.index,
     )
     updated.loc[mask, "ProjectionOverride"] = pd.NA
@@ -195,27 +196,26 @@ def generation_pool(pool: pd.DataFrame, *, showdown: bool) -> pd.DataFrame:
         return pool
     frame = pool.copy()
     if "Include" in frame.columns:
+        positions = frame["Position"] if "Position" in frame.columns else [None] * len(frame)
         excluded = {
-            person_key(name, team)
-            for name, team, include in zip(
-                frame["Name"], frame["TeamAbbrev"], frame["Include"]
+            person_key(name, team, position)
+            for name, team, position, include in zip(
+                frame["Name"], frame["TeamAbbrev"], positions, frame["Include"]
             )
             if not _as_bool(include, default=True)
         }
         if excluded:
             keep = pd.Series(
-                [
-                    person_key(name, team) not in excluded
-                    for name, team in _key_list(frame)
-                ],
+                [key not in excluded for key in _key_list(frame)],
                 index=frame.index,
             )
             frame = frame.loc[keep].copy()
     if showdown and "Captain" in frame.columns and "RosterSlot" in frame.columns and not frame.empty:
+        positions = frame["Position"] if "Position" in frame.columns else [None] * len(frame)
         blocked = {
-            person_key(name, team)
-            for name, team, captain in zip(
-                frame["Name"], frame["TeamAbbrev"], frame["Captain"]
+            person_key(name, team, position)
+            for name, team, position, captain in zip(
+                frame["Name"], frame["TeamAbbrev"], positions, frame["Captain"]
             )
             if not _as_bool(captain, default=True)
         }
@@ -223,8 +223,10 @@ def generation_pool(pool: pd.DataFrame, *, showdown: bool) -> pd.DataFrame:
             slot = frame["RosterSlot"].astype(str).str.strip().str.upper()
             keep = pd.Series(
                 [
-                    not (person_key(name, team) in blocked and roster == "CPT")
-                    for name, team, roster in zip(frame["Name"], frame["TeamAbbrev"], slot)
+                    not (person_key(name, team, position) in blocked and roster == "CPT")
+                    for name, team, position, roster in zip(
+                        frame["Name"], frame["TeamAbbrev"], positions, slot
+                    )
                 ],
                 index=frame.index,
             )
@@ -244,7 +246,7 @@ def locked_player_ids(pool: pd.DataFrame, *, showdown: bool) -> list[str]:
             continue
         if not _as_bool(row.get("Lock"), default=False):
             continue
-        key = person_key(row.get("Name"), row.get("TeamAbbrev"))
+        key = person_key(row.get("Name"), row.get("TeamAbbrev"), row.get("Position"))
         if key in seen:
             continue
         seen.add(key)
@@ -357,12 +359,13 @@ def _set_player_flag(
         return updated
     if column not in updated.columns:
         updated[column] = default
+    positions = shown["Position"] if "Position" in shown.columns else [None] * len(shown)
     keys = {
-        person_key(name, team)
-        for name, team in zip(shown["Name"], shown["TeamAbbrev"])
+        person_key(name, team, position)
+        for name, team, position in zip(shown["Name"], shown["TeamAbbrev"], positions)
     }
     mask = pd.Series(
-        [person_key(name, team) in keys for name, team in _key_list(updated)],
+        [item in keys for item in _key_list(updated)],
         index=updated.index,
     )
     updated.loc[mask, column] = bool(value)
@@ -375,7 +378,10 @@ def carry_choices(previous: pd.DataFrame | None, parsed: pd.DataFrame) -> pd.Dat
         return parsed
     lookup: dict[tuple[str, str], pd.Series] = {}
     for _, row in previous.iterrows():
-        lookup.setdefault(person_key(row.get("Name"), row.get("TeamAbbrev")), row)
+        lookup.setdefault(
+            person_key(row.get("Name"), row.get("TeamAbbrev"), row.get("Position")),
+            row,
+        )
     updated = parsed.copy()
     for column in CHOICE_COLUMNS:
         if column not in previous.columns:
@@ -383,8 +389,8 @@ def carry_choices(previous: pd.DataFrame | None, parsed: pd.DataFrame) -> pd.Dat
         if column not in updated.columns:
             updated[column] = pd.NA
         values = []
-        for name, team in _key_list(updated):
-            prior = lookup.get(person_key(name, team))
+        for key in _key_list(updated):
+            prior = lookup.get(key)
             values.append(pd.NA if prior is None else prior.get(column))
         updated[column] = values
     if "ProjectionOverride" in updated.columns:

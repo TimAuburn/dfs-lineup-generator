@@ -1173,7 +1173,7 @@ class BaseNFLOptimizer:
         best_key = next(iter(wanted))
         best_score = None
         for player in players:
-            key = person_key(player.full_name, player.team)
+            key = player_person_key(player)
             if key not in wanted:
                 continue
             score = float(player.fppg)
@@ -1310,7 +1310,7 @@ class BaseNFLOptimizer:
             return
         self._min_slot_defs = self._min_roster_slots()
         for player in pydfs_optimizer.player_pool.filtered_players:
-            key = person_key(player.full_name, player.team)
+            key = player_person_key(player)
             if not key[0]:
                 continue
             positions = _football_position_set(player)
@@ -1354,7 +1354,7 @@ class BaseNFLOptimizer:
     ):
         used = exposure_counts(prior_frames)
         present = {
-            person_key(player.full_name, player.team)
+            player_person_key(player)
             for player in pydfs_optimizer.player_pool.filtered_players
         }
         skipped = set(skip_min)

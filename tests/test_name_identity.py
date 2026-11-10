@@ -13,9 +13,10 @@ import pandas as pd
 import pytest
 
 from src.contest_parser import _apply_salaries
-from src.database import connect, search_player_performance
-from src.database import save_salary_pool_if_new
-from src.optimizer import NFLClassicOptimizer, NFLShowdownOptimizer
+from src.database import _migrate_player_identity, connect, save_salary_pool_if_new, search_player_performance
+from src.exporter import lineups_to_dk_upload_csv
+from src.optimizer import NFLClassicOptimizer, NFLShowdownOptimizer, player_exposure_table
+from src.portfolio import appearances_needed, exposure_counts
 from src.player_pool import person_key
 from src.portfolio import person_key as portfolio_person_key
 from src.sleeper import (
@@ -385,3 +386,160 @@ def test_showdown_rosters_both_same_name_players_but_not_captain_and_flex():
     assert not ({"c11", "f11"} <= ids)
     assert not ({"c22", "f22"} <= ids)
     assert len(lineup) == 6
+
+
+def test_migration_failure_keeps_the_original_table(tmp_path):
+    import sqlite3
+
+    db_path = tmp_path / "old.db"
+    raw = sqlite3.connect(db_path)
+    raw.executescript(
+        """
+        CREATE TABLE player_performance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contest_id TEXT,
+            player_name TEXT,
+            position TEXT,
+            team TEXT,
+            salary INTEGER,
+            ownership_pct REAL,
+            actual_fpts REAL,
+            UNIQUE(contest_id, player_name, position) ON CONFLICT REPLACE
+        );
+        INSERT INTO player_performance (
+            contest_id, player_name, position, team, salary
+        ) VALUES ('salary-sig', 'Michael Thomas', 'WR', 'NO', 6000);
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    class _FailingConnection:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args, **kwargs):
+            text = " ".join(str(sql).split()).lower()
+            if text.startswith("insert into player_performance"):
+                raise sqlite3.OperationalError("disk full")
+            return self._conn.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    held = sqlite3.connect(db_path)
+    with pytest.raises(sqlite3.OperationalError, match="disk full"):
+        _migrate_player_identity(_FailingConnection(held))
+    held.close()
+
+    check = sqlite3.connect(db_path)
+    names = {
+        row[0]
+        for row in check.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    assert "player_performance" in names
+    assert "player_performance_old" not in names
+    stored = check.execute(
+        "SELECT player_name, team, salary FROM player_performance"
+    ).fetchone()
+    assert stored == ("Michael Thomas", "NO", 6000)
+    sql = " ".join(
+        check.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'player_performance'"
+        ).fetchone()[0].lower().split()
+    )
+    check.close()
+    assert "unique(contest_id, player_name, position)" in sql
+    assert "unique(contest_id, player_name, team, position)" not in sql
+
+
+def test_min_and_max_count_normalized_names_and_separate_same_name_players():
+    """A punctuation variant and two same-name players each keep their own count.
+
+    The salary file says ``Amon Ra St Brown`` and ``Kenneth Walker III``. The
+    projection source says ``Amon-Ra St. Brown`` and ``Kenneth Walker``. The
+    minimum is on the normalized person, and the two Michael Thomas rows are
+    different people.
+    """
+    index = index_projections([
+        _projection("Amon-Ra", "St. Brown", "DET", "WR", 19.0),
+        _projection("Kenneth", "Walker", "SEA", "RB", 16.0),
+        _projection("Buffalo", "Bills", "BUF", "DEF", 9.0),
+    ])
+    specs = [
+        ("QB", "Josh Allen", "BUF", 6000, 22, "BUF@MIN 11/09/2026 08:15PM ET"),
+        ("RB", "Kenneth Walker III", "SEA", 5000, 8, "SEA@SF 11/08/2026 04:05PM ET"),
+        ("RB", "James Cook", "BUF", 4800, 14, "BUF@MIN 11/09/2026 08:15PM ET"),
+        ("WR", "Michael Thomas", "BUF", 5000, 18, "BUF@MIN 11/09/2026 08:15PM ET"),
+        ("WR", "Michael Thomas", "PHI", 4200, 1, "NYG@PHI 11/08/2026 01:00PM ET"),
+        ("WR", "Extra WR", "KC", 4600, 15, "NYJ@KC 11/08/2026 01:00PM ET"),
+        ("WR", "Amon Ra St Brown", "DET", 4700, 6, "DET@MIA 11/08/2026 01:00PM ET"),
+        ("TE", "Travis Kelce", "KC", 4500, 12, "NYJ@KC 11/08/2026 01:00PM ET"),
+        ("RB", "Derrick Henry", "BAL", 4600, 13, "JAX@BAL 11/05/2026 08:15PM ET"),
+        ("DST", "Bills", "BUF", 3000, 8, "BUF@MIN 11/09/2026 08:15PM ET"),
+    ]
+    frame = pd.DataFrame([
+        {
+            "Position": pos,
+            "Name + ID": f"{name} ({pid})",
+            "Name": name,
+            "ID": str(pid),
+            "Roster Position": pos if pos in {"QB", "TE", "DST"} else f"{pos}/FLEX",
+            "Salary": salary,
+            "Game Info": game,
+            "TeamAbbrev": team,
+            "AvgPointsPerGame": points,
+            "Projection": points,
+            "Injury": "",
+        }
+        for pid, (pos, name, team, salary, points, game) in enumerate(specs, start=1)
+    ])
+    updated, _report = match_sleeper_pool(frame, index)
+    amon = updated.loc[updated["Name"].eq("Amon Ra St Brown")].iloc[0]
+    assert amon["MatchStatus"] == "projection"
+    assert float(amon["Projection"]) == pytest.approx(19.0)
+    walker = updated.loc[updated["Name"].eq("Kenneth Walker III")].iloc[0]
+    assert walker["MatchStatus"] == "projection"
+
+    optimizer = NFLClassicOptimizer()
+    optimizer.jitter_pct = (0.0, 0.0)
+    optimizer.jitter_seed = 42
+    optimizer.set_qb_stack(enabled=False)
+    optimizer.load_from_dataframe(updated)
+    optimizer.set_exposure_limits(min_exposure_pct=50, max_exposure_pct=100)
+    lineups = optimizer.generate_lineups(2)
+    assert len(lineups) == 2
+    assert appearances_needed(0.5, 2) == 1
+    counts = exposure_counts(lineups)
+    buf = person_key("Michael Thomas", "BUF", "WR")
+    phi = person_key("Michael Thomas", "PHI", "WR")
+    assert buf != phi
+    assert counts[buf] >= 1
+    assert counts[phi] >= 1
+    assert counts[buf] + counts[phi] == sum(
+        int(lineup["Name"].eq("Michael Thomas").sum()) for lineup in lineups
+    )
+    walker_key = person_key("Kenneth Walker III", "SEA", "RB")
+    assert walker_key == person_key("Kenneth Walker", "SEA")
+    assert counts[walker_key] >= 1
+    amon_key = person_key("Amon Ra St Brown", "DET")
+    assert amon_key == person_key("Amon-Ra St. Brown", "DET")
+    assert counts[amon_key] >= 1
+    bills = person_key("Bills", "BUF", "DST")
+    assert bills == ("dst", "BUF")
+    assert counts[bills] >= 1
+    assert ("bills", "BUF") not in counts
+    assert optimizer.last_min_report is not None
+    assert optimizer.last_min_report.unmet == ()
+    table = player_exposure_table(
+        lineups,
+        requested=2,
+        min_players=list(optimizer.last_min_report.rows),
+    )
+    assert {"Min needed", "Min met"} <= set(table.columns)
+    michaels = table.loc[table["Name"].eq("Michael Thomas")]
+    assert len(michaels) == 2
+    assert set(michaels["Team"]) == {"BUF", "PHI"}
+    assert set(int(value) for value in michaels["Min needed"]) == {1}
+    assert all(str(value).startswith("Yes") for value in michaels["Min met"])
+    assert "Min" not in lineups_to_dk_upload_csv(lineups).splitlines()[0]

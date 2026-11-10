@@ -862,7 +862,7 @@ class PortfolioMinExposureRule(OptimizerRule):
         self.roster = int(state.min_roster)
         self.variables: Dict[Identity, list] = {}
         for player, variable in players_dict.items():
-            key = person_key(player.full_name, player.team)
+            key = player_person_key(player)
             self.variables.setdefault(key, []).append(variable)
 
     def apply_for_iteration(self, solver, result):
@@ -959,7 +959,7 @@ class PortfolioMinExposureRule(OptimizerRule):
     def _record(self, lineup) -> None:
         seen: set[Identity] = set()
         for player in lineup:
-            key = person_key(player.full_name, player.team)
+            key = player_person_key(player)
             if not key[0] or key in seen:
                 continue
             seen.add(key)
@@ -1166,7 +1166,7 @@ def _apply_min_targets(
     needed: Dict[Identity, int] = {}
     meta: Dict[Identity, Mapping[str, object]] = {}
     for row in min_rows:
-        key = person_key(row.get("Name"), row.get("Team"))
+        key = person_key(row.get("Name"), row.get("Team"), row.get("Position"))
         if not key[0]:
             continue
         needed[key] = int(row.get("needed") or 0)

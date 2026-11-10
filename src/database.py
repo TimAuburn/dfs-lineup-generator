@@ -76,10 +76,12 @@ def _migrate_player_identity(conn: sqlite3.Connection) -> None:
     sql = " ".join(str(row[0]).lower().split())
     if "unique(contest_id, player_name, team, position)" in sql:
         return
-    conn.executescript(
+    # foreign_keys cannot change inside a transaction. The rebuild itself is
+    # one transaction so a failure restores player_performance.
+    conn.execute("PRAGMA foreign_keys = OFF")
+    statements = (
+        "ALTER TABLE player_performance RENAME TO player_performance_old",
         """
-        PRAGMA foreign_keys = OFF;
-        ALTER TABLE player_performance RENAME TO player_performance_old;
         CREATE TABLE player_performance (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             contest_id TEXT REFERENCES slates(contest_id),
@@ -90,16 +92,27 @@ def _migrate_player_identity(conn: sqlite3.Connection) -> None:
             ownership_pct REAL,
             actual_fpts REAL,
             UNIQUE(contest_id, player_name, team, position) ON CONFLICT REPLACE
-        );
+        )
+        """,
+        """
         INSERT INTO player_performance (
             contest_id, player_name, position, team, salary, ownership_pct, actual_fpts
         )
         SELECT contest_id, player_name, position, team, salary, ownership_pct, actual_fpts
-        FROM player_performance_old;
-        DROP TABLE player_performance_old;
-        PRAGMA foreign_keys = ON;
-        """
+        FROM player_performance_old
+        """,
+        "DROP TABLE player_performance_old",
     )
+    try:
+        conn.execute("BEGIN")
+        for statement in statements:
+            conn.execute(statement)
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
 
 
 def connect(path: Optional[str | Path] = None) -> sqlite3.Connection:
