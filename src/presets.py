@@ -6,6 +6,15 @@ from dataclasses import dataclass, fields, replace
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
+from .showdown_rules import (
+    DEFAULT_MAX_UNUSED_SALARY,
+    DEFAULT_MIN_PLAYERS_PER_TEAM,
+    DEFAULT_SHOWDOWN_CAP,
+    captain_rule_label,
+    salary_floor_label,
+    team_rule_label,
+)
+
 if TYPE_CHECKING:
     from .optimizer import BaseNFLOptimizer
 
@@ -107,6 +116,16 @@ class PresetConfig:
     # Showdown cash tries to roster both starting QBs and both starting RBs.
     require_starting_core: bool = False
     allow_kicker_captain: bool = False
+    # Showdown lineup rules. Off on Classic. They do not change a projection.
+    # K and DST stay eligible at FLEX and are never CPT while the ban is on.
+    ban_k_dst_captain: bool = False
+    # At least this many players from each team. CPT and FLEX each count as one.
+    # Off leaves DraftKings' own at-most-five (one from each team) in place.
+    min_players_per_team_enabled: bool = False
+    min_players_per_team: int = DEFAULT_MIN_PLAYERS_PER_TEAM
+    # Maximum salary left unused. Spend must reach the slate cap minus this.
+    salary_floor: bool = False
+    max_unused_salary: int = DEFAULT_MAX_UNUSED_SALARY
     # Large-field lineup construction. Off on every preset except Large-Field GPP.
     # These choose roster shape. They do not change a projection.
     primary_stack: bool = False
@@ -215,11 +234,17 @@ PRESET_CONFIGS: Dict[ContestPreset, PresetConfig] = {
         max_kickers=1,
         max_repeating_players=3,
         allow_kicker_captain=False,
+        ban_k_dst_captain=True,
+        min_players_per_team_enabled=True,
+        min_players_per_team=2,
+        salary_floor=False,
+        max_unused_salary=DEFAULT_MAX_UNUSED_SALARY,
         flex_min_salary=1_200,
         description=(
-            "Showdown GPP: salary window, both teams, CPT QB needs 2 WR/TE "
-            "plus an opposing skill player, no K or DST captains, at most one kicker, "
-            "no FLEX under $1,200, drop players at 1.0 points or less, max 3 repeats."
+            "Showdown GPP: salary window, both teams, at least 2 players from each team, "
+            "CPT QB needs 2 WR/TE plus an opposing skill player, no K or DST captains, "
+            "at most one kicker, no FLEX under $1,200, drop players at 1.0 points or less, "
+            "max 3 repeats. The salary floor is off; turning it on leaves at most $1,500 unused."
         ),
     ),
     ContestPreset.SHOWDOWN_CASH: PresetConfig(
@@ -237,6 +262,11 @@ PRESET_CONFIGS: Dict[ContestPreset, PresetConfig] = {
         ban_dst=True,
         max_repeating_players=None,
         allow_kicker_captain=False,
+        ban_k_dst_captain=True,
+        min_players_per_team_enabled=True,
+        min_players_per_team=2,
+        salary_floor=True,
+        max_unused_salary=DEFAULT_MAX_UNUSED_SALARY,
         captain_positions=("QB", "RB", "WR"),
         captain_min_salary=8_000,
         flex_min_salary=3_500,
@@ -246,9 +276,11 @@ PRESET_CONFIGS: Dict[ContestPreset, PresetConfig] = {
         require_starting_core=True,
         description=(
             "Showdown Cash: spend $49,600–$50,000, no defense, at most one kicker, "
+            "at least 2 players from each team, no K or DST captain, "
             "at most one running back from each team, FLEX at $3,500+, "
             "at most one player under $4,500, and both starting quarterbacks "
-            "and running backs when they fit."
+            "and running backs when they fit. The salary floor allows at most "
+            "$1,500 unused; the $49,600 window is the tighter spend floor."
         ),
     ),
 }
@@ -390,11 +422,32 @@ def format_preset_summary(config: PresetConfig) -> List[Tuple[str, str]]:
             rows.append(("Salary window", f"max ${max_sal:,}"))
         else:
             rows.append(("Salary window", "Full cap"))
+        rows.append(
+            (
+                "Salary floor",
+                salary_floor_label(
+                    config.salary_floor,
+                    config.max_unused_salary,
+                    config.min_salary_cap,
+                    config.max_salary_cap,
+                    cap=DEFAULT_SHOWDOWN_CAP,
+                ),
+            )
+        )
 
         rows.append(
             (
                 "Min teams",
                 str(config.min_teams) if config.min_teams is not None else "No minimum",
+            )
+        )
+        rows.append(
+            (
+                "Minimum players per team",
+                team_rule_label(
+                    config.min_players_per_team_enabled,
+                    config.min_players_per_team,
+                ),
             )
         )
         rows.append(
@@ -411,6 +464,12 @@ def format_preset_summary(config: PresetConfig) -> List[Tuple[str, str]]:
             (
                 "Kicker captain",
                 "Yes" if config.allow_kicker_captain else "No",
+            )
+        )
+        rows.append(
+            (
+                "No kicker or DST captain",
+                captain_rule_label(config.ban_k_dst_captain),
             )
         )
         if config.captain_positions:
@@ -654,6 +713,11 @@ def apply_preset(
             max_k_dst_combined=config.max_k_dst_combined,
             max_kickers=config.max_kickers,
             allow_kicker_captain=config.allow_kicker_captain,
+            ban_k_dst_captain=config.ban_k_dst_captain,
+            min_players_per_team_enabled=config.min_players_per_team_enabled,
+            min_players_per_team=config.min_players_per_team,
+            salary_floor=config.salary_floor,
+            max_unused_salary=config.max_unused_salary,
             captain_positions=config.captain_positions,
             captain_min_salary=config.captain_min_salary,
             flex_min_salary=config.flex_min_salary,

@@ -60,6 +60,11 @@ from src.lineup_rules import (
     construction_problem_messages,
     normalize_spreads,
 )
+from src.showdown_rules import (
+    resolve_salary_bounds,
+    slate_salary_cap,
+    team_split_cause,
+)
 from src.lineup_rules import ConstructionSettings as _ConstructionSettings
 from src.optimizer import (
     DK_SALARY_CAP,
@@ -758,6 +763,112 @@ def _construction_controls(
     return overrides, changed
 
 
+def _showdown_rule_controls(
+    preset: ContestPreset,
+    preset_cfg: PresetConfig,
+    *,
+    window_on: bool,
+    window_min: int,
+    window_max: int,
+    allow_kicker_captain: bool,
+    team_split: Tuple[int, int] | None,
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Toggles for the three Showdown lineup rules. Values stay on the preset."""
+    st.markdown("**Showdown lineup rules**")
+    st.caption(
+        "These rules choose who can share a lineup and how much salary it spends. "
+        "They do not change a projection. K and DST can still be FLEX. "
+        "With the team minimum off, DraftKings still allows at most five from one team."
+    )
+    ban_captain = st.checkbox(
+        "No kicker or DST captain",
+        value=bool(preset_cfg.ban_k_dst_captain),
+        key=_preset_key(preset, "ban_k_dst_captain"),
+        help=(
+            "K and DST stay eligible at FLEX and cannot be CPT. "
+            "A lock on the CPT row, or a captain share above 0, blocks generation "
+            "and names the player. The lock is not dropped."
+        ),
+    )
+    min_team = st.checkbox(
+        "Minimum players per team",
+        value=bool(preset_cfg.min_players_per_team_enabled),
+        key=_preset_key(preset, "min_players_per_team_enabled"),
+        help=(
+            "CPT and FLEX each count as one player. "
+            "Off leaves DraftKings' own limit of five players from one team."
+        ),
+    )
+    min_team_count = st.number_input(
+        "Minimum from each team",
+        min_value=1,
+        max_value=3,
+        value=int(preset_cfg.min_players_per_team),
+        step=1,
+        disabled=not min_team,
+        key=_preset_key(preset, "min_players_per_team"),
+        help="At least this many from each team. 2 is two, three, or four from one side.",
+    )
+    salary_floor = st.checkbox(
+        "Salary floor",
+        value=bool(preset_cfg.salary_floor),
+        key=_preset_key(preset, "salary_floor"),
+        help=(
+            "The number is the most salary a lineup may leave unused. "
+            "It has to spend at least the slate cap minus that amount. "
+            "Captain salary counts at 1.5x."
+        ),
+    )
+    max_unused = st.number_input(
+        "Maximum unused salary",
+        min_value=0,
+        max_value=20_000,
+        value=int(preset_cfg.max_unused_salary),
+        step=100,
+        disabled=not salary_floor,
+        key=_preset_key(preset, "max_unused_salary"),
+        help="Unused salary equal to this amount passes. One dollar more does not.",
+    )
+    cap = slate_salary_cap(st.session_state.get("player_pool"))
+    bounds = resolve_salary_bounds(
+        slate_cap=cap,
+        window_min=int(window_min) if window_on else None,
+        window_max=int(window_max) if window_on else None,
+        salary_floor=bool(salary_floor),
+        max_unused=int(max_unused),
+    )
+    if bounds.conflict:
+        st.error(bounds.conflict)
+    elif bounds.note:
+        st.caption(bounds.note)
+    if ban_captain and allow_kicker_captain:
+        st.caption(
+            "No kicker or DST captain is on, so Allow kicker captain does not put a kicker at CPT."
+        )
+    split_cause = team_split_cause(bool(min_team), int(min_team_count), team_split)
+    if split_cause:
+        st.error(split_cause)
+    overrides = {
+        "ban_k_dst_captain": bool(ban_captain),
+        "min_players_per_team_enabled": bool(min_team),
+        "min_players_per_team": int(min_team_count),
+        "salary_floor": bool(salary_floor),
+        "max_unused_salary": int(max_unused),
+    }
+    changed: List[str] = []
+    if bool(ban_captain) != bool(preset_cfg.ban_k_dst_captain):
+        changed.append("No kicker or DST captain")
+    if bool(min_team) != bool(preset_cfg.min_players_per_team_enabled):
+        changed.append("Minimum players per team")
+    elif min_team and int(min_team_count) != int(preset_cfg.min_players_per_team):
+        changed.append("Minimum players per team")
+    if bool(salary_floor) != bool(preset_cfg.salary_floor):
+        changed.append("Salary floor")
+    elif salary_floor and int(max_unused) != int(preset_cfg.max_unused_salary):
+        changed.append("Salary floor")
+    return overrides, changed
+
+
 def _collect_strategy_overrides(
     contest_format: ContestFormat,
     preset: ContestPreset,
@@ -1034,6 +1145,17 @@ def _collect_strategy_overrides(
                 if not slate_teams:
                     st.caption("Upload a salary file to choose which team gets the larger side.")
 
+        rule_overrides, rule_changed = _showdown_rule_controls(
+            preset,
+            preset_cfg,
+            window_on=bool(use_salary_window),
+            window_min=int(salary_lo),
+            window_max=int(salary_hi),
+            allow_kicker_captain=bool(allow_kicker_captain),
+            team_split=team_split,
+        )
+        overrides.update(rule_overrides)
+        changed.extend(rule_changed)
         overrides.update(
             min_salary_cap=int(salary_lo) if use_salary_window else None,
             max_salary_cap=int(salary_hi) if use_salary_window else None,
@@ -1241,6 +1363,11 @@ def _apply_strategy_overrides(optimizer: Any, overrides: Dict[str, Any]) -> None
             max_k_dst_combined=overrides["max_k_dst_combined"],
             max_kickers=overrides.get("max_kickers", 1),
             allow_kicker_captain=bool(overrides.get("allow_kicker_captain", False)),
+            ban_k_dst_captain=bool(overrides.get("ban_k_dst_captain", False)),
+            min_players_per_team_enabled=bool(overrides.get("min_players_per_team_enabled", False)),
+            min_players_per_team=int(overrides.get("min_players_per_team", 2)),
+            salary_floor=bool(overrides.get("salary_floor", False)),
+            max_unused_salary=int(overrides.get("max_unused_salary", 1_500)),
             captain_positions=overrides.get("captain_positions"),
             captain_min_salary=overrides.get("captain_min_salary"),
             flex_min_salary=overrides.get("flex_min_salary"),
@@ -2333,9 +2460,15 @@ with st.container(border=True):
     st.caption(preset_cfg.description)
     st.caption(settings_note)
     if low_scoring_game:
-        st.caption(
-            "Game total is 38.5 or lower, so a kicker can be captain with a 10% exposure cap."
-        )
+        if strategy_overrides.get("ban_k_dst_captain"):
+            st.caption(
+                "Game total is 38.5 or lower. No kicker or DST captain is on, "
+                "so a kicker still cannot be captain."
+            )
+        else:
+            st.caption(
+                "Game total is 38.5 or lower, so a kicker can be captain with a 10% exposure cap."
+            )
     _render_settings_comparison(live_setting_rows)
 
 if pool is None:
