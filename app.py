@@ -46,6 +46,14 @@ from src.env_config import (
     load_env,
 )
 from src.exporter import lineups_to_dk_upload_csv, upload_columns_for
+from src.upload_check import (
+    csv_for_download,
+    failure_table,
+    resolve_upload_check,
+    upload_check_key,
+    validate_lineups,
+    warning_table,
+)
 from src.lineup_rules import (
     active_game_shortfall,
     construction_check_frame,
@@ -291,6 +299,86 @@ def _extra_setting_rows(
             label = f"{label}, {team_split_team or 'either team'}"
         rows.append(("Team split", "Any", label))
     return rows
+
+
+def _render_upload_check(check, *, have_lineups: bool) -> None:
+    """Show the pure upload check. The page does not decide the rules itself."""
+    if not have_lineups:
+        return
+    if check is None:
+        st.error("Upload check is out of date for this slate and was not reused.")
+        return
+    if check.status_message:
+        st.warning(check.status_message)
+    if check.blocked:
+        st.error("Download blocked until every lineup passes.")
+        table = failure_table(check)
+        if not table.empty:
+            st.dataframe(
+                table,
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "Reasons": st.column_config.TextColumn("Reasons", width="large"),
+                },
+            )
+    if check.warnings:
+        st.warning(
+            "Questionable players do not block the download."
+            if not check.blocked
+            else (
+                "Questionable players are a warning only. "
+                "The download is blocked for the other reasons."
+            )
+        )
+        warned = warning_table(check)
+        if not warned.empty:
+            st.dataframe(warned, hide_index=True, width="stretch")
+
+
+def _prepare_dk_upload(lineups, contest_format: ContestFormat, is_showdown: bool):
+    """Recompute the upload check from the slate, lineups, and game toggles.
+
+    A stored result is kept only when it was produced for this same key, and
+    only by replacing it in this run. Kickoff uses the clock inside the check.
+    """
+    pool = st.session_state.get("player_pool")
+    salary_pool = pool if isinstance(pool, pd.DataFrame) else None
+    disabled = [] if is_showdown else _disabled_game_keys()
+    key = upload_check_key(
+        lineups,
+        salary_pool,
+        contest_format=contest_format,
+        disabled_games=disabled,
+        pool_signature=str(st.session_state.get("pool_signature") or ""),
+    )
+
+    def compute():
+        produced = ""
+        export_error = None
+        if lineups:
+            try:
+                produced = lineups_to_dk_upload_csv(lineups, contest_format=contest_format)
+            except ValueError as exc:
+                export_error = str(exc)
+        clock = st.session_state.get("upload_check_now")
+        check = validate_lineups(
+            lineups,
+            salary_pool,
+            contest_format=contest_format,
+            disabled_games=disabled,
+            now=clock if hasattr(clock, "tzinfo") else None,
+            csv_text=None if export_error else produced,
+            export_error=export_error,
+        )
+        return check, produced, export_error
+
+    result = resolve_upload_check(st.session_state, key=key, compute=compute)
+    if not isinstance(result, tuple) or len(result) != 3:
+        return None, ""
+    check, produced, export_error = result
+    payload = "" if export_error else produced
+    return check, csv_for_download(check, payload)
 
 
 def _disabled_game_keys() -> List[str]:
@@ -1798,9 +1886,6 @@ if drop_stale_scoring_session(st.session_state):
 lineups = st.session_state.lineups
 _generated_for_export = st.session_state.generated_run or {}
 _requested_lineups = _generated_for_export.get("requested")
-csv_text = (
-    lineups_to_dk_upload_csv(lineups, contest_format=contest_format) if lineups else ""
-)
 _min_players_for_export = (_generated_for_export or {}).get("min_players")
 exposure_csv = (
     exposure_report_csv(
@@ -2187,6 +2272,7 @@ st.caption("Pick a contest preset and export multi-entry lineups from the player
 export_headers = ",".join(upload_columns_for(contest_format))
 st.caption(f"Export template: `{export_headers}`")
 
+upload_check, upload_csv = _prepare_dk_upload(lineups, contest_format, is_showdown)
 generate_col, download_col = st.columns([1.2, 1.6], gap="medium")
 with generate_col:
     generate = st.button(
@@ -2198,12 +2284,16 @@ with generate_col:
 with download_col:
     st.download_button(
         "Download DK Upload CSV",
-        data=csv_text,
+        data=upload_csv,
         file_name=download_name,
         mime="text/csv",
         type="secondary",
         width="stretch",
-        disabled=not bool(lineups),
+        disabled=(
+            not bool(lineups)
+            or upload_check is None
+            or upload_check.blocked
+        ),
     )
     st.download_button(
         "Download exposure report",
@@ -2218,6 +2308,8 @@ with download_col:
             "This is not the DraftKings upload."
         ),
     )
+
+_render_upload_check(upload_check, have_lineups=bool(lineups))
 
 if st.session_state.error:
     st.error(st.session_state.error)

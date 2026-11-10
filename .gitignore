@@ -162,6 +162,8 @@ venv.bak/
 data/
 *.csv
 !tests/mock_dk_salaries.csv
+!tests/golden/classic_cash_seed42.csv
+!tests/golden/showdown_cash_seed42.csv
 
 # Spyder project settings
 .spyderproject
