@@ -522,6 +522,76 @@ def test_streamlit_blocks_the_download_and_lists_the_reason():
     assert exposure.disabled is False
 
 
+def test_failed_generate_hides_the_stale_download_and_a_later_run_shows_it():
+    """A failed generate cannot download the previous CSV. The next one can."""
+    from unittest.mock import patch
+
+    app_test = pytest.importorskip("streamlit.testing.v1")
+    pool = parse_dk_csv(MOCK_SHOWDOWN)
+    pool["Injury"] = "Q"
+    stamped, summary = _contract(pool)
+    summary["applied"] = True
+    summary["ok"] = True
+    summary["season"] = 2025
+    summary["week"] = 1
+    summary["season_type"] = "regular"
+    lineup = _showdown(stamped)
+    app = app_test.AppTest.from_file(
+        str(Path(__file__).resolve().parents[1] / "app.py"),
+        default_timeout=90,
+    )
+    app.session_state["app_view"] = "Optimizer"
+    app.session_state["contest_format"] = "showdown"
+    app.session_state["contest_preset"] = "showdown_cash"
+    app.session_state["player_pool"] = stamped
+    app.session_state["sleeper_summary"] = summary
+    app.session_state["lineups"] = [lineup]
+    app.session_state["pool_signature"] = "upload-check-ui"
+    app.session_state["upload_check_now"] = BEFORE
+    app.session_state["generated_run"] = None
+
+    def _dk_button():
+        return next(item for item in app.download_button if item.label == "Download DK Upload CSV")
+
+    def _warning_frames():
+        return [
+            frame.value
+            for frame in app.dataframe
+            if "Warnings" in getattr(frame.value, "columns", [])
+        ]
+
+    with patch("src.weather.fetch_slate_weather", return_value={}):
+        app.run(timeout=90)
+        assert not app.exception, app.exception
+        assert _dk_button().disabled is False
+        assert _warning_frames(), "the seeded lineup should show the upload check"
+
+        failed = app.session_state["player_pool"].copy()
+        failed.loc[failed["Name"] == "Harrison Butker", "CaptainExposure"] = 1.0
+        app.session_state["player_pool"] = failed
+        next(item for item in app.button if item.label == "Generate Lineups").click()
+        app.run(timeout=90)
+        assert not app.exception, app.exception
+        assert any("Optimization failed" in item.value for item in app.error)
+        assert _dk_button().disabled is True
+        assert app.session_state["lineups"] == []
+        assert _warning_frames() == []
+        assert not any(
+            "Reasons" in getattr(frame.value, "columns", [])
+            for frame in app.dataframe
+        )
+
+        restored = app.session_state["player_pool"].copy()
+        restored["CaptainExposure"] = pd.NA
+        app.session_state["player_pool"] = restored
+        next(item for item in app.button if item.label == "Generate Lineups").click()
+        app.run(timeout=120)
+        assert not app.exception, app.exception
+        assert app.session_state["lineups"], "the successful run should keep its lineups"
+        assert _dk_button().disabled is False
+        assert _warning_frames(), "the new lineups should show the upload check"
+
+
 def test_streamlit_questionable_warning_leaves_the_download_available():
     pool = parse_dk_csv(MOCK_CLASSIC)
     pool.loc[pool["ID"] == "1001", "Injury"] = "Q"
