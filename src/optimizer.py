@@ -34,6 +34,7 @@ from .portfolio import (
     PortfolioIdentityRule,
     PortfolioMinExposureRule,
     PortfolioRuleState,
+    PortfolioShortfall,
     appearances_allowed,
     appearances_needed,
     batch_team_stack_exposures,
@@ -51,6 +52,19 @@ from .portfolio import (
     person_key,
     position_tokens,
     team_stack_counts,
+)
+from .showdown_rules import (
+    RULE_MIN_PER_TEAM,
+    RULE_NO_K_DST_CAPTAIN,
+    RULE_SALARY_FLOOR,
+    captain_lock_causes,
+    minimum_spend,
+    resolve_salary_bounds,
+    MinPlayersPerTeamRule,
+    roster_supply_cause,
+    shortfall_message,
+    slate_salary_cap,
+    team_split_cause,
 )
 from .presets import ContestFormat
 
@@ -2104,6 +2118,12 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         self.team_split_team: Optional[str] = None
         # Cash tries to roster both starting QBs and both starting RBs.
         self.require_starting_core: bool = False
+        # Showdown lineup rules. Off until a preset or the UI turns them on.
+        self.ban_k_dst_captain: bool = False
+        self.min_players_per_team_enabled: bool = False
+        self.min_players_per_team: int = 2
+        self.salary_floor: bool = False
+        self.max_unused_salary: int = 1_500
 
     def configure_showdown_rules(
         self,
@@ -2128,6 +2148,11 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         team_split: Optional[Tuple[int, int]] = None,
         team_split_team: Optional[str] = None,
         require_starting_core: bool = False,
+        ban_k_dst_captain: bool = False,
+        min_players_per_team_enabled: bool = False,
+        min_players_per_team: int = 2,
+        salary_floor: bool = False,
+        max_unused_salary: int = 1_500,
     ) -> None:
         if cpt_qb_pass_catchers < 1:
             raise ValueError("cpt_qb_pass_catchers must be at least 1")
@@ -2160,6 +2185,10 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
                     "DraftKings Showdown allows at most 5 players from one team"
                 )
             parsed_split = (high, low)
+        if min_players_per_team_enabled and not 1 <= int(min_players_per_team) <= 3:
+            raise ValueError("min players per team must be from 1 to 3")
+        if int(max_unused_salary) < 0:
+            raise ValueError("max unused salary must be at least 0")
         self.min_salary_cap = min_salary_cap
         self.max_salary_cap = max_salary_cap
         self.min_teams = min_teams
@@ -2192,6 +2221,11 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             None if not team_split_team else str(team_split_team).strip().upper()
         )
         self.require_starting_core = bool(require_starting_core)
+        self.ban_k_dst_captain = bool(ban_k_dst_captain)
+        self.min_players_per_team_enabled = bool(min_players_per_team_enabled)
+        self.min_players_per_team = int(min_players_per_team)
+        self.salary_floor = bool(salary_floor)
+        self.max_unused_salary = int(max_unused_salary)
 
     def set_confirmed_quarterbacks(
         self,
@@ -2274,10 +2308,13 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
 
     def _captain_positions_allowed(self) -> frozenset:
         if self.captain_positions is not None:
-            return frozenset(self.captain_positions)
-        allowed = set(CAPTAIN_POSITIONS)
-        if self.allow_kicker_captain:
-            allowed.add("K")
+            allowed = set(self.captain_positions)
+        else:
+            allowed = set(CAPTAIN_POSITIONS)
+            if self.allow_kicker_captain:
+                allowed.add("K")
+        if self.ban_k_dst_captain:
+            allowed -= {"K", "DST", "DEF"}
         return frozenset(allowed)
 
     @staticmethod
@@ -2680,6 +2717,203 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             PlayersGroup(chosen, min_from_group=len(distinct), max_from_group=len(chosen))
         )
 
+    def _apply_salary_caps(self, pydfs_optimizer) -> None:
+        """Window plus the unused-salary floor. A contradiction is refused.
+
+        The stored window is left as the user set it. The solver sees the
+        intersection. The floor is not used to lower a tighter window, and
+        the window is not used to raise the unused-salary allowance.
+        """
+        bounds = self.salary_resolution()
+        if bounds.conflict:
+            raise RuntimeError(shortfall_message(self.lineup_count, 0, bounds.conflict))
+        ceiling = int(bounds.maximum)
+        site_budget = int(getattr(pydfs_optimizer.settings, "budget", None) or self.salary_cap)
+        if self.max_salary_cap is not None or ceiling < site_budget:
+            pydfs_optimizer.settings.budget = ceiling
+        if bounds.minimum is not None:
+            pydfs_optimizer.set_min_salary_cap(float(bounds.minimum))
+
+    def salary_resolution(self):
+        """Spend range for the loaded slate, the window, and the salary floor."""
+        return resolve_salary_bounds(
+            slate_cap=slate_salary_cap(self._player_df),
+            window_min=self.min_salary_cap,
+            window_max=self.max_salary_cap,
+            salary_floor=bool(self.salary_floor),
+            max_unused=int(self.max_unused_salary),
+        )
+
+    def _showdown_pre_solve_cause(self) -> Optional[str]:
+        """A rule that cannot be built, named before the solver runs."""
+        if self.ban_k_dst_captain:
+            locks = captain_lock_causes(self._player_df, self.locked_player_ids)
+            if locks:
+                return " ".join(locks)
+        if self.min_players_per_team_enabled:
+            split = team_split_cause(
+                True,
+                int(self.min_players_per_team),
+                self.team_split,
+            )
+            if split:
+                return split
+            supply = roster_supply_cause(self._player_df, int(self.min_players_per_team))
+            if supply:
+                return supply
+        bounds = self.salary_resolution()
+        if bounds.conflict:
+            return bounds.conflict
+        return None
+
+    def _apply_min_players_per_team(self, optimizer, players: List[Player]) -> None:
+        """At least N players from each team. CPT and FLEX rows both count.
+
+        DraftKings still caps a team at five when this rule is off. This adds
+        a higher floor and does not remove that cap.
+        """
+        if not self.min_players_per_team_enabled:
+            return
+        minimum = int(self.min_players_per_team)
+        grouped: Dict[str, List[Player]] = {}
+        for player in players:
+            team = str(player.team or "").strip()
+            if team:
+                grouped.setdefault(team.upper(), []).append(player)
+        for members in grouped.values():
+            distinct = {player_person_key(player) for player in members}
+            if len(distinct) < minimum:
+                raise RuntimeError(
+                    shortfall_message(
+                        self.lineup_count,
+                        0,
+                        (
+                            f"{RULE_MIN_PER_TEAM}. {members[0].team} has "
+                            f"{len(distinct)} different players and the minimum is "
+                            f"{minimum}. The minimum was not lowered."
+                        ),
+                    )
+                )
+        optimizer._showdown_min_per_team = minimum
+        optimizer.add_new_rule(MinPlayersPerTeamRule)
+
+    def _rule_cause_text(self, flag: str) -> str:
+        if flag == "ban_k_dst_captain":
+            return (
+                f"{RULE_NO_K_DST_CAPTAIN}. K and DST can be FLEX and cannot be CPT."
+            )
+        if flag == "min_players_per_team_enabled":
+            return (
+                f"{RULE_MIN_PER_TEAM}. Each team needs at least "
+                f"{int(self.min_players_per_team)} players. "
+                "CPT and FLEX each count as one."
+            )
+        cap = slate_salary_cap(self._player_df)
+        spend = minimum_spend(cap, int(self.max_unused_salary))
+        return (
+            f"{RULE_SALARY_FLOOR}. Unused salary can be at most "
+            f"${int(self.max_unused_salary):,} "
+            f"(spend at least ${spend:,} of the ${cap:,} cap)."
+        )
+
+    def _can_reach(self, players: List[Player], count: int, **overrides: bool) -> bool:
+        """Whether ``count`` lineups exist after turning the named rules off.
+
+        The returned lineups are discarded. Exposure and the rule flags are
+        put back, so this does not loosen the lineup that was exported.
+        """
+        saved_flags = {name: getattr(self, name) for name in overrides}
+        saved_core = self.require_starting_core
+        saved_exposure = [
+            (player, player.min_exposure, player.max_exposure) for player in players
+        ]
+        saved_notes = list(self._solver_constraint_notes)
+        saved_shortfall = self.last_shortfall
+        try:
+            # Starting core already retries without itself. Keep it off here so
+            # the check names a showdown rule instead of that retry.
+            self.require_starting_core = False
+            for name, value in overrides.items():
+                setattr(self, name, value)
+            for player, minimum, maximum in saved_exposure:
+                player.min_exposure = minimum
+                player.max_exposure = maximum
+            try:
+                optimizer = self._build_optimizer(players)
+                raw = self._consume_lineups(optimizer, int(count), players, [])
+            except (GenerateLineupException, RuntimeError):
+                return False
+            return len(raw) >= int(count)
+        finally:
+            self.require_starting_core = saved_core
+            for name, value in saved_flags.items():
+                setattr(self, name, value)
+            for player, minimum, maximum in saved_exposure:
+                player.min_exposure = minimum
+                player.max_exposure = maximum
+            self._solver_constraint_notes = saved_notes
+            self.last_shortfall = saved_shortfall
+
+    def _attribute_showdown_shortfall(
+        self,
+        players: List[Player],
+        built: int,
+        requested: int,
+    ) -> Optional[str]:
+        """Name the showdown rule that stops the next lineup, if one does.
+
+        A rule is named only when turning that rule off allows another lineup
+        and the others stay on. A combination is named when no single rule is
+        enough. Other limits keep the existing shortfall text.
+        """
+        flags = {
+            "ban_k_dst_captain": bool(self.ban_k_dst_captain),
+            "min_players_per_team_enabled": bool(self.min_players_per_team_enabled),
+            "salary_floor": bool(self.salary_floor),
+        }
+        active = [name for name, enabled in flags.items() if enabled]
+        if not active:
+            return None
+        target = int(built) + 1
+        single = [
+            name
+            for name in active
+            if self._can_reach(players, target, **{name: False})
+        ]
+        if len(single) == 1:
+            return (
+                f"{self._rule_cause_text(single[0])} "
+                "The rule was not loosened."
+            )
+        if len(single) > 1:
+            detail = " ".join(self._rule_cause_text(name) for name in single)
+            return (
+                f"{detail} Together they blocked another lineup. "
+                "Neither rule was loosened."
+            )
+        if len(active) > 1 and self._can_reach(
+            players,
+            target,
+            **{name: False for name in active},
+        ):
+            detail = " ".join(self._rule_cause_text(name) for name in active)
+            return (
+                f"{detail} Together they blocked another lineup. "
+                "None of those rules was loosened."
+            )
+        return None
+
+    def _remember_rule_shortfall(self, requested: int, built: int, cause: str) -> str:
+        message = shortfall_message(requested, built, cause)
+        self.last_shortfall = PortfolioShortfall(
+            requested=int(requested),
+            built=int(built),
+            message=message,
+            proven=(cause,),
+            candidates=(),
+        )
+        return message
+
     def _build_optimizer(self, players: List[Player]):
         optimizer = get_optimizer(self.site, self.sport)
         install_person_uniqueness(optimizer)
@@ -2707,6 +2941,7 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         self._apply_starting_core(optimizer, players)
         self._apply_quarterback_limit(optimizer, players)
         self._apply_team_split(optimizer, players)
+        self._apply_min_players_per_team(optimizer, players)
         self._apply_game_script(optimizer, players)
         self._apply_kicker_limit(optimizer, players)
         self._apply_dst_limit(optimizer, players)
@@ -2722,6 +2957,9 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             self.last_shortfall = None
             self.portfolio_size = count
             self._reset_min_tracking()
+        cause = self._showdown_pre_solve_cause()
+        if cause:
+            raise RuntimeError(self._remember_rule_shortfall(count, 0, cause))
         players = self._players_for_optimize()
         try:
             if self.require_starting_core:
@@ -2737,12 +2975,19 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
                 frames = self._optimize_showdown(players, count)
         except GenerateLineupException as exc:
             self._solver_constraint_notes = list(getattr(exc, "invalid_constraints", []) or [])
+            rule_cause = self._attribute_showdown_shortfall(players, 0, count)
+            if rule_cause:
+                raise RuntimeError(self._remember_rule_shortfall(count, 0, rule_cause)) from exc
             if self._limits_configured():
                 self._finalize_min_report([], count)
                 self.last_shortfall = self.explain_lineup_shortfall([], count)
                 raise RuntimeError(self._limit_failure_message()) from exc
             raise
         self._finish_shortfall(frames, count)
+        if len(frames) < count:
+            rule_cause = self._attribute_showdown_shortfall(players, len(frames), count)
+            if rule_cause:
+                self._remember_rule_shortfall(count, len(frames), rule_cause)
         return frames
 
     def _optimize_showdown(self, players: List[Player], count: int) -> List[pd.DataFrame]:
