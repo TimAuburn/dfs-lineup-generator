@@ -2072,11 +2072,23 @@ class _EitherTeamSplitRule(OptimizerRule):
         )
 
 
+# These say no binding constraint was identified. Once a showdown rule is
+# named, that claim contradicts the rule sentence. "Solver-reported" used to
+# keep the whole suffix, including these sentences. Overlap detail stays.
+_CONTRADICTING_SOLVER_SENTENCES = (
+    "The solver stopped and did not identify which constraint blocked the next lineup.",
+    "The solver stopped without naming one binding constraint.",
+)
+
+
 def _diagnostic_suffix(shortfall: Optional[PortfolioShortfall]) -> str:
     """Overlap and solver detail already written for this short set.
 
-    The rule sentence is added beside this text. A shortfall that only says
-    the solver stopped, with no limit named, is not repeated once a rule is.
+    The rule sentence is added beside this text. Sentences that say the
+    solver never named a binding constraint are left off, because the rule
+    is that constraint. Overlap detail and solver-reported names stay. A
+    shortfall that only says the solver stopped, with no limit named, is
+    not repeated.
     """
     if shortfall is None or not shortfall.message:
         return ""
@@ -2085,6 +2097,9 @@ def _diagnostic_suffix(shortfall: Optional[PortfolioShortfall]) -> str:
     )
     text = shortfall.message.strip()
     suffix = text[len(prefix):].strip() if text.startswith(prefix) else text
+    for sentence in _CONTRADICTING_SOLVER_SENTENCES:
+        suffix = suffix.replace(sentence, " ")
+    suffix = " ".join(suffix.split())
     if not suffix:
         return ""
     markers = (

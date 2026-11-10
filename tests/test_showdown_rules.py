@@ -501,6 +501,72 @@ def test_shortfall_names_the_rule_and_keeps_the_overlap_detail():
     assert all(count == 1 and prior_n == len(lineups) for count, prior_n in calls[1:])
 
 
+def test_named_rule_drops_contradicting_solver_text_and_keeps_overlap():
+    """A named rule keeps overlap detail and drops the generic solver sentence.
+
+    The no-rule shortfall still uses that generic sentence.
+    """
+    rows = _salary_pool()
+    rows += _pair("WR", "BUF C", 80, "BUF", 6000, 18)
+    optimizer, lineups = _generate(
+        rows,
+        n=4,
+        salary_floor=True,
+        max_unused_salary=1_500,
+        min_salary_cap=None,
+        max_salary_cap=None,
+        max_repeating_players=5,
+    )
+    assert len(lineups) == 3
+    message = optimizer.last_shortfall.message
+    assert RULE_SALARY_FLOOR in message
+    assert "Binding limit:" in message
+    assert "Candidate limits at capacity: Max overlap 5:" in message
+    assert "share 5 players" in message
+    assert "The solver stopped without naming one binding constraint." not in message
+    assert (
+        "The solver stopped and did not identify which constraint blocked the next lineup."
+        not in message
+    )
+
+    # One legal lineup, so there is no overlap pair to report. Solver-reported
+    # names used to keep the "did not identify" sentence next to the rule.
+    single = _solve(
+        _salary_pool(),
+        salary_floor=True,
+        max_unused_salary=1_500,
+        max_repeating_players=None,
+    )
+    single.set_lineup_count(2)
+    assert len(single.generate_lineups()) == 1
+    single_message = single.last_shortfall.message
+    assert RULE_SALARY_FLOOR in single_message
+    assert "not loosened" in single_message
+    assert (
+        "The solver stopped and did not identify which constraint blocked the next lineup."
+        not in single_message
+    )
+
+    plain, plain_lineups = _generate(
+        rows,
+        n=3,
+        salary_floor=False,
+        min_salary_cap=None,
+        max_salary_cap=None,
+        max_repeating_players=2,
+    )
+    assert len(plain_lineups) == 1
+    assert plain.last_shortfall is not None
+    plain_message = plain.last_shortfall.message
+    assert "Binding limit:" not in plain_message
+    assert RULE_SALARY_FLOOR not in plain_message
+    assert (
+        "The solver stopped and did not identify which constraint blocked the next lineup."
+        in plain_message
+    )
+    assert "Solver-reported" in plain_message
+
+
 def test_low_total_kicker_cap_is_skipped_while_the_captain_ban_is_on():
     assert kicker_captain_exposure_cap(
         low_scoring=True,
