@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
+from pulp import LpStatusOptimal
 from pydfs_lineup_optimizer import Player, Site, Sport, get_optimizer
 from pydfs_lineup_optimizer.exceptions import GenerateLineupException
 from pydfs_lineup_optimizer.lineup import Lineup
@@ -15,6 +17,8 @@ from pydfs_lineup_optimizer.player import GameInfo, LineupPlayer
 from pydfs_lineup_optimizer.rules import OptimizerRule
 from pydfs_lineup_optimizer.settings import LineupPosition
 from pydfs_lineup_optimizer.solvers.constants import SolverSign
+from pydfs_lineup_optimizer.solvers.exceptions import SolverInfeasibleSolutionException
+from pydfs_lineup_optimizer.solvers.pulp_solver import PuLPSolver
 from pydfs_lineup_optimizer.stacks import PlayersGroup, PositionsStack
 
 from .identity import install_person_uniqueness
@@ -1874,7 +1878,7 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
         skip_rules=(),
         record_rules: bool = True,
     ):
-        optimizer = get_optimizer(self.site, self.sport)
+        optimizer = get_optimizer(self.site, self.sport, solver=_ReportingPuLPSolver)
         install_person_uniqueness(optimizer)
         self._apply_salary_caps(optimizer)
         self._apply_injury_filter(optimizer)
@@ -2072,11 +2076,97 @@ class _EitherTeamSplitRule(OptimizerRule):
         )
 
 
+def _selected_variables(problem):
+    """Variables chosen by a feasible CBC solve. Same rule as PuLPSolver."""
+    chosen = []
+    for variable in problem.variables():
+        value = variable.value()
+        if value is not None and round(value) >= 1.0:
+            chosen.append(variable)
+    return chosen
+
+
+def _order_constraint_terms(constraint) -> None:
+    """Put this constraint's variables in name order.
+
+    Overlap rows are filled by walking a set, so the term order follows
+    ``PYTHONHASHSEED``. ``deepcopy`` has already detached this constraint
+    from the lineup problem.
+    """
+    terms = sorted(
+        list(constraint.items()),
+        key=lambda pair: str(getattr(pair[0], "name", pair[0])),
+    )
+    constant = constraint.constant
+    sense = constraint.sense
+    name = constraint.name
+    constraint.clear()
+    for variable, coefficient in terms:
+        constraint[variable] = coefficient
+    constraint.constant = constant
+    constraint.sense = sense
+    constraint.name = name
+
+
+def _stable_invalid_constraint_names(problem) -> List[str]:
+    """Constraint names violated by one hash-stable infeasible solve.
+
+    PuLP writes the CBC matrix in constraint-dict order, and each row in
+    the order its terms were inserted. Both follow set iteration. CBC then
+    returns a different infeasible point, and a different subset of
+    constraints looks violated. This is a deepcopy used only to name them.
+    The lineup solve is the earlier one and is not rewritten.
+    """
+    copied = problem.deepcopy()
+    ordered = {}
+    for name, constraint in sorted(copied.constraints.items(), key=lambda item: str(item[0])):
+        _order_constraint_terms(constraint)
+        ordered[name] = constraint
+    copied.constraints = ordered
+    copied.solve(PuLPSolver.LP_SOLVER)
+    names = [
+        name or str(constraint)
+        for name, constraint in copied.constraints.items()
+        if not constraint.valid()
+    ]
+    return sorted(names)
+
+
+class _ReportingPuLPSolver(PuLPSolver):
+    """PuLP solver whose infeasible report does not depend on hash order.
+
+    A feasible solve is the stock PuLP path, so the lineup is the one CBC
+    returns for the problem pydfs built. Only the failure report is rebuilt.
+    """
+
+    def solve(self):
+        self.prob.solve(self.LP_SOLVER)
+        if self.prob.status == LpStatusOptimal:
+            return _selected_variables(self.prob)
+        raise SolverInfeasibleSolutionException(_stable_invalid_constraint_names(self.prob))
+
+
+# These say no binding constraint was identified. Once a showdown rule is
+# named, that claim contradicts the rule sentence. Overlap detail stays.
+# Solver-reported names are a fallback for when nothing else is named, so
+# they are not repeated beside a rule.
+_CONTRADICTING_SOLVER_SENTENCES = (
+    "The solver stopped and did not identify which constraint blocked the next lineup.",
+    "The solver stopped without naming one binding constraint.",
+)
+_SOLVER_REPORTED_CLAUSE = re.compile(
+    r"Solver-reported constraint names \(evidence only, not a proven cause\):[^.]*\."
+)
+
+
 def _diagnostic_suffix(shortfall: Optional[PortfolioShortfall]) -> str:
     """Overlap and solver detail already written for this short set.
 
-    The rule sentence is added beside this text. A shortfall that only says
-    the solver stopped, with no limit named, is not repeated once a rule is.
+    The rule sentence is added beside this text. Sentences that say the
+    solver never named a binding constraint are left off, and so are
+    solver-reported names: the rule or the overlap detail is the
+    explanation. A shortfall that only says the solver stopped, with no
+    limit named, is not repeated.
     """
     if shortfall is None or not shortfall.message:
         return ""
@@ -2085,6 +2175,10 @@ def _diagnostic_suffix(shortfall: Optional[PortfolioShortfall]) -> str:
     )
     text = shortfall.message.strip()
     suffix = text[len(prefix):].strip() if text.startswith(prefix) else text
+    for sentence in _CONTRADICTING_SOLVER_SENTENCES:
+        suffix = suffix.replace(sentence, " ")
+    suffix = _SOLVER_REPORTED_CLAUSE.sub(" ", suffix)
+    suffix = " ".join(suffix.split())
     if not suffix:
         return ""
     markers = (
@@ -2092,7 +2186,6 @@ def _diagnostic_suffix(shortfall: Optional[PortfolioShortfall]) -> str:
         "Limits sufficient",
         "Also at capacity",
         "Binding limit:",
-        "Solver-reported",
         "blocks another lineup",
     )
     if not any(marker in suffix for marker in markers):
@@ -2964,8 +3057,22 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         )
         return message
 
+    def _note_tier_rule(self, cause: Optional[str]) -> None:
+        """Remember a binding rule while a salary tier is being solved.
+
+        ``optimize_tiered_salaries`` replaces ``last_shortfall`` after the
+        tiers. The cause has to live somewhere that replacement does not wipe.
+        """
+        if not cause or not self._inside_portfolio:
+            return
+        causes = getattr(self, "_tier_rule_causes", None)
+        if causes is None:
+            causes = []
+            self._tier_rule_causes = causes
+        causes.append(cause)
+
     def _build_optimizer(self, players: List[Player]):
-        optimizer = get_optimizer(self.site, self.sport)
+        optimizer = get_optimizer(self.site, self.sport, solver=_ReportingPuLPSolver)
         install_person_uniqueness(optimizer)
         # Optional window. Showdown presets leave $200–$2,000 under the DK cap.
         self._apply_salary_caps(optimizer)
@@ -3028,6 +3135,7 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             diagnostic = self.explain_lineup_shortfall([], count)
             rule_cause = self._attribute_showdown_shortfall(players, [], count)
             if rule_cause:
+                self._note_tier_rule(rule_cause)
                 raise RuntimeError(
                     self._remember_rule_shortfall(count, 0, rule_cause, diagnostic)
                 ) from exc
@@ -3039,8 +3147,14 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         self._finish_shortfall(frames, count)
         if len(frames) < count:
             diagnostic = self.last_shortfall
+            if self._inside_portfolio:
+                # The portfolio batch does not write last_shortfall above, so
+                # the overlap detail for this tier is computed here. The tier
+                # helper still replaces the stored message with the combined one.
+                diagnostic = self.explain_lineup_shortfall(frames, count)
             rule_cause = self._attribute_showdown_shortfall(players, frames, count)
             if rule_cause:
+                self._note_tier_rule(rule_cause)
                 self._remember_rule_shortfall(count, len(frames), rule_cause, diagnostic)
         return frames
 
@@ -3188,6 +3302,7 @@ def optimize_tiered_salaries(
     optimizer._inside_portfolio = True
     optimizer.portfolio_size = int(total_n)
     optimizer.last_shortfall = None
+    optimizer._tier_rule_causes = []
     reset_min = getattr(optimizer, "_reset_min_tracking", None)
     if reset_min is not None:
         reset_min()
@@ -3206,7 +3321,14 @@ def optimize_tiered_salaries(
             optimizer.portfolio_lineups = list(lineups)
             lineups.extend(optimizer.generate_lineups(discount_n))
         if len(lineups) < int(total_n):
-            optimizer.last_shortfall = optimizer.explain_lineup_shortfall(lineups, total_n)
+            diagnostic = optimizer.explain_lineup_shortfall(lineups, total_n)
+            causes = list(dict.fromkeys(getattr(optimizer, "_tier_rule_causes", None) or []))
+            remember = getattr(optimizer, "_remember_rule_shortfall", None)
+            if causes and remember is not None:
+                cause = causes[0] if len(causes) == 1 else " ".join(causes)
+                remember(int(total_n), len(lineups), cause, diagnostic)
+            else:
+                optimizer.last_shortfall = diagnostic
         else:
             optimizer.last_shortfall = None
         finalize_min = getattr(optimizer, "_finalize_min_report", None)

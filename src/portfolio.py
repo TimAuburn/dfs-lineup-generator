@@ -716,6 +716,19 @@ def _name_list(keys: Sequence[Identity], names: Mapping[Identity, str]) -> str:
     return text
 
 
+def _constraint_name_key(name: str) -> tuple:
+    """Alphabetical, with a trailing index in numeric order.
+
+    ``person_unique_13`` sorts after ``person_unique_5``. Plain ``sorted``
+    would put it first because ``"1" < "5"``.
+    """
+    text = str(name)
+    prefix, separator, suffix = text.rpartition("_")
+    if separator and suffix.isdigit():
+        return (prefix, int(suffix), text)
+    return (text, -1, text)
+
+
 def _shortfall_message(
     requested: int,
     built: int,
@@ -739,12 +752,19 @@ def _shortfall_message(
         sentence += (
             " The solver stopped and did not identify which constraint blocked the next lineup."
         )
-    if solver_constraints:
-        sentence += (
-            " Solver-reported constraint names (evidence only, not a proven cause): "
-            + ", ".join(solver_constraints)
-            + "."
+        # Names are only the fallback. A binding limit or a capacity
+        # candidate already explains the shortfall, so they are left off
+        # there. The list is sorted because set order follows PYTHONHASHSEED.
+        names = sorted(
+            {str(name).strip() for name in solver_constraints if str(name).strip()},
+            key=_constraint_name_key,
         )
+        if names:
+            sentence += (
+                " Solver-reported constraint names (evidence only, not a proven cause): "
+                + ", ".join(names)
+                + "."
+            )
     return sentence
 
 
