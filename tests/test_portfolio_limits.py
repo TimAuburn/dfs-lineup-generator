@@ -237,8 +237,9 @@ def test_infeasible_overlap_returns_fewer_lineups_and_names_the_limit():
     assert "Max overlap 0" in shortfall.message
     assert "Binding limit" in shortfall.message
     assert "Requested 2 lineups and built 1." in shortfall.message
-    # The solver names symptoms. Those names are not the binding limit.
-    assert "not a proven cause" in shortfall.message
+    # The overlap cap is the named cause, so solver symptom names are omitted.
+    assert "Solver-reported" not in shortfall.message
+    assert "not a proven cause" not in shortfall.message
     assert pairwise_overlap(lineups) <= 0 or len(lineups) == 1
 
 

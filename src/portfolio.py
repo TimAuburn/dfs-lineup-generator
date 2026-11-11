@@ -752,18 +752,19 @@ def _shortfall_message(
         sentence += (
             " The solver stopped and did not identify which constraint blocked the next lineup."
         )
-    if solver_constraints:
-        # Dict and set order follow PYTHONHASHSEED. The names are evidence,
-        # so the sentence lists each one once, in a fixed order.
+        # Names are only the fallback. A binding limit or a capacity
+        # candidate already explains the shortfall, so they are left off
+        # there. The list is sorted because set order follows PYTHONHASHSEED.
         names = sorted(
             {str(name).strip() for name in solver_constraints if str(name).strip()},
             key=_constraint_name_key,
         )
-        sentence += (
-            " Solver-reported constraint names (evidence only, not a proven cause): "
-            + ", ".join(names)
-            + "."
-        )
+        if names:
+            sentence += (
+                " Solver-reported constraint names (evidence only, not a proven cause): "
+                + ", ".join(names)
+                + "."
+            )
     return sentence
 
 

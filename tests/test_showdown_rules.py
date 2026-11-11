@@ -532,9 +532,10 @@ def test_named_rule_drops_contradicting_solver_text_and_keeps_overlap():
         "The solver stopped and did not identify which constraint blocked the next lineup."
         not in message
     )
+    assert "Solver-reported" not in message
 
-    # One legal lineup, so there is no overlap pair to report. Solver-reported
-    # names used to keep the "did not identify" sentence next to the rule.
+    # One legal lineup, so there is no overlap pair to report. The salary
+    # floor is the cause, so solver names are not attached.
     single = _solve(
         _salary_pool(),
         salary_floor=True,
@@ -550,6 +551,7 @@ def test_named_rule_drops_contradicting_solver_text_and_keeps_overlap():
         "The solver stopped and did not identify which constraint blocked the next lineup."
         not in single_message
     )
+    assert "Solver-reported" not in single_message
 
     plain, plain_lineups = _generate(
         rows,
@@ -599,6 +601,7 @@ def test_tiered_showdown_shortfall_names_the_binding_rule_and_overlap():
         "The solver stopped and did not identify which constraint blocked the next lineup."
         not in message
     )
+    assert "Solver-reported" not in message
 
 
 def _shortfall_under_hash_seed(seed: str) -> dict:
@@ -634,6 +637,64 @@ print(json.dumps({
     )
     assert completed.returncode == 0, completed.stderr
     return json.loads(completed.stdout)
+
+
+def _gpp_shortfall_under_hash_seed(seed: str) -> dict:
+    """150 Showdown GPP lineups. The shortfall text used to follow the hash seed."""
+    code = """
+import hashlib
+import json
+from pathlib import Path
+from src.optimizer import NFLShowdownOptimizer
+from src.parser import parse_dk_csv
+from src.presets import ContestPreset, apply_preset
+
+optimizer = NFLShowdownOptimizer()
+optimizer.load_from_dataframe(parse_dk_csv(Path("tests/mock_dk_showdown.csv")))
+apply_preset(optimizer, ContestPreset.SHOWDOWN_GPP, lineup_count=150, jitter_seed=42)
+lineups = optimizer.generate_lineups()
+ids = tuple(tuple(str(player_id) for player_id in lineup["ID"].tolist()) for lineup in lineups)
+digest = hashlib.sha256("\\n".join(",".join(row) for row in ids).encode()).hexdigest()
+print(json.dumps({
+    "built": len(lineups),
+    "id_hash": digest,
+    "message": None if optimizer.last_shortfall is None else optimizer.last_shortfall.message,
+}))
+"""
+    env = os.environ.copy()
+    env["PYTHONHASHSEED"] = seed
+    root = str(Path(__file__).resolve().parents[1])
+    env["PYTHONPATH"] = root
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)
+
+
+def test_showdown_gpp_shortfall_message_is_identical_across_hash_seeds():
+    """A 150-lineup Showdown shortfall reads the same under four hash seeds."""
+    runs = [_gpp_shortfall_under_hash_seed(seed) for seed in ("0", "1", "2", "42")]
+    messages = [run["message"] for run in runs]
+    assert all(message == messages[0] for message in messages)
+    assert all(run["built"] == runs[0]["built"] for run in runs)
+    assert all(run["id_hash"] == runs[0]["id_hash"] for run in runs)
+    message = messages[0]
+    assert message is not None
+    assert "Binding limit:" in message
+    assert RULE_MIN_PER_TEAM in message
+    assert "Candidate limits at capacity: Max overlap 3:" in message
+    assert "Solver-reported" not in message
+    assert "The solver stopped without naming one binding constraint." not in message
+    assert (
+        "The solver stopped and did not identify which constraint blocked the next lineup."
+        not in message
+    )
 
 
 def test_shortfall_message_is_identical_across_hash_seeds():

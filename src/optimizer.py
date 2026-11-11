@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
@@ -2085,18 +2086,43 @@ def _selected_variables(problem):
     return chosen
 
 
+def _order_constraint_terms(constraint) -> None:
+    """Put this constraint's variables in name order.
+
+    Overlap rows are filled by walking a set, so the term order follows
+    ``PYTHONHASHSEED``. ``deepcopy`` has already detached this constraint
+    from the lineup problem.
+    """
+    terms = sorted(
+        list(constraint.items()),
+        key=lambda pair: str(getattr(pair[0], "name", pair[0])),
+    )
+    constant = constraint.constant
+    sense = constraint.sense
+    name = constraint.name
+    constraint.clear()
+    for variable, coefficient in terms:
+        constraint[variable] = coefficient
+    constraint.constant = constant
+    constraint.sense = sense
+    constraint.name = name
+
+
 def _stable_invalid_constraint_names(problem) -> List[str]:
     """Constraint names violated by one hash-stable infeasible solve.
 
-    PuLP writes the CBC matrix in ``constraints`` insertion order. pydfs
-    stores rules in a set, and team limits walk a set, so that order follows
-    ``PYTHONHASHSEED``. CBC then returns a different infeasible point, and a
-    different subset of constraints looks violated. The lineup solve is
-    untouched. This copy sorts the same constraints by name and solves only
-    to name them.
+    PuLP writes the CBC matrix in constraint-dict order, and each row in
+    the order its terms were inserted. Both follow set iteration. CBC then
+    returns a different infeasible point, and a different subset of
+    constraints looks violated. This is a deepcopy used only to name them.
+    The lineup solve is the earlier one and is not rewritten.
     """
-    copied = problem.copy()
-    copied.constraints = dict(sorted(copied.constraints.items(), key=lambda item: str(item[0])))
+    copied = problem.deepcopy()
+    ordered = {}
+    for name, constraint in sorted(copied.constraints.items(), key=lambda item: str(item[0])):
+        _order_constraint_terms(constraint)
+        ordered[name] = constraint
+    copied.constraints = ordered
     copied.solve(PuLPSolver.LP_SOLVER)
     names = [
         name or str(constraint)
@@ -2121,11 +2147,15 @@ class _ReportingPuLPSolver(PuLPSolver):
 
 
 # These say no binding constraint was identified. Once a showdown rule is
-# named, that claim contradicts the rule sentence. "Solver-reported" used to
-# keep the whole suffix, including these sentences. Overlap detail stays.
+# named, that claim contradicts the rule sentence. Overlap detail stays.
+# Solver-reported names are a fallback for when nothing else is named, so
+# they are not repeated beside a rule.
 _CONTRADICTING_SOLVER_SENTENCES = (
     "The solver stopped and did not identify which constraint blocked the next lineup.",
     "The solver stopped without naming one binding constraint.",
+)
+_SOLVER_REPORTED_CLAUSE = re.compile(
+    r"Solver-reported constraint names \(evidence only, not a proven cause\):[^.]*\."
 )
 
 
@@ -2133,10 +2163,10 @@ def _diagnostic_suffix(shortfall: Optional[PortfolioShortfall]) -> str:
     """Overlap and solver detail already written for this short set.
 
     The rule sentence is added beside this text. Sentences that say the
-    solver never named a binding constraint are left off, because the rule
-    is that constraint. Overlap detail and solver-reported names stay. A
-    shortfall that only says the solver stopped, with no limit named, is
-    not repeated.
+    solver never named a binding constraint are left off, and so are
+    solver-reported names: the rule or the overlap detail is the
+    explanation. A shortfall that only says the solver stopped, with no
+    limit named, is not repeated.
     """
     if shortfall is None or not shortfall.message:
         return ""
@@ -2147,6 +2177,7 @@ def _diagnostic_suffix(shortfall: Optional[PortfolioShortfall]) -> str:
     suffix = text[len(prefix):].strip() if text.startswith(prefix) else text
     for sentence in _CONTRADICTING_SOLVER_SENTENCES:
         suffix = suffix.replace(sentence, " ")
+    suffix = _SOLVER_REPORTED_CLAUSE.sub(" ", suffix)
     suffix = " ".join(suffix.split())
     if not suffix:
         return ""
@@ -2155,7 +2186,6 @@ def _diagnostic_suffix(shortfall: Optional[PortfolioShortfall]) -> str:
         "Limits sufficient",
         "Also at capacity",
         "Binding limit:",
-        "Solver-reported",
         "blocks another lineup",
     )
     if not any(marker in suffix for marker in markers):
