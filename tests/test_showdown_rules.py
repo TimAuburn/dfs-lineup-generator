@@ -7,6 +7,10 @@ same lineup main produced.
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -14,7 +18,7 @@ import pytest
 
 from src.data_loader import apply_low_total_kicker_cap, kicker_captain_exposure_cap
 from src.exporter import lineups_to_dk_upload_csv
-from src.optimizer import NFLClassicOptimizer, NFLShowdownOptimizer
+from src.optimizer import NFLClassicOptimizer, NFLShowdownOptimizer, optimize_tiered_salaries
 from src.parser import parse_dk_csv
 from src.presets import ContestPreset, apply_preset, format_preset_summary, get_preset_config
 from src.showdown_rules import (
@@ -565,6 +569,85 @@ def test_named_rule_drops_contradicting_solver_text_and_keeps_overlap():
         in plain_message
     )
     assert "Solver-reported" in plain_message
+
+
+def test_tiered_showdown_shortfall_names_the_binding_rule_and_overlap():
+    """A short tiered run keeps the rule found in a tier, then the overlap detail."""
+    optimizer = NFLShowdownOptimizer()
+    optimizer.load_from_dataframe(parse_dk_csv(MOCK_SHOWDOWN))
+    apply_preset(optimizer, ContestPreset.SHOWDOWN_GPP, lineup_count=6, jitter_seed=42)
+    optimizer.jitter_pct = (0.0, 0.0)
+    optimizer.max_repeating_players = 1
+    lineups = optimize_tiered_salaries(
+        optimizer,
+        total_n=6,
+        leave_money_ratio=0.5,
+        standard_cap=50_000,
+        discount_cap=47_000,
+        discount_floor=40_000,
+    )
+    assert len(lineups) < 6
+    message = optimizer.last_shortfall.message
+    assert f"Requested 6 lineups and built {len(lineups)}." in message
+    assert "Binding limit:" in message
+    assert RULE_NO_K_DST_CAPTAIN in message
+    assert RULE_MIN_PER_TEAM in message
+    assert "Candidate limits at capacity: Max overlap 1:" in message
+    assert "share 1 players" in message
+    assert "The solver stopped without naming one binding constraint." not in message
+    assert (
+        "The solver stopped and did not identify which constraint blocked the next lineup."
+        not in message
+    )
+
+
+def _shortfall_under_hash_seed(seed: str) -> dict:
+    """One process, one PYTHONHASHSEED, the shortfall whose names used to move."""
+    code = """
+import json
+from tests.test_showdown_rules import _salary_pool, _pair, _generate
+rows = _salary_pool()
+rows += _pair("WR", "BUF C", 80, "BUF", 6000, 18)
+optimizer, lineups = _generate(
+    rows,
+    n=3,
+    salary_floor=False,
+    min_salary_cap=None,
+    max_salary_cap=None,
+    max_repeating_players=2,
+)
+print(json.dumps({
+    "ids": [[str(player_id) for player_id in lineup["ID"].tolist()] for lineup in lineups],
+    "message": optimizer.last_shortfall.message,
+}))
+"""
+    env = os.environ.copy()
+    env["PYTHONHASHSEED"] = seed
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)
+
+
+def test_shortfall_message_is_identical_across_hash_seeds():
+    """Solver-reported names stay put when PYTHONHASHSEED changes. Lineups do too."""
+    first = _shortfall_under_hash_seed("0")
+    second = _shortfall_under_hash_seed("1")
+    assert first["ids"] == second["ids"]
+    assert first["ids"] == [["11", "60", "20", "30", "40", "50"]]
+    assert first["message"] == second["message"]
+    assert (
+        "The solver stopped and did not identify which constraint blocked the next lineup."
+        in first["message"]
+    )
+    assert "Solver-reported" in first["message"]
 
 
 def test_low_total_kicker_cap_is_skipped_while_the_captain_ban_is_on():
