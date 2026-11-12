@@ -1815,7 +1815,10 @@ with st.sidebar:
 
     st.markdown("### API keys")
     st.caption(key_status(ODDS_API_KEY_ENV))
-    st.caption("The odds key loads from a local `.env` (see `.env.example`). Weather uses the National Weather Service and does not need a key.")
+    st.caption(
+        "The odds key is read from the process environment, a local `.env` file, "
+        "or Streamlit secrets. Weather uses the National Weather Service and does not need a key."
+    )
 
     st.markdown("### Vegas odds")
     odds_api_key = get_odds_api_key()
