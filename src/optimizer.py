@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -728,6 +728,9 @@ class BaseNFLOptimizer:
         self._solver_constraint_notes: List[str] = []
         # Jittered pool captured before lineup rules run. Rules do not edit it.
         self.last_projected_frame: Optional[pd.DataFrame] = None
+        # Optional UI hook. None leaves generation unchanged. The argument is
+        # how many lineups this portfolio has produced in the current attempt.
+        self.on_lineup_progress: Optional[Callable[[int], None]] = None
 
     def set_locked_players(self, player_ids: Optional[Sequence[str]]) -> None:
         """Force these player IDs into the lineup. Empty clears the locks."""
@@ -1046,6 +1049,13 @@ class BaseNFLOptimizer:
             return True
         return False
 
+    def _note_lineup_progress(self, built: int) -> None:
+        """Report a lineup as it is yielded. The solver result is unchanged."""
+        callback = self.on_lineup_progress
+        if callback is None:
+            return
+        callback(int(built))
+
     def _consume_lineups(self, pydfs_optimizer, count: int, players: Sequence[Player], prior_frames: Sequence[pd.DataFrame]):
         """Run one pydfs batch. A partial result is kept; an empty one is raised.
 
@@ -1069,6 +1079,7 @@ class BaseNFLOptimizer:
                     exclude_lineups=exclude,
                 ):
                     produced.append(lineup)
+                    self._note_lineup_progress(len(prior_frames) + len(raw) + len(produced))
                 raw.extend(produced)
                 break
             except GenerateLineupException as exc:
@@ -1196,6 +1207,7 @@ class BaseNFLOptimizer:
                         return built
                 built.append(lineup)
                 carried.append(self.format_lineup(lineup))
+                self._note_lineup_progress(len(carried))
                 placed = True
         return built
 

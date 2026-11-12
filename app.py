@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -47,6 +48,7 @@ from src.env_config import (
     load_env,
 )
 from src.exporter import lineups_to_dk_upload_csv, upload_columns_for
+from src.generation_progress import format_lineup_progress, lineup_progress_percent
 from src.upload_check import (
     csv_for_download,
     failure_table,
@@ -2549,7 +2551,25 @@ if generate:
             st.error(sleeper_status_caption(sleeper_summary, st.session_state.player_pool))
         _paint_exports()
         st.stop()
-    progress = st.progress(0, text="Building optimizer…")
+    progress_slot = st.empty()
+    requested_lineups = int(lineup_count)
+    generation_started = time.perf_counter()
+    progress_bar = progress_slot.progress(
+        lineup_progress_percent(0, requested_lineups),
+        text=format_lineup_progress(0, requested_lineups, 0.0),
+    )
+
+    def _on_lineup_progress(built: int) -> None:
+        progress_bar.progress(
+            lineup_progress_percent(built, requested_lineups),
+            text=format_lineup_progress(
+                built,
+                requested_lineups,
+                time.perf_counter() - generation_started,
+            ),
+        )
+
+    optimizer = None
     try:
         if working_pool.empty:
             raise RuntimeError("Every player is removed from the pool.")
@@ -2564,6 +2584,7 @@ if generate:
         # Current odds and wind, from the clean baseline. Overrides stay as entered.
         solve_pool = projections_for_solve(working_pool, solve_lines, solve_weather)
         optimizer = get_nfl_optimizer(contest_format)
+        optimizer.on_lineup_progress = _on_lineup_progress
         optimizer.set_exclude_inactive(exclude_inactive)
         optimizer.load_from_dataframe(solve_pool)
         optimizer.set_locked_players(locked_ids)
@@ -2597,7 +2618,6 @@ if generate:
             min_exposure_pct=float(min_exposure_pct) if use_min_exposure else None,
             max_exposure_pct=float(max_exposure_pct) if use_max_exposure else None,
         )
-        progress.progress(30, text=f"Generating {lineup_count} lineups…")
         if game_script_buckets is not None:
             if not game_script_buckets:
                 raise RuntimeError(
@@ -2621,7 +2641,6 @@ if generate:
             )
         else:
             generated = optimizer.generate_lineups()
-        progress.progress(100, text="Done")
         rule_check = None
         if preset is ContestPreset.CLASSIC_LARGE_GPP and game_script_buckets is None:
             rule_check = {
@@ -2677,7 +2696,9 @@ if generate:
         st.session_state.generated_run = None
         st.error(f"Optimization failed: {exc}")
     finally:
-        progress.empty()
+        if optimizer is not None:
+            optimizer.on_lineup_progress = None
+        progress_slot.empty()
 
 lineups = st.session_state.lineups
 if lineups:
