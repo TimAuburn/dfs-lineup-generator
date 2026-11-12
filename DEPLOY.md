@@ -16,7 +16,8 @@ with `streamlit run app.py`.
 
 Community Cloud installs `requirements.txt`. Test-only packages are listed in
 `requirements-dev.txt` and are not installed on Cloud. Do not add
-`packages.txt`. PuLP's Linux build includes the CBC solver binary this app uses.
+`packages.txt`. `pydfs-lineup-optimizer` 3.6.1 requires `PuLP==2.4`, and that
+release's Linux build includes the CBC solver binary this app uses.
 
 No `.streamlit/config.toml` is included. Salary and contest uploads are CSV or
 ZIP files, and Streamlit's default upload limit is 200 MB.
