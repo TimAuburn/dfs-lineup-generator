@@ -1816,8 +1816,11 @@ with st.sidebar:
     st.markdown("### API keys")
     st.caption(key_status(ODDS_API_KEY_ENV))
     st.caption(
-        "The odds key is read from the process environment, a local `.env` file, "
-        "or Streamlit secrets. Weather uses the National Weather Service and does not need a key."
+        "Under streamlit run, a root-level secret is copied into the environment "
+        "before this script starts, so Streamlit secrets win over the process "
+        "environment and a local `.env` file. The line above names which source "
+        "supplied the odds key and does not show the key. Weather uses the "
+        "National Weather Service and does not need a key."
     )
 
     st.markdown("### Vegas odds")

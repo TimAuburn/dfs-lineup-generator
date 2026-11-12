@@ -1,4 +1,17 @@
-"""Load API keys from the process environment, a ``.env`` file, or Streamlit secrets.
+"""Load API keys and name which source supplied them.
+
+Under ``streamlit run``, including Streamlit Community Cloud, a ``secrets.toml``
+file is parsed before the app script runs. Root-level strings, ints, and
+floats are copied into ``os.environ`` by
+``streamlit.runtime.secrets.Secrets._maybe_set_environment_variable``, which
+assigns ``os.environ[name] = str(value)`` and therefore replaces a process
+environment value of the same name. ``load_dotenv`` does not override, so a
+``.env`` file cannot replace that copy either. Precedence is Streamlit
+secrets, then the process environment, then ``.env``.
+
+Outside ``streamlit run`` nothing copies secrets first. The process
+environment wins, then ``.env``, and ``st.secrets`` is read only when the
+name is still missing.
 
 The value is never logged. Callers that only need a status line should use
 ``key_status``, which names the source and omits the secret.
@@ -99,46 +112,43 @@ def read_exec_environment() -> Optional[dict[str, str]]:
     return parsed
 
 
-def _already_loaded_secret(name: str) -> Optional[str]:
-    """Read a secret Streamlit has already parsed, without parsing files.
+def _read_public_secret(name: str, *, restore_env: bool) -> Optional[str]:
+    """Return ``st.secrets[name]`` when it is a string, else ``None``.
 
-    Touching ``st.secrets`` parses ``secrets.toml`` and copies string values
-    into ``os.environ``. Skip that when a value is already in the environment
-    so a caption check cannot replace it.
-    """
-    try:
-        from streamlit.runtime.secrets import secrets_singleton
-    except ImportError:
-        return None
-    parsed = getattr(secrets_singleton, "_secrets", None)
-    if not isinstance(parsed, Mapping):
-        return None
-    value = parsed.get(name)
-    if not isinstance(value, str):
-        return None
-    return _clean(value)
+    Membership uses the public ``in`` check. A missing or broken secrets file
+    raises ``StreamlitSecretNotFoundError``. Any other failure, including a
+    future Streamlit API change, is caught too. None of those crash the app
+    or mark the source as secrets.
 
-
-def _read_streamlit_secret(name: str) -> Optional[str]:
-    """Return ``st.secrets[name]`` when the environment variable is missing.
-
-    Streamlit raises ``StreamlitSecretNotFoundError`` (a ``FileNotFoundError``)
-    when ``secrets.toml`` is absent. A missing key raises ``KeyError``. Both,
-    and importing Streamlit when it is not installed, yield ``None``.
+    Touching ``st.secrets`` parses ``secrets.toml`` and copies root values
+    into ``os.environ``. When ``restore_env`` is true, ``name`` is put back
+    so a caption check cannot replace a value that was already set.
     """
     try:
         import streamlit as st
         from streamlit.errors import StreamlitSecretNotFoundError
     except ImportError:
         return None
+
+    had_key = name in os.environ
+    previous = os.environ.get(name) if had_key else None
+    value: object = None
     try:
-        if not st.secrets.load_if_toml_exists():
-            return None
-        value = st.secrets[name]
-    except (StreamlitSecretNotFoundError, KeyError, FileNotFoundError):
-        return None
-    except Exception:
-        return None
+        try:
+            if name not in st.secrets:
+                value = None
+            else:
+                value = st.secrets[name]
+        except (StreamlitSecretNotFoundError, KeyError, FileNotFoundError):
+            value = None
+        except Exception:
+            value = None
+    finally:
+        if restore_env:
+            if had_key:
+                os.environ[name] = "" if previous is None else previous
+            else:
+                os.environ.pop(name, None)
     if not isinstance(value, str):
         return None
     return _clean(value)
@@ -155,9 +165,9 @@ def _secret_for(
         if not isinstance(value, str):
             return None
         return _clean(value)
-    if allow_load:
-        return _read_streamlit_secret(name)
-    return _already_loaded_secret(name)
+    # A value already in the environment must not be replaced by the parse.
+    # When the name is still missing, leave Streamlit's copy in place.
+    return _read_public_secret(name, restore_env=not allow_load)
 
 
 def resolve_key(
@@ -172,11 +182,14 @@ def resolve_key(
     ``source`` is ``environment``, ``dotenv``, ``secrets``, or ``missing``.
     ``value`` is ``None`` when the key is absent. Captions must not include it.
 
-    An external environment variable is one present at process start. A value
-    python-dotenv wrote is ``dotenv``. Streamlit Community Cloud copies
-    ``secrets.toml`` into ``os.environ`` before the script runs; that value is
-    ``secrets`` when it was not already in the process-start environment.
-    ``st.secrets`` is read only when the variable is still missing.
+    Under ``streamlit run`` the returned value is whatever Streamlit left in
+    the environment. A root secret wins over the process environment and over
+    ``.env``. This function labels that value ``secrets`` when it matches
+    ``st.secrets`` and was not already present at process start. A value
+    python-dotenv wrote is ``dotenv``. A value present at process start, and
+    a later assignment that is not a secret, is ``environment``. ``st.secrets``
+    supplies the value itself only when the name is still missing, which is
+    the path outside ``streamlit run``.
     """
     if dotenv_path is not None:
         load_env(dotenv_path, override=False)

@@ -30,9 +30,11 @@ In the app's **Advanced settings**, open **Secrets** and add:
 ODDS_API_KEY = "..."
 ```
 
-The app reads `st.secrets["ODDS_API_KEY"]` when that variable is not already
-in the environment. The sidebar caption names the source — the process
-environment, a `.env` file, or Streamlit secrets — and does not show the key.
+`streamlit run` copies that root-level value into the environment before the
+app starts. The copy replaces a process environment value of the same name,
+and a `.env` file does not override it. The sidebar caption names the source
+— Streamlit secrets, the process environment, or a `.env` file — and does
+not show the key.
 
 ## Data and runtime
 
