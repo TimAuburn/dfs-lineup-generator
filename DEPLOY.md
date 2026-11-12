@@ -16,7 +16,8 @@ with `streamlit run app.py`.
 
 Community Cloud installs `requirements.txt`. Test-only packages are listed in
 `requirements-dev.txt` and are not installed on Cloud. Do not add
-`packages.txt`. PuLP's Linux build includes the CBC solver binary this app uses.
+`packages.txt`. `pydfs-lineup-optimizer` 3.6.1 requires `PuLP==2.4`, and that
+release's Linux build includes the CBC solver binary this app uses.
 
 No `.streamlit/config.toml` is included. Salary and contest uploads are CSV or
 ZIP files, and Streamlit's default upload limit is 200 MB.
@@ -29,9 +30,11 @@ In the app's **Advanced settings**, open **Secrets** and add:
 ODDS_API_KEY = "..."
 ```
 
-The app reads `st.secrets["ODDS_API_KEY"]` when that variable is not already
-in the environment. The sidebar caption names the source — the process
-environment, a `.env` file, or Streamlit secrets — and does not show the key.
+`streamlit run` copies that root-level value into the environment before the
+app starts. The copy replaces a process environment value of the same name,
+and a `.env` file does not override it. The sidebar caption names the source
+— Streamlit secrets, the process environment, or a `.env` file — and does
+not show the key.
 
 ## Data and runtime
 

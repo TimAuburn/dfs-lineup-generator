@@ -220,3 +220,131 @@ def test_in_process_env_var_is_labeled_environment_without_proc(tmp_path, monkey
     assert source == SOURCE_ENVIRONMENT
     assert caption == PROCESS_CAPTION
     assert _PROCESS_VALUE not in caption
+
+
+class _RaisingSecrets:
+    """Stand-in for a secrets object whose public access fails closed."""
+
+    def __contains__(self, key: object) -> bool:
+        raise RuntimeError("st.secrets is unavailable")
+
+    def __getitem__(self, key: object) -> str:
+        raise RuntimeError("st.secrets is unavailable")
+
+
+def test_secrets_access_raising_does_not_crash_or_mislabel(tmp_path, monkeypatch, capsys, caplog):
+    """A broken or renamed secrets API must not crash or claim the secret source."""
+    import os
+
+    monkeypatch.setattr("streamlit.secrets", _RaisingSecrets())
+    monkeypatch.setenv(ODDS_API_KEY_ENV, _PROCESS_VALUE)
+    caplog.set_level(logging.DEBUG)
+    load_env(_empty_env(tmp_path), override=False)
+
+    value, source = resolve_key(ODDS_API_KEY_ENV, process_env={})
+    caption = key_status(ODDS_API_KEY_ENV, process_env={})
+    captured = capsys.readouterr()
+    assert value == _PROCESS_VALUE
+    assert source == SOURCE_ENVIRONMENT
+    assert caption == PROCESS_CAPTION
+    assert _PROCESS_VALUE not in caption
+    assert _PROCESS_VALUE not in captured.out
+    assert _PROCESS_VALUE not in captured.err
+    assert _PROCESS_VALUE not in caplog.text
+    assert os.environ.get(ODDS_API_KEY_ENV) == _PROCESS_VALUE
+
+
+def test_secrets_access_raising_with_nothing_else_set_is_missing(tmp_path, monkeypatch, capsys, caplog):
+    monkeypatch.setattr("streamlit.secrets", _RaisingSecrets())
+    caplog.set_level(logging.DEBUG)
+    load_env(_empty_env(tmp_path), override=True)
+
+    value, source = resolve_key(ODDS_API_KEY_ENV, process_env={})
+    caption = key_status(ODDS_API_KEY_ENV, process_env={})
+    captured = capsys.readouterr()
+    assert value is None
+    assert source == SOURCE_MISSING
+    assert caption == MISSING_CAPTION
+    assert _SECRETS_VALUE not in caption
+    assert _SECRETS_VALUE not in captured.out
+    assert _SECRETS_VALUE not in captured.err
+    assert _SECRETS_VALUE not in caplog.text
+
+
+def test_broken_secrets_file_does_not_crash_and_keeps_dotenv(tmp_path, monkeypatch, capsys, caplog):
+    secrets_file = tmp_path / "secrets.toml"
+    secrets_file.write_text("this is not toml [\n", encoding="utf-8")
+    _point_secrets_at(secrets_file)
+    monkeypatch.delenv(ODDS_API_KEY_ENV, raising=False)
+    load_env(_empty_env(tmp_path), override=True)
+    absent, absent_source = resolve_key(ODDS_API_KEY_ENV, process_env={})
+    assert absent is None
+    assert absent_source == SOURCE_MISSING
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"{ODDS_API_KEY_ENV}={_DOTENV_VALUE}\n", encoding="utf-8")
+    caplog.set_level(logging.DEBUG)
+    load_env(env_file, override=True)
+
+    value, source = resolve_key(ODDS_API_KEY_ENV, process_env={})
+    caption = key_status(ODDS_API_KEY_ENV, process_env={})
+    captured = capsys.readouterr()
+    assert value == _DOTENV_VALUE
+    assert source == SOURCE_DOTENV
+    assert caption == DOTENV_CAPTION
+    assert _DOTENV_VALUE not in caption
+    assert _DOTENV_VALUE not in captured.out
+    assert _DOTENV_VALUE not in captured.err
+    assert _DOTENV_VALUE not in caplog.text
+
+
+def test_caption_check_does_not_replace_an_in_process_key(tmp_path, monkeypatch):
+    """Reading st.secrets to label a later assignment must not clobber that value."""
+    import os
+
+    secrets_file = tmp_path / "secrets.toml"
+    secrets_file.write_text(f'{ODDS_API_KEY_ENV} = "{_SECRETS_VALUE}"\n', encoding="utf-8")
+    _point_secrets_at(secrets_file)
+    monkeypatch.setenv(ODDS_API_KEY_ENV, _PROCESS_VALUE)
+    load_env(_empty_env(tmp_path), override=False)
+
+    value, source = resolve_key(ODDS_API_KEY_ENV, process_env={})
+    caption = key_status(ODDS_API_KEY_ENV, process_env={})
+    assert value == _PROCESS_VALUE
+    assert source == SOURCE_ENVIRONMENT
+    assert caption == PROCESS_CAPTION
+    assert os.environ.get(ODDS_API_KEY_ENV) == _PROCESS_VALUE
+    assert _PROCESS_VALUE not in caption
+    assert _SECRETS_VALUE not in caption
+
+
+def test_env_only_does_not_read_a_different_secret(tmp_path, monkeypatch, capsys, caplog):
+    """A process-start value stays put even when secrets.toml has another key."""
+    import os
+
+    secrets_file = tmp_path / "secrets.toml"
+    secrets_file.write_text(f'{ODDS_API_KEY_ENV} = "{_SECRETS_VALUE}"\n', encoding="utf-8")
+    _point_secrets_at(secrets_file)
+    monkeypatch.setenv(ODDS_API_KEY_ENV, _PROCESS_VALUE)
+    caplog.set_level(logging.DEBUG)
+    load_env(_empty_env(tmp_path), override=False)
+
+    value, source = resolve_key(
+        ODDS_API_KEY_ENV,
+        process_env={ODDS_API_KEY_ENV: _PROCESS_VALUE},
+    )
+    caption = key_status(
+        ODDS_API_KEY_ENV,
+        process_env={ODDS_API_KEY_ENV: _PROCESS_VALUE},
+    )
+    captured = capsys.readouterr()
+    assert value == _PROCESS_VALUE
+    assert source == SOURCE_ENVIRONMENT
+    assert caption == PROCESS_CAPTION
+    assert os.environ.get(ODDS_API_KEY_ENV) == _PROCESS_VALUE
+    assert _PROCESS_VALUE not in caption
+    assert _SECRETS_VALUE not in caption
+    assert _SECRETS_VALUE not in captured.out
+    assert _SECRETS_VALUE not in captured.err
+    assert _SECRETS_VALUE not in caplog.text
+    assert _PROCESS_VALUE not in caplog.text
