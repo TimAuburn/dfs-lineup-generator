@@ -1,6 +1,6 @@
-streamlit
-pydfs-lineup-optimizer
-pandas
-numpy
-python-dotenv
-pytest
+streamlit==1.67.0
+pandas==3.0.6
+numpy==2.5.4
+pydfs-lineup-optimizer==3.6.1
+python-dotenv==1.2.4
+PuLP==2.4
