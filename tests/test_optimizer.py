@@ -1570,7 +1570,7 @@ def _showdown_open_rules(**extra):
     return rules
 
 
-def test_showdown_results_list_every_lineup_without_a_dropdown():
+def test_showdown_results_list_every_lineup_and_a_full_roster_table():
     app_test = pytest.importorskip("streamlit.testing.v1")
     from src.presets import ContestFormat
 
@@ -1617,8 +1617,13 @@ def test_showdown_results_list_every_lineup_without_a_dropdown():
     at.session_state["lineups"] = [lineup]
     at.run(timeout=90)
     assert not at.exception
-    assert not any(item.label == "View lineup" for item in at.selectbox)
+    assert any(item.label == "View lineup" for item in at.selectbox)
     grid = next(frame for frame in at.dataframe if "Captain" in frame.value.columns)
+    detail = next(frame for frame in at.dataframe if "Sleeper Proj" in frame.value.columns)
+    assert list(detail.value["Slot"]) == ["CPT", "FLEX", "FLEX", "FLEX", "FLEX", "FLEX"]
+    assert "Salary Remaining ($)" not in detail.value.columns
+    assert "Projection" in detail.value.columns
+    assert detail.value["Sleeper Proj"].isna().all()
     assert grid.value.loc[0, "Captain"] == "Saquon Barkley (PHI)"
     assert grid.value.loc[0, "FLEX 1"] == "Austin Ekeler (WAS)"
     assert grid.value.loc[0, "Salary"] == 48900

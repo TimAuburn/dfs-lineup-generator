@@ -93,6 +93,7 @@ from src.optimizer import (
 from src.dk_scoring import SCORING_VERSION
 from src.parser import DKCSVValidationError, is_inactive_injury, parse_dk_csv
 from src.kickoff_forecast import forecasts_for_matchups, weather_label
+from src.lineup_view import dataframe_height, lineup_detail_frame, sleeper_proj_caption
 from src.slate_games import (
     disabled_for_slate,
     forecast_source_caption,
@@ -2883,32 +2884,38 @@ if lineups:
             f"${_remaining(lu):,} left · {projection:.2f} proj"
         )
 
-    if not is_showdown:
-        selected = st.selectbox("View lineup", options=options, format_func=_lineup_label)
-        lineup = lineups[selected]
-        lineup_view = lineup[["Slot", "Name", "Team", "Salary", "Projection"]].copy()
-        if "ID" in lineup.columns and "ID" in pool.columns and "Delta" in pool.columns:
-            delta_by_id = dict(zip(pool["ID"].astype(str), pool["Delta"]))
-            lineup_view["Delta"] = lineup["ID"].astype(str).map(delta_by_id)
-        lineup_view["Salary Remaining ($)"] = _remaining(lineup)
-        st.dataframe(
-            lineup_view,
-            width="stretch",
-            hide_index=True,
-            height=320,
-            column_config={
-                "Salary": st.column_config.NumberColumn("Salary", format="$%d"),
-                "Salary Remaining ($)": st.column_config.NumberColumn(
-                    "Salary Remaining ($)",
-                    format="$%d",
+    selected = st.selectbox("View lineup", options=options, format_func=_lineup_label)
+    lineup = lineups[selected]
+    lineup_view = lineup_detail_frame(lineup, pool if isinstance(pool, pd.DataFrame) else None)
+    sleeper_note = sleeper_proj_caption(st.session_state.get("sleeper_summary"))
+    if sleeper_note:
+        st.caption(sleeper_note)
+    st.dataframe(
+        lineup_view,
+        width="stretch",
+        hide_index=True,
+        height=dataframe_height(len(lineup_view)),
+        column_config={
+            "Salary": st.column_config.NumberColumn("Salary", format="$%d"),
+            "Projection": st.column_config.NumberColumn("Projection", format="%.2f"),
+            "Sleeper Proj": st.column_config.NumberColumn(
+                "Sleeper Proj",
+                format="%.2f",
+                help=(
+                    "Sleeper's weekly projection for this player. "
+                    "Complete stat lines are scored on the DraftKings table. "
+                    "An incomplete line uses Sleeper full PPR (pts_ppr). "
+                    "Standard scoring is not used, a captain is shown at 1x, "
+                    "and a blank cell has no matched projection. "
+                    "This column is not used to build the lineup."
                 ),
-                "Projection": st.column_config.NumberColumn("Projection", format="%.2f"),
-                "Delta": st.column_config.NumberColumn(
-                    "Delta",
-                    format="%+.2f",
-                    help="Points added or removed from the player-pool projection by Vegas and wind.",
-                ),
-            },
-        )
+            ),
+            "Delta": st.column_config.NumberColumn(
+                "Delta",
+                format="%+.2f",
+                help="Points added or removed from the player-pool projection by Vegas and wind.",
+            ),
+        },
+    )
 
 _paint_exports()
