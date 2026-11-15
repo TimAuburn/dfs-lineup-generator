@@ -30,6 +30,9 @@ def test_format_preset_summary_classic_cash():
     assert rows["Stacks"] == "None"
     assert rows["Flex"] == "WR or RB"
     assert rows["Skill salary floor"] == "$4,200"
+    assert rows["Pass catchers"] == (
+        "Pass catchers: max 1 WR/TE per team unless its QB is rostered"
+    )
     assert rows["Exclude vs DST"] == "No"
     assert rows["Max repeating players"] == "No limit"
     assert rows["Ownership cap"] == "None"

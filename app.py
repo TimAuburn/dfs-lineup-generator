@@ -91,8 +91,14 @@ from src.optimizer import (
     unique_quarterbacks,
 )
 from src.dk_scoring import SCORING_VERSION
-from src.parser import DKCSVValidationError, is_inactive_injury, parse_dk_csv
+from src.parser import (
+    DKCSVValidationError,
+    detect_salary_file_format,
+    is_inactive_injury,
+    parse_dk_csv,
+)
 from src.kickoff_forecast import forecasts_for_matchups, weather_label
+from src.lineup_view import dataframe_height, lineup_detail_frame, sleeper_proj_caption
 from src.slate_games import (
     disabled_for_slate,
     forecast_source_caption,
@@ -102,6 +108,7 @@ from src.slate_games import (
     matchups_from_pool,
     odds_fetched_at,
     odds_source_caption,
+    order_game_labels_by_total,
     pool_without_games,
     spreads_for_pool,
     with_disabled,
@@ -145,6 +152,7 @@ from src.weather import (
     format_weather_cache_status,
     weather_adjustment_labels,
 )
+from src.cash_rules import pass_catcher_rule_label
 from src.presets import (
     ContestFormat,
     ContestPreset,
@@ -192,6 +200,8 @@ def _init_state() -> None:
         "sleeper_summary": None,
         "sleeper_version": 0,
         "disabled_games_by_slate": {},
+        "salary_detect_key": None,
+        "salary_detection": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -265,6 +275,89 @@ def _on_format_change() -> None:
     st.session_state.lineups = []
     st.session_state.generated_run = None
     st.session_state.error = None
+
+
+def _salary_upload_key(name: str, content: bytes) -> str:
+    """One uploaded file. A new name or new bytes is a new auto-set."""
+    digest = hashlib.sha256(content).hexdigest()
+    return f"{name}\n{digest}"
+
+
+def _detection_state(found) -> dict:
+    fmt = found.contest_format
+    return {
+        "format": None if fmt is None else fmt.value,
+        "caption": found.caption,
+        "warning": found.warning,
+    }
+
+
+def _format_needs_autodetect(fmt: ContestFormat) -> bool:
+    """True when the current format or preset does not match ``fmt``."""
+    fitting = {preset.value for preset in presets_for_format(fmt)}
+    return (
+        st.session_state.get("contest_format") != fmt.value
+        or st.session_state.get("contest_preset") not in fitting
+    )
+
+
+def _consume_detected_format() -> None:
+    """Apply a stashed salary format before the format widgets exist.
+
+    The upload runs after those widgets, and Streamlit rejects a write to
+    ``contest_format`` once the radio is on the page. A later rerun of the
+    same file does not call this: the pending value is already gone, so a
+    manual choice is left alone.
+    """
+    pending = st.session_state.pop("salary_format_pending", None)
+    if not pending:
+        return
+    try:
+        fmt = ContestFormat(pending)
+    except ValueError:
+        return
+    presets = presets_for_format(fmt)
+    fitting = {preset.value for preset in presets}
+    if st.session_state.get("contest_format") == fmt.value:
+        if st.session_state.get("contest_preset") not in fitting:
+            st.session_state.contest_preset = presets[0].value
+        return
+    st.session_state.contest_format = fmt.value
+    st.session_state.contest_preset = presets[0].value
+    st.session_state.player_pool = None
+    st.session_state.lineups = []
+    st.session_state.generated_run = None
+    st.session_state.error = None
+
+
+def _record_salary_upload(name: str, content: bytes) -> None:
+    """Detect a new salary file once. Reruns of that file do not auto-set."""
+    detect_key = _salary_upload_key(name, content)
+    if st.session_state.get("salary_detect_key") == detect_key:
+        return
+    found = detect_salary_file_format(content)
+    st.session_state.salary_detect_key = detect_key
+    st.session_state.salary_detection = _detection_state(found)
+    if found.contest_format is None:
+        st.session_state.error = None
+        st.session_state.player_pool = None
+        st.session_state.lineups = []
+        st.session_state.generated_run = None
+        st.rerun()
+    if _format_needs_autodetect(found.contest_format):
+        st.session_state.salary_format_pending = found.contest_format.value
+        st.rerun()
+
+
+def _render_salary_detection() -> None:
+    found = st.session_state.get("salary_detection") or {}
+    warning = found.get("warning")
+    if warning:
+        st.warning(str(warning))
+        return
+    caption = found.get("caption")
+    if caption:
+        st.caption(str(caption))
 
 
 def _preset_key(preset: ContestPreset, name: str) -> str:
@@ -491,7 +584,12 @@ def _render_slate_games(pool: pd.DataFrame, lines: dict, *, showdown: bool) -> N
             ),
             "Weather": st.column_config.TextColumn("Weather", width="large"),
         },
-        key=f"slate_games_{signature}",
+        # Edits are stored by row position. The order token drops that state
+        # when the rows move, so a checkbox stays on the matchup it was set for.
+        key=(
+            f"slate_games_{signature}_"
+            + hashlib.sha1("\n".join(frame["Matchup"].astype(str)).encode()).hexdigest()[:16]
+        ),
     )
     turned_off: List[str] = []
     if "On" in edited.columns and "Matchup" in edited.columns:
@@ -1025,6 +1123,21 @@ def _collect_strategy_overrides(
             preset_cfg.flex_positions
         ):
             changed.append("Flex")
+        if preset_cfg.pass_catcher_team_cap:
+            strict_pass_catchers = st.checkbox(
+                "Strict one pass catcher per team",
+                value=bool(preset_cfg.strict_pass_catcher_cap),
+                key=_preset_key(preset, "strict_pass_catcher_cap"),
+                help=(
+                    "On: at most one WR or TE from each team, even when that "
+                    "team's quarterback is rostered. Off: more pass catchers "
+                    "from a team are allowed when its quarterback is in the lineup."
+                ),
+            )
+            overrides["strict_pass_catcher_cap"] = bool(strict_pass_catchers)
+            st.caption(pass_catcher_rule_label(bool(strict_pass_catchers)))
+            if bool(strict_pass_catchers) != bool(preset_cfg.strict_pass_catcher_cap):
+                changed.append("Pass catchers")
         construction_overrides, construction_changed = _construction_controls(preset, preset_cfg)
         overrides.update(construction_overrides)
         changed.extend(construction_changed)
@@ -1342,6 +1455,8 @@ def _apply_strategy_overrides(optimizer: Any, overrides: Dict[str, Any]) -> None
         optimizer.exclude_vs_dst = overrides["exclude_vs_dst"]
     if "flex_positions" in overrides and hasattr(optimizer, "flex_positions"):
         optimizer.flex_positions = overrides["flex_positions"]
+    if "strict_pass_catcher_cap" in overrides and hasattr(optimizer, "strict_pass_catcher_cap"):
+        optimizer.strict_pass_catcher_cap = bool(overrides["strict_pass_catcher_cap"])
     if "primary_stack" in overrides and hasattr(optimizer, "primary_stack"):
         optimizer.primary_stack = bool(overrides["primary_stack"])
         optimizer.primary_pass_catchers = int(overrides["primary_pass_catchers"])
@@ -1554,6 +1669,7 @@ def render_archive_view() -> None:
 
 
 _init_state()
+_consume_detected_format()
 
 view = st.segmented_control(
     "View",
@@ -2046,13 +2162,25 @@ if view == "Player pool":
         "Load the salary file here. Include, captain, ownership, lock, and projection "
         "are saved with the pool and used when you generate lineups."
     )
+    # Stable across formats. A format-specific key would drop the file on the
+    # rerun that applies auto-detect, and the two keys would collide.
     uploaded = st.file_uploader(
         "DraftKings player pool CSV",
         type=["csv"],
         help=upload_help,
-        key=f"uploader_{contest_format.value}",
+        key="salary_uploader",
     )
-    if uploaded is not None:
+    if uploaded is None:
+        st.session_state.salary_detect_key = None
+        st.session_state.salary_detection = None
+    else:
+        _record_salary_upload(
+            str(getattr(uploaded, "name", "") or ""),
+            uploaded.getvalue(),
+        )
+    _render_salary_detection()
+    detected_format = (st.session_state.get("salary_detection") or {}).get("format")
+    if uploaded is not None and detected_format:
         try:
             parsed_pool = parse_dk_csv(uploaded, contest_format=contest_format)
             force_sleeper = bool(st.session_state.pop("sleeper_force", False))
@@ -2205,7 +2333,11 @@ if view == "Player pool":
         help="Leave every position unselected to show all of them. Flex is RB, WR, and TE.",
         width="stretch",
     ) if available_positions else []
-    available_games = game_choices(editor_frame)
+    available_games = order_game_labels_by_total(
+        game_choices(editor_frame),
+        matchups_from_pool(pool),
+        vegas_lines,
+    )
     selected_games = st.pills(
         "Game",
         available_games,
@@ -2489,6 +2621,8 @@ else:
 with st.container(border=True):
     st.markdown(f"#### Lineup settings — {preset_cfg.label}")
     st.caption(preset_cfg.description)
+    if actual_cfg.pass_catcher_team_cap:
+        st.caption(pass_catcher_rule_label(bool(actual_cfg.strict_pass_catcher_cap)))
     st.caption(settings_note)
     if low_scoring_game:
         if strategy_overrides.get("ban_k_dst_captain"):
@@ -2883,32 +3017,38 @@ if lineups:
             f"${_remaining(lu):,} left · {projection:.2f} proj"
         )
 
-    if not is_showdown:
-        selected = st.selectbox("View lineup", options=options, format_func=_lineup_label)
-        lineup = lineups[selected]
-        lineup_view = lineup[["Slot", "Name", "Team", "Salary", "Projection"]].copy()
-        if "ID" in lineup.columns and "ID" in pool.columns and "Delta" in pool.columns:
-            delta_by_id = dict(zip(pool["ID"].astype(str), pool["Delta"]))
-            lineup_view["Delta"] = lineup["ID"].astype(str).map(delta_by_id)
-        lineup_view["Salary Remaining ($)"] = _remaining(lineup)
-        st.dataframe(
-            lineup_view,
-            width="stretch",
-            hide_index=True,
-            height=320,
-            column_config={
-                "Salary": st.column_config.NumberColumn("Salary", format="$%d"),
-                "Salary Remaining ($)": st.column_config.NumberColumn(
-                    "Salary Remaining ($)",
-                    format="$%d",
+    selected = st.selectbox("View lineup", options=options, format_func=_lineup_label)
+    lineup = lineups[selected]
+    lineup_view = lineup_detail_frame(lineup, pool if isinstance(pool, pd.DataFrame) else None)
+    sleeper_note = sleeper_proj_caption(st.session_state.get("sleeper_summary"))
+    if sleeper_note:
+        st.caption(sleeper_note)
+    st.dataframe(
+        lineup_view,
+        width="stretch",
+        hide_index=True,
+        height=dataframe_height(len(lineup_view)),
+        column_config={
+            "Salary": st.column_config.NumberColumn("Salary", format="$%d"),
+            "Projection": st.column_config.NumberColumn("Projection", format="%.2f"),
+            "Sleeper Proj": st.column_config.NumberColumn(
+                "Sleeper Proj",
+                format="%.2f",
+                help=(
+                    "Sleeper's weekly projection for this player. "
+                    "Complete stat lines are scored on the DraftKings table. "
+                    "An incomplete line uses Sleeper full PPR (pts_ppr). "
+                    "Standard scoring is not used, a captain is shown at 1x, "
+                    "and a blank cell has no matched projection. "
+                    "This column is not used to build the lineup."
                 ),
-                "Projection": st.column_config.NumberColumn("Projection", format="%.2f"),
-                "Delta": st.column_config.NumberColumn(
-                    "Delta",
-                    format="%+.2f",
-                    help="Points added or removed from the player-pool projection by Vegas and wind.",
-                ),
-            },
-        )
+            ),
+            "Delta": st.column_config.NumberColumn(
+                "Delta",
+                format="%+.2f",
+                help="Points added or removed from the player-pool projection by Vegas and wind.",
+            ),
+        },
+    )
 
 _paint_exports()

@@ -253,6 +253,59 @@ def display_spread(lines: object, away: str, home: str) -> str:
     return f"{favorite} {line:.1f}"
 
 
+def _total_sort_number(lines: object, game: SlateMatchup) -> Optional[float]:
+    """Displayed total as a number. ``missing`` stays missing."""
+    shown = display_total(lines, game.away, game.home)
+    if shown == MISSING:
+        return None
+    return _as_float(shown)
+
+
+def _total_order_key(game: SlateMatchup, lines: object) -> tuple:
+    """Highest total first. A missing total is last, then kickoff, then matchup."""
+    number = _total_sort_number(lines, game)
+    kickoff = game.kickoff_at if isinstance(game.kickoff_at, datetime) else None
+    return (
+        number is None,
+        -(number if number is not None else 0.0),
+        kickoff is None,
+        kickoff.timestamp() if kickoff is not None else 0.0,
+        game.kickoff,
+        game.matchup,
+    )
+
+
+def order_matchups_by_total(
+    matchups: Sequence[SlateMatchup],
+    lines: object,
+) -> list[SlateMatchup]:
+    """Highest total first. Missing totals last. The total text is not filled in.
+
+    Equal totals break by kickoff, earlier first. A missing kickoff sorts after
+    a known kickoff at that total. The last key is the matchup text.
+    """
+    return sorted(matchups, key=lambda game: _total_order_key(game, lines))
+
+
+def order_game_labels_by_total(
+    labels: Sequence[str],
+    matchups: Sequence[SlateMatchup],
+    lines: object,
+) -> list[str]:
+    """Game-filter labels in the same order as the games table.
+
+    A label that is not on the slate stays after the slate games, in its
+    original place relative to the other leftovers.
+    """
+    rank = {
+        game.key: index
+        for index, game in enumerate(order_matchups_by_total(matchups, lines))
+    }
+    paired = list(enumerate(labels))
+    paired.sort(key=lambda item: (rank.get(game_key(item[1]), len(rank)), item[0]))
+    return [label for _, label in paired]
+
+
 def games_table_frame(
     matchups: Sequence[SlateMatchup],
     lines: object,
@@ -261,11 +314,16 @@ def games_table_frame(
     *,
     showdown: bool = False,
 ) -> pd.DataFrame:
-    """One row per game. Totals and spreads are text so a gap is not a number."""
+    """One row per game, highest total first.
+
+    A missing total stays the text ``missing`` and sorts last. Equal totals
+    break by kickoff (earlier first), then by matchup. Totals and spreads
+    are text so a gap is not a number. ``On`` travels with the matchup.
+    """
     off = {game_key(item) for item in (disabled or [])}
     labels = weather or {}
     rows = []
-    for game in matchups:
+    for game in order_matchups_by_total(matchups, lines):
         row = {
             "Matchup": game.matchup,
             "Kickoff": game.kickoff,

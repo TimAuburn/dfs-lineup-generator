@@ -6,6 +6,7 @@ from dataclasses import dataclass, fields, replace
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
+from .cash_rules import pass_catcher_rule_label
 from .showdown_rules import (
     DEFAULT_MAX_UNUSED_SALARY,
     DEFAULT_MIN_PLAYERS_PER_TEAM,
@@ -83,6 +84,10 @@ class PresetConfig:
     flex_positions: Optional[Tuple[str, ...]] = None
     # Classic cash drops WR/RB/TE under this salary unless the user locks them.
     min_skill_salary: Optional[int] = None
+    # Classic cash only. At most one WR or TE from a team unless its QB is rostered.
+    # Strict mode keeps that cap even when the quarterback is in the lineup.
+    pass_catcher_team_cap: bool = False
+    strict_pass_catcher_cap: bool = False
     # Fewer than 10 games tightens the repeating-player cap; 4 games lowers stack exposure.
     slate_aware_gpp: bool = False
     exclude_vs_dst: bool = False
@@ -157,11 +162,14 @@ PRESET_CONFIGS: Dict[ContestPreset, PresetConfig] = {
         enable_qb_stack=False,
         flex_positions=("RB", "WR"),
         min_skill_salary=4_200,
+        pass_catcher_team_cap=True,
+        strict_pass_catcher_cap=False,
         exclude_vs_dst=False,
         max_repeating_players=None,
         description=(
             "Single deterministic cash lineup. No stacks. FLEX is WR or RB. "
-            "WR, RB, and TE under $4,200 are excluded unless locked."
+            "WR, RB, and TE under $4,200 are excluded unless locked. "
+            "At most one WR or TE from a team unless that team's quarterback is rostered."
         ),
     ),
     ContestPreset.CLASSIC_SMALL_GPP: PresetConfig(
@@ -400,6 +408,10 @@ def format_preset_summary(config: PresetConfig) -> List[Tuple[str, str]]:
         rows.append(("Flex", flex_position_label(config.flex_positions)))
         if config.min_skill_salary is not None:
             rows.append(("Skill salary floor", f"${config.min_skill_salary:,}"))
+        if config.pass_catcher_team_cap:
+            rows.append(
+                ("Pass catchers", pass_catcher_rule_label(config.strict_pass_catcher_cap))
+            )
         rows.append(("Exclude vs DST", "Yes" if config.exclude_vs_dst else "No"))
         rows.append(
             (
@@ -689,6 +701,9 @@ def apply_preset(
         optimizer.flex_positions = config.flex_positions
     if hasattr(optimizer, "min_skill_salary"):
         optimizer.min_skill_salary = config.min_skill_salary
+    if hasattr(optimizer, "pass_catcher_team_cap"):
+        optimizer.pass_catcher_team_cap = bool(config.pass_catcher_team_cap)
+        optimizer.strict_pass_catcher_cap = bool(config.strict_pass_catcher_cap)
     if hasattr(optimizer, "primary_stack"):
         optimizer.primary_stack = bool(config.primary_stack)
         optimizer.primary_pass_catchers = int(config.primary_pass_catchers)
