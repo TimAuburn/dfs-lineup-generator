@@ -1,13 +1,18 @@
-"""Classic cash cap on wide receivers and tight ends from one team.
+"""Classic cash roster rules that are solver constraints.
 
-A Classic cash lineup can roster at most one WR or TE from a team unless
-that team's quarterback is also in the lineup. Strict mode keeps the cap at
-one even when the quarterback is rostered. The rule is a solver constraint.
-It does not change a projection, and it is not used for Classic GPP or
-Showdown.
+Pass catchers: a Classic cash lineup can roster at most one WR or TE from a
+team unless that team's quarterback is also in the lineup. Strict mode keeps
+the cap at one even when the quarterback is rostered.
 
-Each player is one selection variable. A WR who is also eligible for FLEX
-is still that one variable, so the player is counted once.
+Quarterback and running back: a Classic cash lineup never rosters a
+quarterback together with a running back from the same NFL team. The ban
+covers every RB slot, including an RB used at FLEX.
+
+Both rules are solver constraints. They do not change a projection, and
+they are not used for Classic GPP or Showdown.
+
+Each player is one selection variable. A player who is also eligible for
+FLEX is still that one variable, so the player is counted once.
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence
 
 import pandas as pd
+from pydfs_lineup_optimizer.fantasy_points_strategy import BaseFantasyPointsStrategy
 from pydfs_lineup_optimizer.rules import OptimizerRule
 from pydfs_lineup_optimizer.solvers.constants import SolverSign
 
@@ -24,8 +30,12 @@ from .slate_week import dk_team
 
 RULE_PASS_CATCHERS = "Pass catchers: max 1 WR/TE per team unless its QB is rostered"
 RULE_PASS_CATCHERS_STRICT = "Pass catchers: strict: max 1 WR/TE per team"
+RULE_SAME_TEAM_QB_RB = (
+    "QB and RB: never roster a quarterback with a running back from the same team, including FLEX"
+)
 PASS_CATCHER_POSITIONS = frozenset({"WR", "TE"})
 CONSTRAINT_PREFIX = "cash_pass_catcher_"
+QB_RB_CONSTRAINT_PREFIX = "cash_qb_rb_"
 
 
 @dataclass(frozen=True)
@@ -45,6 +55,16 @@ def pass_catcher_rule_label(strict: bool) -> str:
 def pass_catcher_cause(strict: bool) -> str:
     """Binding-limit sentence. The lineup is not rebuilt without the rule."""
     return f"{pass_catcher_rule_label(strict)}. The rule was not loosened."
+
+
+def qb_rb_rule_label() -> str:
+    """Caption for the Classic cash quarterback and running back ban."""
+    return RULE_SAME_TEAM_QB_RB
+
+
+def qb_rb_cause() -> str:
+    """Binding-limit sentence. The lineup is not rebuilt without the rule."""
+    return f"{qb_rb_rule_label()}. The rule was not loosened."
 
 
 def extra_pass_catcher_allowance(positions: Optional[Sequence[object]]) -> int:
@@ -102,6 +122,13 @@ def _is_quarterback(positions: Iterable[str]) -> bool:
     if owned & {"DST", "DEF"} or _is_pass_catcher(owned):
         return False
     return "QB" in owned
+
+
+def _is_running_back(positions: Iterable[str]) -> bool:
+    owned = set(positions)
+    if owned & {"DST", "DEF"}:
+        return False
+    return "RB" in owned
 
 
 def pass_catcher_violations(lineup: pd.DataFrame, *, strict: bool) -> tuple[str, ...]:
@@ -216,3 +243,126 @@ class PassCatcherTeamRule(OptimizerRule):
                 1,
                 name=name,
             )
+
+
+def same_team_qb_rb_violations(lineup: pd.DataFrame) -> tuple[str, ...]:
+    """Teams that roster a quarterback and a running back together.
+
+    Each player id is counted once, in whichever slot they were assigned.
+    An RB in the FLEX slot still counts. A missing lineup is not a violation.
+    This is the same pairing the solver constraint forbids.
+    """
+    if lineup is None or lineup.empty:
+        return ()
+    id_col = "ID" if "ID" in lineup.columns else None
+    team_col = "Team" if "Team" in lineup.columns else "TeamAbbrev"
+    if team_col not in lineup.columns or "Position" not in lineup.columns:
+        return ()
+    running_backs: dict[str, int] = {}
+    quarterbacks: set[str] = set()
+    seen: set[str] = set()
+    for index, row in lineup.iterrows():
+        player_id = str(row.get(id_col)) if id_col else str(index)
+        if player_id in seen:
+            continue
+        seen.add(player_id)
+        positions = _tokens(row.get("Position"))
+        team = dk_team(row.get(team_col))
+        if not team:
+            continue
+        if _is_running_back(positions):
+            running_backs[team] = running_backs.get(team, 0) + 1
+        elif _is_quarterback(positions):
+            quarterbacks.add(team)
+    found: list[str] = []
+    for team in sorted(running_backs):
+        if team not in quarterbacks:
+            continue
+        count = running_backs[team]
+        found.append(f"{team} rosters a QB with {count} RB")
+    return tuple(found)
+
+
+class CashTieBreakStrategy(BaseFantasyPointsStrategy):
+    """Break an exact points tie without moving a lineup that scores more.
+
+    Adding a constraint changes the matrix CBC searches, so two lineups with
+    the same projection can swap which one comes back first. The penalty is
+    at most 0.0002 points. A higher DraftKings id costs more than every
+    lower id combined, so the tie keeps the lineup with the lower high id.
+    Exported projections stay on the player's own fppg.
+    """
+
+    def __init__(self, inner: BaseFantasyPointsStrategy, players: Iterable[object]):
+        self.inner = inner
+        ranked = sorted(
+            {str(getattr(player, "id", "")) for player in players if getattr(player, "id", None)},
+            key=lambda player_id: (0, int(player_id)) if player_id.isdigit() else (1, player_id),
+        )
+        top = max(len(ranked) - 1, 0)
+        self._penalty = {
+            player_id: 1e-4 * (2 ** (index - top))
+            for index, player_id in enumerate(ranked)
+        }
+
+    def get_player_fantasy_points(self, player) -> float:
+        base = float(self.inner.get_player_fantasy_points(player))
+        return base - self._penalty.get(str(getattr(player, "id", "")), 0.0)
+
+    def set_previous_lineup(self, lineup) -> None:
+        self.inner.set_previous_lineup(lineup)
+
+
+class SameTeamQbRbRule(OptimizerRule):
+    """``sum(QB of T) + RB_j <= 1`` for every running back j on team T.
+
+    A player who is eligible for RB and FLEX still has one variable, so the
+    ban covers the FLEX slot. Teams with no quarterback or no running back
+    in the pool add nothing.
+    """
+
+    def apply(self, solver):
+        if not getattr(self.optimizer, "_ban_same_team_qb_rb", False):
+            return
+        order: dict[str, list] = {}
+        for player, variable in self.players_dict.items():
+            positions = solver_positions(player)
+            team = dk_team(getattr(player, "team", ""))
+            if not team:
+                continue
+            if _is_running_back(positions):
+                kind = "rb"
+            elif _is_quarterback(positions):
+                kind = "qb"
+            else:
+                continue
+            order.setdefault(team, []).append(
+                (str(getattr(player, "id", "")), variable, kind)
+            )
+        for team in sorted(order):
+            ranked = sorted(order.get(team, []), key=lambda item: (item[0], item[2]))
+            quarterbacks = []
+            running_backs = []
+            seen_vars = set()
+            identities: dict[int, str] = {}
+            for player_id, variable, kind in ranked:
+                if id(variable) in seen_vars:
+                    continue
+                seen_vars.add(id(variable))
+                identities[id(variable)] = player_id
+                if kind == "rb":
+                    running_backs.append(variable)
+                else:
+                    quarterbacks.append(variable)
+            if not quarterbacks or not running_backs:
+                continue
+            for variable in running_backs:
+                player_id = identities[id(variable)]
+                name = f"{QB_RB_CONSTRAINT_PREFIX}{team}_{player_id}"
+                solver.add_constraint(
+                    [*quarterbacks, variable],
+                    None,
+                    SolverSign.LTE,
+                    1,
+                    name=name,
+                )

@@ -152,7 +152,7 @@ from src.weather import (
     format_weather_cache_status,
     weather_adjustment_labels,
 )
-from src.cash_rules import pass_catcher_rule_label
+from src.cash_rules import pass_catcher_rule_label, qb_rb_rule_label
 from src.presets import (
     ContestFormat,
     ContestPreset,
@@ -1138,6 +1138,8 @@ def _collect_strategy_overrides(
             st.caption(pass_catcher_rule_label(bool(strict_pass_catchers)))
             if bool(strict_pass_catchers) != bool(preset_cfg.strict_pass_catcher_cap):
                 changed.append("Pass catchers")
+        if preset_cfg.ban_same_team_qb_rb:
+            st.caption(qb_rb_rule_label())
         construction_overrides, construction_changed = _construction_controls(preset, preset_cfg)
         overrides.update(construction_overrides)
         changed.extend(construction_changed)
@@ -2623,6 +2625,8 @@ with st.container(border=True):
     st.caption(preset_cfg.description)
     if actual_cfg.pass_catcher_team_cap:
         st.caption(pass_catcher_rule_label(bool(actual_cfg.strict_pass_catcher_cap)))
+    if actual_cfg.ban_same_team_qb_rb:
+        st.caption(qb_rb_rule_label())
     st.caption(settings_note)
     if low_scoring_game:
         if strategy_overrides.get("ban_k_dst_captain"):

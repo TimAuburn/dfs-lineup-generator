@@ -203,8 +203,11 @@ def _flex_te_pool() -> pd.DataFrame:
             _row("TE", "PHI TE", 7, "PHI", 4600, 20, game),
             _row("TE", "PHI TE2", 8, "PHI", 4500, 24, game),
             _row("DST", "DAL DST", 9, "DAL", 2800, 6, game),
-            _row("QB", "PHI QB", 10, "PHI", 6200, 3, game),
+            _row("QB", "PHI QB", 10, "PHI", 6200, 1, game),
             _row("RB", "DAL RB", 11, "DAL", 4300, 4, game),
+            # A spare wideout lets the capped lineup fill FLEX without a second
+            # PHI tight end or the quarterback's own running back.
+            _row("WR", "SEA WR", 12, "SEA", 4500, 9, game),
         ]
     )
 
@@ -223,6 +226,10 @@ def _only_buf_catchers() -> pd.DataFrame:
             _row("WR", "BUF WR4", 7, "BUF", 4500, 15, game),
             _row("TE", "BUF TE", 8, "BUF", 4500, 12, game),
             _row("DST", "KC DST", 9, "KC", 2800, 6, game),
+            # Two running backs off the quarterback's team, so the pass-catcher
+            # cap is what blocks the lineup. The QB/RB ban stays on for cash.
+            _row("RB", "DAL RB", 10, "DAL", 5000, 8, game),
+            _row("RB", "DAL RB2", 11, "DAL", 4800, 7, game),
         ]
     )
 
@@ -449,7 +456,7 @@ def test_a_short_batch_names_the_rule_when_the_next_lineup_would_break_it():
     frame = pd.DataFrame(
         [
             _row("QB", "KC QB", 1, "KC", 7000, 20, game),
-            _row("RB", "KC RB", 2, "KC", 5400, 12, game),
+            _row("RB", "SF RB", 2, "SF", 5400, 12, game),
             _row("RB", "PHI RB", 3, "PHI", 5200, 11, other),
             _row("RB", "DAL RB", 10, "DAL", 4500, 9, other),
             _row("WR", "BUF WR", 4, "BUF", 5000, 15, game),

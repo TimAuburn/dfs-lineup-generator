@@ -21,7 +21,14 @@ from pydfs_lineup_optimizer.solvers.exceptions import SolverInfeasibleSolutionEx
 from pydfs_lineup_optimizer.solvers.pulp_solver import PuLPSolver
 from pydfs_lineup_optimizer.stacks import PlayersGroup, PositionsStack
 
-from .cash_rules import PassCatcherCapSettings, PassCatcherTeamRule, pass_catcher_cause
+from .cash_rules import (
+    CashTieBreakStrategy,
+    PassCatcherCapSettings,
+    PassCatcherTeamRule,
+    SameTeamQbRbRule,
+    pass_catcher_cause,
+    qb_rb_cause,
+)
 from .identity import install_person_uniqueness
 from .lineup_rules import (
     ConstructionSettings,
@@ -1648,6 +1655,8 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
         # Classic cash. Off on GPP, so those solves stay on the previous model.
         self.pass_catcher_team_cap: bool = False
         self.strict_pass_catcher_cap: bool = False
+        # Classic cash. A QB and an RB from the same team cannot share a lineup.
+        self.ban_same_team_qb_rb: bool = False
         # Large-field lineup rules. Off leaves the solver on the previous path.
         self.primary_stack: bool = False
         self.primary_pass_catchers: int = 2
@@ -1955,6 +1964,7 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
             record=record_rules,
         )
         self._apply_pass_catcher_cap(optimizer)
+        self._apply_same_team_qb_rb(optimizer)
         return optimizer
 
     def _apply_pass_catcher_cap(self, optimizer) -> None:
@@ -1965,6 +1975,20 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
             strict=bool(self.strict_pass_catcher_cap),
         )
         optimizer.add_new_rule(PassCatcherTeamRule)
+
+    def _apply_same_team_qb_rb(self, optimizer) -> None:
+        """Ban a QB with a same-team RB inside the solve. Projections are not edited."""
+        if not self.ban_same_team_qb_rb:
+            return
+        optimizer._ban_same_team_qb_rb = True
+        optimizer.add_new_rule(SameTeamQbRbRule)
+        # The ban does not change a projection. An exact tie would otherwise
+        # follow the new constraint order, so keep the lower high id.
+        pool = getattr(optimizer, "player_pool", None)
+        players = list(getattr(pool, "filtered_players", None) or [])
+        current = getattr(optimizer, "fantasy_points_strategy", None)
+        if current is not None and players and not isinstance(current, CashTieBreakStrategy):
+            optimizer.set_fantasy_points_strategy(CashTieBreakStrategy(current, players))
 
     def _pass_catcher_allows_another(
         self,
@@ -2037,6 +2061,82 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
         if not self._pass_catcher_allows_another(players, frames):
             return
         cause = pass_catcher_cause(self.strict_pass_catcher_cap)
+        if self._inside_portfolio:
+            causes = getattr(self, "_tier_rule_causes", None)
+            if causes is None:
+                causes = []
+                self._tier_rule_causes = causes
+            causes.append(cause)
+            return
+        self._remember_rule_shortfall(
+            requested,
+            len(frames),
+            cause,
+            self.last_shortfall,
+        )
+
+    def _same_team_qb_rb_allows_another(
+        self,
+        players: Sequence[Player],
+        frames: Sequence[pd.DataFrame],
+    ) -> bool:
+        """Whether one more lineup exists once the QB/RB ban is removed.
+
+        The lineups already built are excluded. Nothing from that check is
+        exported, and the ban is put back. The pass-catcher cap stays as it was.
+        """
+        if not self.ban_same_team_qb_rb:
+            return False
+        saved_flag = self.ban_same_team_qb_rb
+        saved_notes = list(self._solver_constraint_notes)
+        saved_games = self.last_game_count
+        saved_overlap = self.last_overlap_cap
+        saved_stacks = self.last_stack_exposure
+        saved_applied = self._construction_applied
+        saved_max = [(player, player.max_exposure) for player in players]
+        self.ban_same_team_qb_rb = False
+        try:
+            built = self._build_optimizer(players, record_rules=False)
+            exclude = _lineups_for_overlap(frames, built.player_pool.filtered_players) or None
+            try:
+                next(built.optimize(1, exclude_lineups=exclude))
+            except GenerateLineupException:
+                return False
+            return True
+        finally:
+            self.ban_same_team_qb_rb = saved_flag
+            self._solver_constraint_notes = saved_notes
+            self.last_game_count = saved_games
+            self.last_overlap_cap = saved_overlap
+            self.last_stack_exposure = saved_stacks
+            self._construction_applied = saved_applied
+            for player, rate in saved_max:
+                player.max_exposure = rate
+
+    def _attribute_same_team_qb_rb_shortfall(
+        self,
+        players: Sequence[Player],
+        frames: Sequence[pd.DataFrame],
+        requested: int,
+    ) -> None:
+        """Name the QB/RB ban when it is what stops the next lineup.
+
+        A pass-catcher explanation already on the shortfall is left in place.
+        """
+        if not self.ban_same_team_qb_rb or len(frames) >= int(requested):
+            return
+        if not self._inside_portfolio:
+            existing = ""
+            if self.last_shortfall is not None and self.last_shortfall.message:
+                existing = self.last_shortfall.message
+            if (
+                self.pass_catcher_team_cap
+                and pass_catcher_cause(self.strict_pass_catcher_cap) in existing
+            ):
+                return
+        if not self._same_team_qb_rb_allows_another(players, frames):
+            return
+        cause = qb_rb_cause()
         if self._inside_portfolio:
             causes = getattr(self, "_tier_rule_causes", None)
             if causes is None:
@@ -2143,16 +2243,19 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
                 self._finalize_construction_report([])
                 self.last_shortfall = self.explain_lineup_shortfall([], count)
                 self._attribute_pass_catcher_shortfall(players, [], count)
+                self._attribute_same_team_qb_rb_shortfall(players, [], count)
                 raise RuntimeError(self._limit_failure_message()) from exc
             else:
                 self._finalize_construction_report([])
                 self._attribute_pass_catcher_shortfall(players, [], count)
-                if (
-                    self.last_shortfall is not None
-                    and self.last_shortfall.message
-                    and pass_catcher_cause(self.strict_pass_catcher_cap) in self.last_shortfall.message
-                ):
-                    raise RuntimeError(self.last_shortfall.message) from exc
+                self._attribute_same_team_qb_rb_shortfall(players, [], count)
+                message = "" if self.last_shortfall is None else (self.last_shortfall.message or "")
+                named = (
+                    pass_catcher_cause(self.strict_pass_catcher_cap),
+                    qb_rb_cause(),
+                )
+                if message and any(cause in message for cause in named):
+                    raise RuntimeError(message) from exc
                 raise
         frames = [self.format_lineup(lineup) for lineup in raw_lineups]
         if game_script:
@@ -2160,6 +2263,7 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
                 frame.attrs["game_script"] = game_script
         self._finish_shortfall(frames, count)
         self._attribute_pass_catcher_shortfall(players, frames, count)
+        self._attribute_same_team_qb_rb_shortfall(players, frames, count)
         return frames
 
 

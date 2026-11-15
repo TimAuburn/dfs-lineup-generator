@@ -33,6 +33,9 @@ def test_format_preset_summary_classic_cash():
     assert rows["Pass catchers"] == (
         "Pass catchers: max 1 WR/TE per team unless its QB is rostered"
     )
+    assert rows["QB and RB"] == (
+        "QB and RB: never roster a quarterback with a running back from the same team, including FLEX"
+    )
     assert rows["Exclude vs DST"] == "No"
     assert rows["Max repeating players"] == "No limit"
     assert rows["Ownership cap"] == "None"
