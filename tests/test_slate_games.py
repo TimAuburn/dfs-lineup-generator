@@ -32,6 +32,8 @@ from src.slate_games import (
     matchups_from_pool,
     odds_source_caption,
     off_game_blocks,
+    order_game_labels_by_total,
+    order_matchups_by_total,
     pool_without_games,
     spreads_for_pool,
     with_disabled,
@@ -311,6 +313,273 @@ def test_game_selection_is_keyed_to_the_slate():
     assert disabled_for_slate(store, "slate-a", ["PHI@DAL", "KC@BUF"]) == ["KC@BUF"]
     assert disabled_for_slate(store, "slate-b", ["PHI@DAL", "KC@BUF"]) == []
     assert disabled_for_slate(store, "slate-a", ["PHI@DAL"]) == []
+
+
+def _pair(matchup: str, total: float, spread: float = -3.0) -> dict:
+    away, home = matchup.split("@")
+    return {
+        away: {"total": total, "spread": spread, "game": matchup},
+        home: {"total": total, "spread": -spread, "game": matchup},
+    }
+
+
+def _slate_lines() -> dict:
+    lines: dict = {}
+    lines.update(_pair("KC@BUF", 50.0))
+    lines.update(_pair("PHI@DAL", 50.0))
+    lines.update(_pair("BAL@CIN", 44.5))
+    lines.update(_pair("DET@GB", 44.5))
+    lines.update(_pair("TB@ATL", 41.0))
+    lines.update(_pair("NYJ@NE", 50.0))
+    lines.update(_pair("MIA@IND", 0.0))
+    # SEA@LAR is absent. A conflicting total stays missing and is not averaged.
+    lines["ARI"] = {"total": 40.0, "spread": -1.0, "game": "ARI@NO"}
+    lines["NO"] = {"total": 55.0, "spread": 1.0, "game": "ARI@NO"}
+    return lines
+
+
+def _slate_pool() -> pd.DataFrame:
+    """File order is not total order. The highest total is not the first game."""
+    specs = [
+        ("TB", "1", "TB@ATL 09/10/2025 01:00PM ET"),
+        ("PHI", "2", "PHI@DAL 09/10/2025 04:25PM ET"),
+        ("KC", "3", "KC@BUF 09/10/2025 01:00PM ET"),
+        ("SEA", "4", "SEA@LAR 09/10/2025 08:20PM ET"),
+        ("BAL", "5", "BAL@CIN 09/10/2025 01:00PM ET"),
+        ("DET", "6", "DET@GB 09/10/2025 01:00PM ET"),
+        ("NYJ", "7", "NYJ@NE"),
+        ("MIA", "8", "MIA@IND 09/10/2025 01:00PM ET"),
+        ("ARI", "9", "ARI@NO 09/07/2025 01:00PM ET"),
+    ]
+    return pd.DataFrame(
+        [_player(team, team, pid, game) for team, pid, game in specs]
+    )
+
+
+_TOTAL_ORDER = [
+    "KC @ BUF",
+    "PHI @ DAL",
+    "NYJ @ NE",
+    "BAL @ CIN",
+    "DET @ GB",
+    "TB @ ATL",
+    "MIA @ IND",
+    "ARI @ NO",
+    "SEA @ LAR",
+]
+
+
+def test_games_order_by_total_then_kickoff_then_matchup():
+    """Highest total first. Ties use kickoff, then matchup. Missing totals are last."""
+    lines = _slate_lines()
+    forward = matchups_from_pool(_slate_pool())
+    backward = list(reversed(forward))
+    assert [game.key for game in backward] != [game.key for game in forward]
+
+    ordered = order_matchups_by_total(backward, lines)
+    assert [game.matchup for game in ordered] == _TOTAL_ORDER
+    assert [game.matchup for game in order_matchups_by_total(forward, lines)] == _TOTAL_ORDER
+    assert [game.key for game in forward] == [game.key for game in matchups_from_pool(_slate_pool())]
+
+    labels = [game.key for game in forward]
+    assert order_game_labels_by_total(labels, backward, lines) == [
+        game.key for game in ordered
+    ]
+    # A label that is not on the slate keeps its place after the slate games.
+    assert order_game_labels_by_total(
+        ["NOT@SLATE", *labels, "ALSO@OUT"],
+        forward,
+        lines,
+    ) == [game.key for game in ordered] + ["NOT@SLATE", "ALSO@OUT"]
+
+    frame = games_table_frame(backward, lines, disabled=["KC @ BUF"])
+    assert list(frame["Matchup"]) == _TOTAL_ORDER
+    assert list(frame["Total"]) == [
+        "50.0",
+        "50.0",
+        "50.0",
+        "44.5",
+        "44.5",
+        "41.0",
+        "0.0",
+        MISSING,
+        MISSING,
+    ]
+    assert MISSING == "missing"
+    assert bool(frame.loc[frame["Matchup"].eq("KC @ BUF"), "On"].iloc[0]) is False
+    assert bool(frame.iloc[0]["On"]) is False
+    assert frame.iloc[0]["Matchup"] == "KC @ BUF"
+    # The off game moved to row 0. The game that used to be row 0 stays on.
+    assert bool(frame.loc[frame["Matchup"].eq("TB @ ATL"), "On"].iloc[0]) is True
+    assert frame.loc[frame["Matchup"].eq("SEA @ LAR"), "Total"].iloc[0] == MISSING
+    assert frame.loc[frame["Matchup"].eq("ARI @ NO"), "Total"].iloc[0] == MISSING
+    assert (frame["Total"] == "0").sum() == 0
+    assert (frame["Total"] == "0.0").sum() == 1
+
+
+def _games_editor(at):
+    for editor in at.data_editor:
+        value = getattr(editor, "value", None)
+        if value is None:
+            continue
+        columns = set(getattr(value, "columns", []))
+        if {"On", "Matchup", "Total"} <= columns:
+            return editor
+    raise AssertionError("games table editor was not on the page")
+
+
+def _stamp_pool(pool: pd.DataFrame) -> pd.DataFrame:
+    from src.dk_scoring import SCORING_VERSION
+    from src.slate_week import slate_games_from_pool, slate_key
+    from src.sleeper import MATCH_CACHE_VERSION
+
+    frame = pool.copy()
+    frame["PPR"] = pd.Series(pd.NA, index=frame.index, dtype="Float64")
+    frame["Scoring"] = ""
+    frame["ScoringNote"] = ""
+    key = slate_key(slate_games_from_pool(frame)) if "Game Info" in frame.columns else ""
+    frame.attrs["scoring_version"] = SCORING_VERSION
+    frame.attrs["match_schema"] = MATCH_CACHE_VERSION
+    frame.attrs["slate_key"] = key
+    frame.attrs["fingerprint"] = f"test|{key}"
+    return frame
+
+
+def _sleeper_summary(pool: pd.DataFrame) -> dict:
+    from src.dk_scoring import SCORING_VERSION
+    from src.sleeper import MATCH_CACHE_VERSION
+
+    return {
+        "ok": True,
+        "applied": True,
+        "scoring": SCORING_VERSION,
+        "match_schema": MATCH_CACHE_VERSION,
+        "season": "2025",
+        "week": 1,
+        "season_type": "regular",
+        "fingerprint": pool.attrs.get("fingerprint") or "",
+        "slate_key": pool.attrs.get("slate_key") or "",
+        "matched": 0,
+        "rows": int(len(pool)),
+        "inactive_rows": 0,
+        "ppr_fallback_rows": 0,
+    }
+
+
+def _load_games_page(at, lines: dict) -> None:
+    import json
+
+    from src.data_loader import lines_to_frame
+    from src.vegas_cache import CACHE_SCHEMA_VERSION
+
+    pool = _stamp_pool(_slate_pool())
+    empty = json.dumps({}, sort_keys=True, default=str)
+    at.session_state["app_view"] = "Player pool"
+    at.session_state["contest_format"] = "classic"
+    at.session_state["contest_preset"] = "classic_cash"
+    at.session_state["player_pool"] = pool
+    at.session_state["sleeper_summary"] = _sleeper_summary(pool)
+    at.session_state["pool_signature"] = "total-order"
+    at.session_state["vegas_schema"] = CACHE_SCHEMA_VERSION
+    at.session_state["vegas_source_json"] = empty
+    at.session_state["vegas_editor_version"] = 1
+    at.session_state["vegas_frame"] = lines_to_frame(lines)
+    at.session_state["weather_by_home"] = {}
+    at.session_state["weather_source_json"] = empty
+
+
+def _on_by_matchup(editor) -> dict[str, bool]:
+    frame = editor.value
+    return {
+        str(row["Matchup"]): bool(row["On"])
+        for _, row in frame.iterrows()
+    }
+
+
+def test_game_toggle_stays_on_the_sorted_game_across_reruns(monkeypatch):
+    """Unchecking the top row turns off that matchup, not the first file game.
+
+    A later change in total order must not replay the row-0 edit onto the
+    game that moves into that row.
+    """
+    app_test = pytest.importorskip("streamlit.testing.v1")
+    monkeypatch.setattr("src.vegas_cache.fetch_vegas_lines", lambda *args, **kwargs: {})
+    monkeypatch.setattr("src.weather.fetch_slate_weather", lambda *args, **kwargs: {})
+
+    at = app_test.AppTest.from_file(
+        str(Path(__file__).resolve().parents[1] / "app.py"),
+        default_timeout=120,
+    )
+    lines = _slate_lines()
+    _load_games_page(at, lines)
+    at.run(timeout=120)
+    assert not at.exception, at.exception
+
+    editor = _games_editor(at)
+    assert list(editor.value["Matchup"]) == _TOTAL_ORDER
+    assert list(editor.value["Total"])[:3] == ["50.0", "50.0", "50.0"]
+    assert editor.value["Total"].iloc[-1] == MISSING
+    assert editor.value["Matchup"].iloc[0] == "KC @ BUF"
+    assert editor.value["Matchup"].iloc[0] != "TB @ ATL"
+    pills = next(item for item in at.pills if item.label == "Game")
+    assert list(pills.options) == [
+        "KC@BUF",
+        "PHI@DAL",
+        "NYJ@NE",
+        "BAL@CIN",
+        "DET@GB",
+        "TB@ATL",
+        "MIA@IND",
+        "ARI@NO",
+        "SEA@LAR",
+    ]
+
+    first_key = editor.key
+    at.session_state[first_key] = {
+        "edited_rows": {0: {"On": False}},
+        "added_rows": [],
+        "deleted_rows": [],
+    }
+    at.run(timeout=120)
+    assert not at.exception, at.exception
+    # The editor's displayed value is the table passed in. The off game is
+    # recorded from the edited return, keyed by matchup, during this run.
+    assert at.session_state["disabled_games_by_slate"]["total-order"] == ["KC@BUF"]
+
+    at.run(timeout=120)
+    assert not at.exception, at.exception
+    editor = _games_editor(at)
+    assert list(editor.value["Matchup"]) == _TOTAL_ORDER
+    assert _on_by_matchup(editor)["KC @ BUF"] is False
+    assert _on_by_matchup(editor)["TB @ ATL"] is True
+    assert _on_by_matchup(editor)["PHI @ DAL"] is True
+    assert at.session_state["disabled_games_by_slate"]["total-order"] == ["KC@BUF"]
+
+    from src.data_loader import lines_to_frame
+
+    moved = _slate_lines()
+    moved.update(_pair("TB@ATL", 60.0))
+    at.session_state["vegas_frame"] = lines_to_frame(moved)
+    at.session_state["vegas_editor_version"] = 2
+    at.run(timeout=120)
+    assert not at.exception, at.exception
+    editor = _games_editor(at)
+    assert editor.key != first_key
+    assert list(editor.value["Matchup"])[:2] == ["TB @ ATL", "KC @ BUF"]
+    assert _on_by_matchup(editor)["TB @ ATL"] is True
+    assert _on_by_matchup(editor)["KC @ BUF"] is False
+    assert editor.value.loc[editor.value["Matchup"].eq("SEA @ LAR"), "Total"].iloc[0] == MISSING
+    assert at.session_state["disabled_games_by_slate"]["total-order"] == ["KC@BUF"]
+    assert at.session_state[first_key]["edited_rows"][0]["On"] is False
+    pills = next(item for item in at.pills if item.label == "Game")
+    assert list(pills.options)[:2] == ["TB@ATL", "KC@BUF"]
+
+    at.run(timeout=120)
+    assert not at.exception, at.exception
+    editor = _games_editor(at)
+    assert _on_by_matchup(editor)["TB @ ATL"] is True
+    assert _on_by_matchup(editor)["KC @ BUF"] is False
+    assert at.session_state["disabled_games_by_slate"]["total-order"] == ["KC@BUF"]
 
 
 def test_spreads_for_a_filtered_pool_omit_the_off_game():

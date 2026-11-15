@@ -107,6 +107,7 @@ from src.slate_games import (
     matchups_from_pool,
     odds_fetched_at,
     odds_source_caption,
+    order_game_labels_by_total,
     pool_without_games,
     spreads_for_pool,
     with_disabled,
@@ -581,7 +582,12 @@ def _render_slate_games(pool: pd.DataFrame, lines: dict, *, showdown: bool) -> N
             ),
             "Weather": st.column_config.TextColumn("Weather", width="large"),
         },
-        key=f"slate_games_{signature}",
+        # Edits are stored by row position. The order token drops that state
+        # when the rows move, so a checkbox stays on the matchup it was set for.
+        key=(
+            f"slate_games_{signature}_"
+            + hashlib.sha1("\n".join(frame["Matchup"].astype(str)).encode()).hexdigest()[:16]
+        ),
     )
     turned_off: List[str] = []
     if "On" in edited.columns and "Matchup" in edited.columns:
@@ -2308,7 +2314,11 @@ if view == "Player pool":
         help="Leave every position unselected to show all of them. Flex is RB, WR, and TE.",
         width="stretch",
     ) if available_positions else []
-    available_games = game_choices(editor_frame)
+    available_games = order_game_labels_by_total(
+        game_choices(editor_frame),
+        matchups_from_pool(pool),
+        vegas_lines,
+    )
     selected_games = st.pills(
         "Game",
         available_games,
