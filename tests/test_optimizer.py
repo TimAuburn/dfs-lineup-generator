@@ -112,6 +112,8 @@ def test_classic_cash_preset_deterministic_single_lineup():
     assert optimizer.jitter_pct == (0.0, 0.0)
     assert optimizer.flex_positions == ("RB", "WR")
     assert optimizer.min_skill_salary == 4_200
+    assert optimizer.pass_catcher_team_cap is True
+    assert optimizer.strict_pass_catcher_cap is False
 
     a = optimizer.generate_lineups()
     b = optimizer.generate_lineups()
@@ -137,6 +139,8 @@ def test_classic_small_gpp_preset_rules():
     assert optimizer.exclude_vs_dst is True
     assert optimizer.max_repeating_players == 6
     assert optimizer.jitter_pct == (0.05, 0.08)
+    assert optimizer.pass_catcher_team_cap is False
+    assert optimizer.strict_pass_catcher_cap is False
 
     lineups = optimizer.generate_lineups()
     assert len(lineups) == 2

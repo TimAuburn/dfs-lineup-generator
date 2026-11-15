@@ -145,6 +145,7 @@ from src.weather import (
     format_weather_cache_status,
     weather_adjustment_labels,
 )
+from src.cash_rules import pass_catcher_rule_label
 from src.presets import (
     ContestFormat,
     ContestPreset,
@@ -1025,6 +1026,21 @@ def _collect_strategy_overrides(
             preset_cfg.flex_positions
         ):
             changed.append("Flex")
+        if preset_cfg.pass_catcher_team_cap:
+            strict_pass_catchers = st.checkbox(
+                "Strict one pass catcher per team",
+                value=bool(preset_cfg.strict_pass_catcher_cap),
+                key=_preset_key(preset, "strict_pass_catcher_cap"),
+                help=(
+                    "On: at most one WR or TE from each team, even when that "
+                    "team's quarterback is rostered. Off: more pass catchers "
+                    "from a team are allowed when its quarterback is in the lineup."
+                ),
+            )
+            overrides["strict_pass_catcher_cap"] = bool(strict_pass_catchers)
+            st.caption(pass_catcher_rule_label(bool(strict_pass_catchers)))
+            if bool(strict_pass_catchers) != bool(preset_cfg.strict_pass_catcher_cap):
+                changed.append("Pass catchers")
         construction_overrides, construction_changed = _construction_controls(preset, preset_cfg)
         overrides.update(construction_overrides)
         changed.extend(construction_changed)
@@ -1342,6 +1358,8 @@ def _apply_strategy_overrides(optimizer: Any, overrides: Dict[str, Any]) -> None
         optimizer.exclude_vs_dst = overrides["exclude_vs_dst"]
     if "flex_positions" in overrides and hasattr(optimizer, "flex_positions"):
         optimizer.flex_positions = overrides["flex_positions"]
+    if "strict_pass_catcher_cap" in overrides and hasattr(optimizer, "strict_pass_catcher_cap"):
+        optimizer.strict_pass_catcher_cap = bool(overrides["strict_pass_catcher_cap"])
     if "primary_stack" in overrides and hasattr(optimizer, "primary_stack"):
         optimizer.primary_stack = bool(overrides["primary_stack"])
         optimizer.primary_pass_catchers = int(overrides["primary_pass_catchers"])
@@ -2489,6 +2507,8 @@ else:
 with st.container(border=True):
     st.markdown(f"#### Lineup settings — {preset_cfg.label}")
     st.caption(preset_cfg.description)
+    if actual_cfg.pass_catcher_team_cap:
+        st.caption(pass_catcher_rule_label(bool(actual_cfg.strict_pass_catcher_cap)))
     st.caption(settings_note)
     if low_scoring_game:
         if strategy_overrides.get("ban_k_dst_captain"):
