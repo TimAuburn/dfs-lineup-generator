@@ -562,3 +562,107 @@ def test_seed_42_gpp_and_showdown_upload_files_match_main():
     assert classic_csv(ContestPreset.CLASSIC_LARGE_GPP) == MAIN_LARGE_GPP_CSV
     assert showdown_csv(ContestPreset.SHOWDOWN_CASH) == MAIN_SHOWDOWN_CASH_CSV
     assert showdown_csv(ContestPreset.SHOWDOWN_GPP) == MAIN_SHOWDOWN_GPP_CSV
+
+
+def _cash_page_pool():
+    """Mock Classic pool marked as the current scorer so Generate can run."""
+    from src.dk_scoring import SCORING_VERSION
+    from src.slate_week import slate_games_from_pool, slate_key
+    from src.sleeper import MATCH_CACHE_VERSION
+
+    pool = parse_dk_csv(MOCK_CLASSIC)
+    pool["PPR"] = pd.Series(pd.NA, index=pool.index, dtype="Float64")
+    pool["Scoring"] = ""
+    pool["ScoringNote"] = ""
+    key = slate_key(slate_games_from_pool(pool))
+    pool.attrs["scoring_version"] = SCORING_VERSION
+    pool.attrs["match_schema"] = MATCH_CACHE_VERSION
+    pool.attrs["slate_key"] = key
+    pool.attrs["fingerprint"] = f"checkbox|{key}"
+    summary = {
+        "ok": True,
+        "applied": True,
+        "scoring": SCORING_VERSION,
+        "match_schema": MATCH_CACHE_VERSION,
+        "season": "2025",
+        "week": 1,
+        "season_type": "regular",
+        "fingerprint": pool.attrs["fingerprint"],
+        "slate_key": key,
+        "matched": 0,
+        "rows": len(pool),
+        "inactive_rows": 0,
+        "ppr_fallback_rows": 0,
+    }
+    return pool, summary
+
+
+def _pass_catcher_constraints(strict: bool) -> list[tuple]:
+    """Constraints the cash rule adds during one Generate click."""
+    from unittest.mock import patch
+
+    from src.cash_rules import CONSTRAINT_PREFIX, PassCatcherTeamRule
+
+    app_test = pytest.importorskip("streamlit.testing.v1")
+    pool, summary = _cash_page_pool()
+    app = app_test.AppTest.from_file(
+        str(Path(__file__).resolve().parents[1] / "app.py"),
+        default_timeout=120,
+    )
+    app.session_state["contest_format"] = ContestFormat.CLASSIC.value
+    app.session_state["contest_preset"] = ContestPreset.CLASSIC_CASH.value
+    app.session_state["player_pool"] = pool
+    app.session_state["sleeper_summary"] = summary
+    app.session_state["pool_signature"] = "checkbox"
+    recorded: list[tuple] = []
+    real_apply = PassCatcherTeamRule.apply
+
+    def spy(self, solver):
+        original = solver.add_constraint
+
+        def capture(*args, **kwargs):
+            name = kwargs.get("name", args[4] if len(args) > 4 else "")
+            coefficients = args[1] if len(args) > 1 else None
+            if str(name).startswith(CONSTRAINT_PREFIX):
+                spec = getattr(self.optimizer, "_pass_catcher_cap", None)
+                recorded.append(
+                    (
+                        str(name),
+                        None if coefficients is None else [float(item) for item in coefficients],
+                        bool(getattr(spec, "strict", False)),
+                    )
+                )
+            return original(*args, **kwargs)
+
+        solver.add_constraint = capture
+        return real_apply(self, solver)
+
+    with patch("src.weather.fetch_slate_weather", return_value={}), patch.object(
+        PassCatcherTeamRule, "apply", spy
+    ):
+        app.run()
+        assert not app.exception, app.exception
+        box = next(item for item in app.checkbox if item.label == "Strict one pass catcher per team")
+        box.set_value(strict)
+        next(item for item in app.button if item.label == "Generate Lineups").click()
+        app.run()
+    assert not app.exception, app.exception
+    return recorded
+
+
+def test_strict_cash_checkbox_drops_the_qb_exception():
+    """Checked: the solver cap is one pass catcher, with no quarterback term."""
+    relaxed = _pass_catcher_constraints(False)
+    assert relaxed
+    assert {item[2] for item in relaxed} == {False}
+    assert any(
+        coeff < 0
+        for _name, coefficients, _strict in relaxed
+        if coefficients
+        for coeff in coefficients
+    )
+
+    strict = _pass_catcher_constraints(True)
+    assert strict
+    assert {item[2] for item in strict} == {True}
+    assert all(coefficients is None for _name, coefficients, _strict in strict)
