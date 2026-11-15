@@ -376,18 +376,26 @@ def test_optional_scoring_columns_and_version_roundtrip():
 
 
 def _det_cash_pool() -> pd.DataFrame:
-    """Nine classic players. Worthy's stored projection is the old ITT 30 number."""
+    """Detroit cash slate. Worthy's stored projection is the old ITT 30 number.
+
+    Three cheap Minnesota running backs fill the RB slots and FLEX. Classic
+    cash will not roster Goff with a Lions running back, and this slate's
+    projection checks still need Worthy in the lineup.
+    """
     game = "MIN@DET 11/08/2026 01:00PM ET"
     rows = [
-        ("QB", "Jared Goff", "1", 8000, 18.0, 18.0),
-        ("RB", "Jahmyr Gibbs", "2", 7000, 16.0, 16.0),
-        ("RB", "David Montgomery", "3", 6000, 12.0, 12.0),
-        ("WR", "Xavier Worthy", "3009", 5000, 11.50, 12.07),
-        ("WR", "Amon-Ra St. Brown", "5", 6400, 15.0, 15.0),
-        ("WR", "Jameson Williams", "6", 4800, 10.0, 10.0),
-        ("TE", "Sam LaPorta", "7", 4600, 9.0, 9.0),
-        ("RB", "Craig Reynolds", "8", 4200, 6.0, 6.0),
-        ("DST", "Lions", "9", 3000, 7.0, 7.0),
+        ("QB", "Jared Goff", "1", "DET", 8000, 18.0, 18.0),
+        ("RB", "Jahmyr Gibbs", "2", "DET", 7000, 16.0, 16.0),
+        ("RB", "David Montgomery", "3", "DET", 6000, 12.0, 12.0),
+        ("WR", "Xavier Worthy", "3009", "DET", 5000, 11.50, 12.07),
+        ("WR", "Amon-Ra St. Brown", "5", "DET", 6400, 15.0, 15.0),
+        ("WR", "Jameson Williams", "6", "DET", 4800, 10.0, 10.0),
+        ("TE", "Sam LaPorta", "7", "DET", 4600, 9.0, 9.0),
+        ("RB", "Craig Reynolds", "8", "DET", 4200, 6.0, 6.0),
+        ("DST", "Lions", "9", "DET", 3000, 7.0, 7.0),
+        ("RB", "Min Back", "10", "MIN", 4300, 1.0, 1.0),
+        ("RB", "Min Back 2", "11", "MIN", 4300, 1.0, 1.0),
+        ("RB", "Min Back 3", "12", "MIN", 4300, 1.0, 1.0),
     ]
     return pd.DataFrame(
         [
@@ -395,13 +403,13 @@ def _det_cash_pool() -> pd.DataFrame:
                 "ID": player_id,
                 "Name": name,
                 "Position": position,
-                "TeamAbbrev": "DET",
+                "TeamAbbrev": team,
                 "Salary": salary,
                 "AvgPointsPerGame": base,
                 "Projection": stored,
                 "Game Info": game,
             }
-            for position, name, player_id, salary, base, stored in rows
+            for position, name, player_id, team, salary, base, stored in rows
         ]
     )
 

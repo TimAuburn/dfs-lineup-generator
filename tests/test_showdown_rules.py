@@ -2,7 +2,8 @@
 
 The checks are the optimizer's. Projections are not an input. Seed 42 with
 the three rules off matches the lineup main produced. Classic cash is the
-same lineup main produced.
+seed-42 result with the same-team QB/RB ban, a 127.5-point tie with the
+previous roster.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ MOCK_CLASSIC = Path(__file__).parent / "mock_dk_salaries.csv"
 MOCK_SHOWDOWN = Path(__file__).parent / "mock_dk_showdown.csv"
 GOLDEN_SHOWDOWN = Path(__file__).parent / "golden" / "showdown_cash_seed42.csv"
 
-CLASSIC_IDS = ["1001", "2001", "2003", "3012", "3010", "3013", "4004", "2002", "5004"]
+CLASSIC_IDS = ["1001", "2001", "2003", "3012", "3013", "3009", "4004", "2002", "5006"]
 SHOWDOWN_IDS = ["91003", "92006", "95002", "93010", "91002", "92008"]
 GAME = "KC@BUF 11/15/2026 01:00PM ET"
 

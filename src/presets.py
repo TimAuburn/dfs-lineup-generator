@@ -6,7 +6,7 @@ from dataclasses import dataclass, fields, replace
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
-from .cash_rules import pass_catcher_rule_label
+from .cash_rules import pass_catcher_rule_label, qb_rb_rule_label
 from .showdown_rules import (
     DEFAULT_MAX_UNUSED_SALARY,
     DEFAULT_MIN_PLAYERS_PER_TEAM,
@@ -88,6 +88,9 @@ class PresetConfig:
     # Strict mode keeps that cap even when the quarterback is in the lineup.
     pass_catcher_team_cap: bool = False
     strict_pass_catcher_cap: bool = False
+    # Classic cash only. A quarterback and a running back from one team cannot
+    # share a lineup, including when the running back is in FLEX.
+    ban_same_team_qb_rb: bool = False
     # Fewer than 10 games tightens the repeating-player cap; 4 games lowers stack exposure.
     slate_aware_gpp: bool = False
     exclude_vs_dst: bool = False
@@ -164,12 +167,14 @@ PRESET_CONFIGS: Dict[ContestPreset, PresetConfig] = {
         min_skill_salary=4_200,
         pass_catcher_team_cap=True,
         strict_pass_catcher_cap=False,
+        ban_same_team_qb_rb=True,
         exclude_vs_dst=False,
         max_repeating_players=None,
         description=(
             "Single deterministic cash lineup. No stacks. FLEX is WR or RB. "
             "WR, RB, and TE under $4,200 are excluded unless locked. "
-            "At most one WR or TE from a team unless that team's quarterback is rostered."
+            "At most one WR or TE from a team unless that team's quarterback is rostered. "
+            "A quarterback is never rostered with a running back from the same team, including FLEX."
         ),
     ),
     ContestPreset.CLASSIC_SMALL_GPP: PresetConfig(
@@ -412,6 +417,8 @@ def format_preset_summary(config: PresetConfig) -> List[Tuple[str, str]]:
             rows.append(
                 ("Pass catchers", pass_catcher_rule_label(config.strict_pass_catcher_cap))
             )
+        if config.ban_same_team_qb_rb:
+            rows.append(("QB and RB", qb_rb_rule_label()))
         rows.append(("Exclude vs DST", "Yes" if config.exclude_vs_dst else "No"))
         rows.append(
             (
@@ -704,6 +711,8 @@ def apply_preset(
     if hasattr(optimizer, "pass_catcher_team_cap"):
         optimizer.pass_catcher_team_cap = bool(config.pass_catcher_team_cap)
         optimizer.strict_pass_catcher_cap = bool(config.strict_pass_catcher_cap)
+    if hasattr(optimizer, "ban_same_team_qb_rb"):
+        optimizer.ban_same_team_qb_rb = bool(config.ban_same_team_qb_rb)
     if hasattr(optimizer, "primary_stack"):
         optimizer.primary_stack = bool(config.primary_stack)
         optimizer.primary_pass_catchers = int(config.primary_pass_catchers)

@@ -44,7 +44,7 @@ MOCK_SHOWDOWN = Path(__file__).parent / "mock_dk_showdown.csv"
 
 # main at 6a2649c, seed 42. Cash and Showdown are one lineup. Large-Field GPP
 # is compared with the unfiltered solver, which is main's result.
-MAIN_CASH_IDS = ["1001", "2001", "2003", "3012", "3010", "3013", "4004", "2002", "5004"]
+MAIN_CASH_IDS = ["1001", "2001", "2003", "3012", "3013", "3009", "4004", "2002", "5006"]
 MAIN_SHOWDOWN_IDS = ["91003", "92006", "95002", "93010", "91002", "92008"]
 
 
