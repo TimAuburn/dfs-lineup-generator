@@ -21,6 +21,7 @@ from pydfs_lineup_optimizer.solvers.exceptions import SolverInfeasibleSolutionEx
 from pydfs_lineup_optimizer.solvers.pulp_solver import PuLPSolver
 from pydfs_lineup_optimizer.stacks import PlayersGroup, PositionsStack
 
+from .cash_rules import PassCatcherCapSettings, PassCatcherTeamRule, pass_catcher_cause
 from .identity import install_person_uniqueness
 from .lineup_rules import (
     ConstructionSettings,
@@ -1644,6 +1645,9 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
         self.flex_positions: Optional[Tuple[str, ...]] = None
         # None leaves cheap skill players eligible. Cash sets this to $4,200.
         self.min_skill_salary: Optional[int] = None
+        # Classic cash. Off on GPP, so those solves stay on the previous model.
+        self.pass_catcher_team_cap: bool = False
+        self.strict_pass_catcher_cap: bool = False
         # Large-field lineup rules. Off leaves the solver on the previous path.
         self.primary_stack: bool = False
         self.primary_pass_catchers: int = 2
@@ -1950,7 +1954,102 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
             skip=set(skip_rules),
             record=record_rules,
         )
+        self._apply_pass_catcher_cap(optimizer)
         return optimizer
+
+    def _apply_pass_catcher_cap(self, optimizer) -> None:
+        """Cap same-team WR/TE inside the solve. Projections are not edited."""
+        if not self.pass_catcher_team_cap:
+            return
+        optimizer._pass_catcher_cap = PassCatcherCapSettings(
+            strict=bool(self.strict_pass_catcher_cap),
+        )
+        optimizer.add_new_rule(PassCatcherTeamRule)
+
+    def _pass_catcher_allows_another(
+        self,
+        players: Sequence[Player],
+        frames: Sequence[pd.DataFrame],
+    ) -> bool:
+        """Whether one more lineup exists once this cap is removed.
+
+        The lineups already built are excluded. Nothing from that check is
+        exported, and the cap is put back.
+        """
+        if not self.pass_catcher_team_cap:
+            return False
+        saved_flag = self.pass_catcher_team_cap
+        saved_notes = list(self._solver_constraint_notes)
+        saved_games = self.last_game_count
+        saved_overlap = self.last_overlap_cap
+        saved_stacks = self.last_stack_exposure
+        saved_applied = self._construction_applied
+        saved_max = [(player, player.max_exposure) for player in players]
+        self.pass_catcher_team_cap = False
+        try:
+            built = self._build_optimizer(players, record_rules=False)
+            exclude = _lineups_for_overlap(frames, built.player_pool.filtered_players) or None
+            try:
+                next(built.optimize(1, exclude_lineups=exclude))
+            except GenerateLineupException:
+                return False
+            return True
+        finally:
+            self.pass_catcher_team_cap = saved_flag
+            self._solver_constraint_notes = saved_notes
+            self.last_game_count = saved_games
+            self.last_overlap_cap = saved_overlap
+            self.last_stack_exposure = saved_stacks
+            self._construction_applied = saved_applied
+            for player, rate in saved_max:
+                player.max_exposure = rate
+
+    def _remember_rule_shortfall(
+        self,
+        requested: int,
+        built: int,
+        cause: str,
+        diagnostic: Optional[PortfolioShortfall] = None,
+    ) -> str:
+        message = shortfall_message(requested, built, cause)
+        suffix = _diagnostic_suffix(diagnostic)
+        if suffix:
+            message = f"{message} {suffix}"
+        candidates = () if diagnostic is None else tuple(diagnostic.candidates)
+        self.last_shortfall = PortfolioShortfall(
+            requested=int(requested),
+            built=int(built),
+            message=message,
+            proven=(cause,),
+            candidates=candidates,
+        )
+        return message
+
+    def _attribute_pass_catcher_shortfall(
+        self,
+        players: Sequence[Player],
+        frames: Sequence[pd.DataFrame],
+        requested: int,
+    ) -> None:
+        """Name this cap when it is what stops the next lineup."""
+        if not self.pass_catcher_team_cap or len(frames) >= int(requested):
+            return
+        if not self._pass_catcher_allows_another(players, frames):
+            return
+        cause = pass_catcher_cause(self.strict_pass_catcher_cap)
+        if self._inside_portfolio:
+            causes = getattr(self, "_tier_rule_causes", None)
+            if causes is None:
+                causes = []
+                self._tier_rule_causes = causes
+            causes.append(cause)
+            return
+        self._remember_rule_shortfall(
+            requested,
+            len(frames),
+            cause,
+            self.last_shortfall,
+        )
 
     def _apply_skill_salary_floor(self, optimizer, players: List[Player]) -> None:
         """Drop WR, RB, and TE priced under the cash floor. Locked players stay."""
@@ -2043,15 +2142,24 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
                 self._finalize_min_report([], count)
                 self._finalize_construction_report([])
                 self.last_shortfall = self.explain_lineup_shortfall([], count)
+                self._attribute_pass_catcher_shortfall(players, [], count)
                 raise RuntimeError(self._limit_failure_message()) from exc
             else:
                 self._finalize_construction_report([])
+                self._attribute_pass_catcher_shortfall(players, [], count)
+                if (
+                    self.last_shortfall is not None
+                    and self.last_shortfall.message
+                    and pass_catcher_cause(self.strict_pass_catcher_cap) in self.last_shortfall.message
+                ):
+                    raise RuntimeError(self.last_shortfall.message) from exc
                 raise
         frames = [self.format_lineup(lineup) for lineup in raw_lineups]
         if game_script:
             for frame in frames:
                 frame.attrs["game_script"] = game_script
         self._finish_shortfall(frames, count)
+        self._attribute_pass_catcher_shortfall(players, frames, count)
         return frames
 
 
@@ -3404,6 +3512,7 @@ def optimize_game_scripts(
     optimizer._inside_portfolio = True
     optimizer.portfolio_size = requested
     optimizer.last_shortfall = None
+    optimizer._tier_rule_causes = []
     reset_min = getattr(optimizer, "_reset_min_tracking", None)
     if reset_min is not None:
         reset_min()
@@ -3443,7 +3552,14 @@ def optimize_game_scripts(
                 )
             )
         if len(prior) < requested:
-            optimizer.last_shortfall = optimizer.explain_lineup_shortfall(prior, requested)
+            diagnostic = optimizer.explain_lineup_shortfall(prior, requested)
+            causes = list(dict.fromkeys(getattr(optimizer, "_tier_rule_causes", None) or []))
+            remember = getattr(optimizer, "_remember_rule_shortfall", None)
+            if causes and remember is not None:
+                cause = causes[0] if len(causes) == 1 else " ".join(causes)
+                remember(requested, len(prior), cause, diagnostic)
+            else:
+                optimizer.last_shortfall = diagnostic
         else:
             optimizer.last_shortfall = None
         finalize_min = getattr(optimizer, "_finalize_min_report", None)
