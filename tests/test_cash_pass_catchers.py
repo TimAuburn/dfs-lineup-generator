@@ -37,8 +37,9 @@ from pathlib import Path
 MOCK_CLASSIC = Path(__file__).parent / "mock_dk_salaries.csv"
 MOCK_SHOWDOWN = Path(__file__).parent / "mock_dk_showdown.csv"
 
-# Upload CSV sha256 from main at 3636311, seed 42, preset defaults.
-MAIN_CASH_CSV = "2102d82dc14790b4b6a2c62b00608c6643ca5bbcfdb53177c1c3b722cc329fed"
+# Upload CSV sha256, seed 42, preset defaults. Classic cash is the 127.5-point
+# tie CBC returns once the same-team QB/RB ban is in the model.
+MAIN_CASH_CSV = "9b1614d798c5819fcf0be8f831d38f1ee25a323aa01c12932446b471049272fd"
 MAIN_SHOWDOWN_CASH_CSV = "6980178f01545bef57fc4fdcaa43bc1b7c92459e014f779ba102aae40a437533"
 MAIN_SMALL_GPP_CSV = "fa796590470cf9dc48fb533fd6d311e49711384a9c51be93ae2d7616481a6c6d"
 MAIN_LARGE_GPP_CSV = "a39e4aea971f8aeb6b44d09f78baeeef06d4cfec480fdc5000deffca8efe1236"

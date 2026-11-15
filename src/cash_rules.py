@@ -21,7 +21,6 @@ from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence
 
 import pandas as pd
-from pydfs_lineup_optimizer.fantasy_points_strategy import BaseFantasyPointsStrategy
 from pydfs_lineup_optimizer.rules import OptimizerRule
 from pydfs_lineup_optimizer.solvers.constants import SolverSign
 
@@ -281,36 +280,6 @@ def same_team_qb_rb_violations(lineup: pd.DataFrame) -> tuple[str, ...]:
         count = running_backs[team]
         found.append(f"{team} rosters a QB with {count} RB")
     return tuple(found)
-
-
-class CashTieBreakStrategy(BaseFantasyPointsStrategy):
-    """Break an exact points tie without moving a lineup that scores more.
-
-    Adding a constraint changes the matrix CBC searches, so two lineups with
-    the same projection can swap which one comes back first. The penalty is
-    at most 0.0002 points. A higher DraftKings id costs more than every
-    lower id combined, so the tie keeps the lineup with the lower high id.
-    Exported projections stay on the player's own fppg.
-    """
-
-    def __init__(self, inner: BaseFantasyPointsStrategy, players: Iterable[object]):
-        self.inner = inner
-        ranked = sorted(
-            {str(getattr(player, "id", "")) for player in players if getattr(player, "id", None)},
-            key=lambda player_id: (0, int(player_id)) if player_id.isdigit() else (1, player_id),
-        )
-        top = max(len(ranked) - 1, 0)
-        self._penalty = {
-            player_id: 1e-4 * (2 ** (index - top))
-            for index, player_id in enumerate(ranked)
-        }
-
-    def get_player_fantasy_points(self, player) -> float:
-        base = float(self.inner.get_player_fantasy_points(player))
-        return base - self._penalty.get(str(getattr(player, "id", "")), 0.0)
-
-    def set_previous_lineup(self, lineup) -> None:
-        self.inner.set_previous_lineup(lineup)
 
 
 class SameTeamQbRbRule(OptimizerRule):

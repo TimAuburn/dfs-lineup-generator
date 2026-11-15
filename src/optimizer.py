@@ -22,7 +22,6 @@ from pydfs_lineup_optimizer.solvers.pulp_solver import PuLPSolver
 from pydfs_lineup_optimizer.stacks import PlayersGroup, PositionsStack
 
 from .cash_rules import (
-    CashTieBreakStrategy,
     PassCatcherCapSettings,
     PassCatcherTeamRule,
     SameTeamQbRbRule,
@@ -1982,13 +1981,6 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
             return
         optimizer._ban_same_team_qb_rb = True
         optimizer.add_new_rule(SameTeamQbRbRule)
-        # The ban does not change a projection. An exact tie would otherwise
-        # follow the new constraint order, so keep the lower high id.
-        pool = getattr(optimizer, "player_pool", None)
-        players = list(getattr(pool, "filtered_players", None) or [])
-        current = getattr(optimizer, "fantasy_points_strategy", None)
-        if current is not None and players and not isinstance(current, CashTieBreakStrategy):
-            optimizer.set_fantasy_points_strategy(CashTieBreakStrategy(current, players))
 
     def _pass_catcher_allows_another(
         self,

@@ -348,7 +348,17 @@ def test_clean_classic_and_showdown_pass_and_match_the_seed_42_export():
     cash.load_from_dataframe(classic)
     apply_preset(cash, ContestPreset.CLASSIC_CASH, jitter_seed=42)
     classic_lineups = cash.generate_lineups()
-    assert [str(player_id) for player_id in classic_lineups[0]["ID"]] == CASH_IDS
+    assert [str(player_id) for player_id in classic_lineups[0]["ID"]] == [
+        "1001",
+        "2001",
+        "2003",
+        "3012",
+        "3013",
+        "3009",
+        "4004",
+        "2002",
+        "5006",
+    ]
     classic_check = _check(classic_lineups, classic)
     assert classic_check.blocked is False
     assert classic_check.warnings == ()
