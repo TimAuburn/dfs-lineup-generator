@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from io import StringIO
+from dataclasses import dataclass
+from io import BytesIO, StringIO
 from pathlib import Path
 from typing import BinaryIO, Optional, TextIO, Union
 
@@ -130,11 +131,9 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def detect_contest_format(df: pd.DataFrame) -> ContestFormat:
-    """Infer Classic vs Showdown from Roster Position values."""
-    if "Roster Position" not in df.columns:
-        return ContestFormat.CLASSIC
-    slots = (
+def _primary_roster_slots(df: pd.DataFrame) -> pd.Series:
+    """Roster Position before a slash, uppercased. ``RB/FLEX`` is ``RB``."""
+    return (
         df["Roster Position"]
         .astype(str)
         .str.split("/")
@@ -142,9 +141,94 @@ def detect_contest_format(df: pd.DataFrame) -> ContestFormat:
         .str.strip()
         .str.upper()
     )
-    if slots.isin(SHOWDOWN_SLOTS).any():
+
+
+def detect_contest_format(df: pd.DataFrame) -> ContestFormat:
+    """Infer Classic vs Showdown from Roster Position values."""
+    if "Roster Position" not in df.columns:
+        return ContestFormat.CLASSIC
+    if _primary_roster_slots(df).isin(SHOWDOWN_SLOTS).any():
         return ContestFormat.SHOWDOWN
     return ContestFormat.CLASSIC
+
+
+_UNCHANGED = "Contest format was left unchanged."
+
+
+@dataclass(frozen=True)
+class SalaryFileDetection:
+    """Format read from a salary upload, or a reason not to switch."""
+
+    contest_format: Optional[ContestFormat] = None
+    caption: Optional[str] = None
+    warning: Optional[str] = None
+
+
+def _salary_warning(text: str) -> SalaryFileDetection:
+    return SalaryFileDetection(warning=f"{text} {_UNCHANGED}")
+
+
+def _detected(fmt: ContestFormat) -> SalaryFileDetection:
+    label = "Showdown" if fmt is ContestFormat.SHOWDOWN else "Classic"
+    return SalaryFileDetection(contest_format=fmt, caption=f"Detected: {label}")
+
+
+def _roster_labels(df: pd.DataFrame) -> set[str]:
+    labels: set[str] = set()
+    for raw in _primary_roster_slots(df).tolist():
+        text = str(raw).strip().upper()
+        if text and text != "NAN":
+            labels.add(text)
+    return labels
+
+
+def detect_salary_file_format(source: _IO | bytes) -> SalaryFileDetection:
+    """Classify a DK salary upload as Classic, Showdown, or leave-unchanged.
+
+    Loads the file with the same header scan, column aliases, and required
+    columns as ``parse_dk_csv``. Roster positions decide the format: CPT/FLEX
+    is Showdown, and QB/RB/WR/TE/DST (including RB/FLEX, WR/FLEX, and TE/FLEX)
+    is Classic. A CPT row that is not 1.5x its FLEX row is still Showdown.
+    The pre-upload lineup check already blocks a bad captain price.
+    """
+    if isinstance(source, (bytes, bytearray)):
+        source = BytesIO(bytes(source))
+    try:
+        frame = _normalize_columns(_load_dataframe(source))
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        pd.errors.ParserError,
+        pd.errors.EmptyDataError,
+    ):
+        return _salary_warning(
+            "This file could not be read as a DraftKings salary CSV."
+        )
+
+    missing = [column for column in REQUIRED_COLUMNS if column not in frame.columns]
+    if missing:
+        return _salary_warning(
+            "This salary file is missing required columns: " + ", ".join(missing) + "."
+        )
+
+    labels = _roster_labels(frame)
+    showdown = labels & SHOWDOWN_SLOTS
+    classic = labels & CLASSIC_POSITIONS
+    other = labels - SHOWDOWN_SLOTS - CLASSIC_POSITIONS
+    if showdown and classic:
+        return _salary_warning(
+            "This salary file mixes Showdown (CPT/FLEX) and Classic "
+            "(QB/RB/WR/TE/DST) roster positions."
+        )
+    if other or not labels:
+        return _salary_warning(
+            "Could not detect Classic (QB/RB/WR/TE/DST) or Showdown (CPT/FLEX) "
+            "from the roster positions in this salary file."
+        )
+    if showdown:
+        return _detected(ContestFormat.SHOWDOWN)
+    return _detected(ContestFormat.CLASSIC)
 
 
 def _derive_classic_position(roster_position: str) -> str:

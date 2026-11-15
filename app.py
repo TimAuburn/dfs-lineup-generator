@@ -91,7 +91,12 @@ from src.optimizer import (
     unique_quarterbacks,
 )
 from src.dk_scoring import SCORING_VERSION
-from src.parser import DKCSVValidationError, is_inactive_injury, parse_dk_csv
+from src.parser import (
+    DKCSVValidationError,
+    detect_salary_file_format,
+    is_inactive_injury,
+    parse_dk_csv,
+)
 from src.kickoff_forecast import forecasts_for_matchups, weather_label
 from src.slate_games import (
     disabled_for_slate,
@@ -192,6 +197,8 @@ def _init_state() -> None:
         "sleeper_summary": None,
         "sleeper_version": 0,
         "disabled_games_by_slate": {},
+        "salary_detect_key": None,
+        "salary_detection": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -265,6 +272,89 @@ def _on_format_change() -> None:
     st.session_state.lineups = []
     st.session_state.generated_run = None
     st.session_state.error = None
+
+
+def _salary_upload_key(name: str, content: bytes) -> str:
+    """One uploaded file. A new name or new bytes is a new auto-set."""
+    digest = hashlib.sha256(content).hexdigest()
+    return f"{name}\n{digest}"
+
+
+def _detection_state(found) -> dict:
+    fmt = found.contest_format
+    return {
+        "format": None if fmt is None else fmt.value,
+        "caption": found.caption,
+        "warning": found.warning,
+    }
+
+
+def _format_needs_autodetect(fmt: ContestFormat) -> bool:
+    """True when the current format or preset does not match ``fmt``."""
+    fitting = {preset.value for preset in presets_for_format(fmt)}
+    return (
+        st.session_state.get("contest_format") != fmt.value
+        or st.session_state.get("contest_preset") not in fitting
+    )
+
+
+def _consume_detected_format() -> None:
+    """Apply a stashed salary format before the format widgets exist.
+
+    The upload runs after those widgets, and Streamlit rejects a write to
+    ``contest_format`` once the radio is on the page. A later rerun of the
+    same file does not call this: the pending value is already gone, so a
+    manual choice is left alone.
+    """
+    pending = st.session_state.pop("salary_format_pending", None)
+    if not pending:
+        return
+    try:
+        fmt = ContestFormat(pending)
+    except ValueError:
+        return
+    presets = presets_for_format(fmt)
+    fitting = {preset.value for preset in presets}
+    if st.session_state.get("contest_format") == fmt.value:
+        if st.session_state.get("contest_preset") not in fitting:
+            st.session_state.contest_preset = presets[0].value
+        return
+    st.session_state.contest_format = fmt.value
+    st.session_state.contest_preset = presets[0].value
+    st.session_state.player_pool = None
+    st.session_state.lineups = []
+    st.session_state.generated_run = None
+    st.session_state.error = None
+
+
+def _record_salary_upload(name: str, content: bytes) -> None:
+    """Detect a new salary file once. Reruns of that file do not auto-set."""
+    detect_key = _salary_upload_key(name, content)
+    if st.session_state.get("salary_detect_key") == detect_key:
+        return
+    found = detect_salary_file_format(content)
+    st.session_state.salary_detect_key = detect_key
+    st.session_state.salary_detection = _detection_state(found)
+    if found.contest_format is None:
+        st.session_state.error = None
+        st.session_state.player_pool = None
+        st.session_state.lineups = []
+        st.session_state.generated_run = None
+        st.rerun()
+    if _format_needs_autodetect(found.contest_format):
+        st.session_state.salary_format_pending = found.contest_format.value
+        st.rerun()
+
+
+def _render_salary_detection() -> None:
+    found = st.session_state.get("salary_detection") or {}
+    warning = found.get("warning")
+    if warning:
+        st.warning(str(warning))
+        return
+    caption = found.get("caption")
+    if caption:
+        st.caption(str(caption))
 
 
 def _preset_key(preset: ContestPreset, name: str) -> str:
@@ -1554,6 +1644,7 @@ def render_archive_view() -> None:
 
 
 _init_state()
+_consume_detected_format()
 
 view = st.segmented_control(
     "View",
@@ -2046,13 +2137,25 @@ if view == "Player pool":
         "Load the salary file here. Include, captain, ownership, lock, and projection "
         "are saved with the pool and used when you generate lineups."
     )
+    # Stable across formats. A format-specific key would drop the file on the
+    # rerun that applies auto-detect, and the two keys would collide.
     uploaded = st.file_uploader(
         "DraftKings player pool CSV",
         type=["csv"],
         help=upload_help,
-        key=f"uploader_{contest_format.value}",
+        key="salary_uploader",
     )
-    if uploaded is not None:
+    if uploaded is None:
+        st.session_state.salary_detect_key = None
+        st.session_state.salary_detection = None
+    else:
+        _record_salary_upload(
+            str(getattr(uploaded, "name", "") or ""),
+            uploaded.getvalue(),
+        )
+    _render_salary_detection()
+    detected_format = (st.session_state.get("salary_detection") or {}).get("format")
+    if uploaded is not None and detected_format:
         try:
             parsed_pool = parse_dk_csv(uploaded, contest_format=contest_format)
             force_sleeper = bool(st.session_state.pop("sleeper_force", False))
