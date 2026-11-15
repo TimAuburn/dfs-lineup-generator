@@ -93,7 +93,7 @@ from src.optimizer import (
 from src.dk_scoring import SCORING_VERSION
 from src.parser import (
     DKCSVValidationError,
-    detect_salary_file_format,
+    assess_salary_upload,
     is_inactive_injury,
     parse_dk_csv,
 )
@@ -331,20 +331,31 @@ def _consume_detected_format() -> None:
 
 
 def _record_salary_upload(name: str, content: bytes) -> None:
-    """Detect a new salary file once. Reruns of that file do not auto-set."""
+    """Detect a new salary file once. Reruns of that file do not auto-set.
+
+    The key is stored for a rejection too. A later rerun of that same file
+    returns here and does not try the upload again. Only an accepted file may
+    change the format. The pool and lineups stay put until parsing replaces them.
+    """
     detect_key = _salary_upload_key(name, content)
     if st.session_state.get("salary_detect_key") == detect_key:
         return
-    found = detect_salary_file_format(content)
+    decision = assess_salary_upload(content, filename=name)
     st.session_state.salary_detect_key = detect_key
-    st.session_state.salary_detection = _detection_state(found)
-    if found.contest_format is None:
+    if not decision.accepted:
+        # The notice stays with the file. It is not the optimizer's error, and
+        # it must not follow the user onto the lineup page.
+        st.session_state.salary_detection = {
+            "format": None,
+            "caption": None,
+            "warning": decision.message if decision.level == "warning" else None,
+            "error": decision.message if decision.level == "error" else None,
+        }
         st.session_state.error = None
-        st.session_state.player_pool = None
-        st.session_state.lineups = []
-        st.session_state.generated_run = None
-        st.rerun()
-    if _format_needs_autodetect(found.contest_format):
+        return
+    found = decision.detection
+    st.session_state.salary_detection = _detection_state(found)
+    if found.contest_format is not None and _format_needs_autodetect(found.contest_format):
         st.session_state.salary_format_pending = found.contest_format.value
         st.rerun()
 
@@ -354,6 +365,10 @@ def _render_salary_detection() -> None:
     warning = found.get("warning")
     if warning:
         st.warning(str(warning))
+        return
+    error = found.get("error")
+    if error:
+        st.error(str(error))
         return
     caption = found.get("caption")
     if caption:
@@ -2208,9 +2223,8 @@ if view == "Player pool":
             if pool_changed:
                 st.rerun()
         except DKCSVValidationError as exc:
-            st.session_state.error = str(exc)
-            st.session_state.player_pool = None
-            pool = None
+            label = str(getattr(uploaded, "name", "") or "").strip() or "salary file"
+            st.session_state.error = f"{label}: {exc}"
 
     if st.session_state.error:
         st.error(st.session_state.error)

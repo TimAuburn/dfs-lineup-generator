@@ -173,6 +173,73 @@ def _detected(fmt: ContestFormat) -> SalaryFileDetection:
     return SalaryFileDetection(contest_format=fmt, caption=f"Detected: {label}")
 
 
+@dataclass(frozen=True)
+class SalaryUploadDecision:
+    """Whether an upload may replace the pool.
+
+    Detection can name a format and the file can still be rejected. ``accepted``
+    is the only yes. A rejection carries ``message`` for the page and no pool.
+    """
+
+    accepted: bool
+    detection: SalaryFileDetection
+    message: str = ""
+    level: str = ""
+
+
+def _upload_filename(filename: str) -> str:
+    name = str(filename or "").strip()
+    return name or "salary file"
+
+
+def _named_upload_problem(filename: str, detail: str) -> str:
+    text = " ".join(str(detail).split())
+    prefix = f"{filename}:"
+    if text.startswith(prefix):
+        return text
+    return f"{prefix} {text}"
+
+
+def _reread_salary_source(source: _IO | bytes):
+    """The same bytes detection just read, ready for ``parse_dk_csv``."""
+    if isinstance(source, (bytes, bytearray)):
+        return BytesIO(bytes(source))
+    if isinstance(source, (str, Path)):
+        return source
+    if hasattr(source, "seek"):
+        source.seek(0)
+    return source
+
+
+def assess_salary_upload(source: _IO | bytes, *, filename: str = "") -> SalaryUploadDecision:
+    """Accept a salary file only when it detects a format and parses as that format.
+
+    A read failure, a missing column, a mixed or ambiguous roster, or a
+    ``DKCSVValidationError`` is a rejection. The returned message names the
+    file. Calling this does not touch session state.
+    """
+    label = _upload_filename(filename)
+    found = detect_salary_file_format(source)
+    if found.contest_format is None:
+        detail = found.warning or "This salary file was not accepted."
+        return SalaryUploadDecision(
+            accepted=False,
+            detection=found,
+            message=_named_upload_problem(label, detail),
+            level="warning",
+        )
+    try:
+        parse_dk_csv(_reread_salary_source(source), contest_format=found.contest_format)
+    except DKCSVValidationError as exc:
+        return SalaryUploadDecision(
+            accepted=False,
+            detection=found,
+            message=_named_upload_problem(label, str(exc)),
+            level="error",
+        )
+    return SalaryUploadDecision(accepted=True, detection=found)
+
+
 def _roster_labels(df: pd.DataFrame) -> set[str]:
     labels: set[str] = set()
     for raw in _primary_roster_slots(df).tolist():
