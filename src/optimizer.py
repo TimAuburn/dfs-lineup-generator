@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import contextvars
 import re
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
-from pulp import LpStatusOptimal
+from pulp import LpStatusInfeasible, LpStatusOptimal
 from pydfs_lineup_optimizer import Player, Site, Sport, get_optimizer
 from pydfs_lineup_optimizer.exceptions import GenerateLineupException
 from pydfs_lineup_optimizer.lineup import Lineup
@@ -1078,6 +1080,8 @@ class BaseNFLOptimizer:
         relaxed = False
         self._solver_constraint_notes = []
         while remaining > 0:
+            if _capacity_deadline_reached():
+                break
             produced = []
             try:
                 for lineup in pydfs_optimizer.optimize(
@@ -1087,11 +1091,15 @@ class BaseNFLOptimizer:
                 ):
                     produced.append(lineup)
                     self._note_lineup_progress(len(prior_frames) + len(raw) + len(produced))
+                    if _capacity_deadline_reached():
+                        break
                 raw.extend(produced)
                 break
             except GenerateLineupException as exc:
                 self._solver_constraint_notes = list(getattr(exc, "invalid_constraints", []) or [])
                 raw.extend(produced)
+                if capacity_timed_out():
+                    break
                 remaining = int(count) - len(raw)
                 if relaxed or remaining <= 0 or not self._min_targets:
                     if not raw:
@@ -2228,6 +2236,8 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
             relaxed = self._relax_construction(players, count, prior)
             if relaxed is not None:
                 raw_lineups = relaxed
+            elif getattr(self, "_capacity_probe", False):
+                return []
             elif self._inside_portfolio:
                 raw_lineups = []
             elif self._limits_configured():
@@ -2253,6 +2263,10 @@ class NFLClassicOptimizer(BaseNFLOptimizer):
         if game_script:
             for frame in frames:
                 frame.attrs["game_script"] = game_script
+        # A capacity probe only needs the lineups. Naming the shortfall solves
+        # again and does not change the exported roster.
+        if getattr(self, "_capacity_probe", False):
+            return frames
         self._finish_shortfall(frames, count)
         self._attribute_pass_catcher_shortfall(players, frames, count)
         self._attribute_same_team_qb_rb_shortfall(players, frames, count)
@@ -2348,17 +2362,84 @@ def _stable_invalid_constraint_names(problem) -> List[str]:
     return sorted(names)
 
 
+# A capacity count sets a deadline. Generate leaves it unset, and this solve
+# path is then the one the lineup export already uses.
+_CAPACITY_DEADLINE: contextvars.ContextVar[Optional[float]] = contextvars.ContextVar(
+    "dfs_capacity_deadline",
+    default=None,
+)
+_CAPACITY_TIMED_OUT: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "dfs_capacity_timed_out",
+    default=False,
+)
+
+
+def begin_capacity_budget(deadline: Optional[float]) -> None:
+    """Limit later solves until ``deadline`` (``time.perf_counter``).
+
+    ``None`` clears the limit. The lineup export never sets it.
+    """
+    _CAPACITY_DEADLINE.set(deadline)
+    _CAPACITY_TIMED_OUT.set(False)
+
+
+def clear_capacity_timeout() -> None:
+    """Forget a timeout flag without moving the deadline."""
+    _CAPACITY_TIMED_OUT.set(False)
+
+
+def capacity_timed_out() -> bool:
+    """True once a capacity solve stopped because the deadline was reached."""
+    return bool(_CAPACITY_TIMED_OUT.get())
+
+
+def _capacity_deadline_reached() -> bool:
+    """True when a capacity deadline is set and has been reached.
+
+    An unset deadline is never reached, so lineup generation does not stop.
+    """
+    deadline = _CAPACITY_DEADLINE.get()
+    if deadline is None:
+        return False
+    if time.perf_counter() >= float(deadline):
+        _CAPACITY_TIMED_OUT.set(True)
+        return True
+    return bool(_CAPACITY_TIMED_OUT.get())
+
+
 class _ReportingPuLPSolver(PuLPSolver):
     """PuLP solver whose infeasible report does not depend on hash order.
 
     A feasible solve is the stock PuLP path, so the lineup is the one CBC
     returns for the problem pydfs built. Only the failure report is rebuilt.
+    A capacity deadline, when one is set, limits that same solver and treats
+    a timed-out status as unfinished rather than as a proven infeasible model.
     """
 
     def solve(self):
-        self.prob.solve(self.LP_SOLVER)
+        deadline = _CAPACITY_DEADLINE.get()
+        solver = self.LP_SOLVER
+        saved_limit = None
+        if deadline is not None:
+            remaining = float(deadline) - time.perf_counter()
+            if remaining <= 0.0:
+                _CAPACITY_TIMED_OUT.set(True)
+                raise SolverInfeasibleSolutionException([])
+            saved_limit = solver.timeLimit
+            solver.timeLimit = remaining
+        try:
+            self.prob.solve(solver)
+        finally:
+            if deadline is not None:
+                solver.timeLimit = saved_limit
         if self.prob.status == LpStatusOptimal:
             return _selected_variables(self.prob)
+        if deadline is not None:
+            # Infeasible is a proof. Any other status under a deadline, including
+            # "Not Solved" after CBC stops on time, is not a proof.
+            if self.prob.status != LpStatusInfeasible:
+                _CAPACITY_TIMED_OUT.set(True)
+            raise SolverInfeasibleSolutionException([])
         raise SolverInfeasibleSolutionException(_stable_invalid_constraint_names(self.prob))
 
 
@@ -2678,6 +2759,9 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         is captain in that fraction of the batch. CPT and FLEX are separate
         player objects, so the flex row keeps the global exposure.
         """
+        # Captain % is a cross-lineup share. A singles count leaves it off.
+        if getattr(self, "_capacity_singles", False):
+            return
         frame = self._player_df
         if frame is None or frame.empty or "CaptainExposure" not in frame.columns:
             return
@@ -2734,6 +2818,9 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             player.max_exposure = rate
 
     def _apply_kicker_exposure_cap(self, players: List[Player]) -> None:
+        # The kicker share is a cross-lineup cap. A singles count leaves it off.
+        if getattr(self, "_capacity_singles", False):
+            return
         cap = self.kicker_max_exposure
         if cap is None:
             return
@@ -3332,7 +3419,10 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             self._reset_min_tracking()
         cause = self._showdown_pre_solve_cause()
         if cause:
-            raise RuntimeError(self._remember_rule_shortfall(count, 0, cause))
+            message = self._remember_rule_shortfall(count, 0, cause)
+            if getattr(self, "_capacity_probe", False):
+                return []
+            raise RuntimeError(message)
         players = self._players_for_optimize()
         try:
             if self.require_starting_core:
@@ -3348,6 +3438,8 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
                 frames = self._optimize_showdown(players, count)
         except GenerateLineupException as exc:
             self._solver_constraint_notes = list(getattr(exc, "invalid_constraints", []) or [])
+            if getattr(self, "_capacity_probe", False):
+                return []
             diagnostic = self.explain_lineup_shortfall([], count)
             rule_cause = self._attribute_showdown_shortfall(players, [], count)
             if rule_cause:
@@ -3360,6 +3452,8 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
                 self.last_shortfall = self.explain_lineup_shortfall([], count)
                 raise RuntimeError(self._limit_failure_message()) from exc
             raise
+        if getattr(self, "_capacity_probe", False):
+            return frames
         self._finish_shortfall(frames, count)
         if len(frames) < count:
             diagnostic = self.last_shortfall
