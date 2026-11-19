@@ -34,6 +34,17 @@ What a label proves
 
 A requested count M is too high only when a proved ceiling is below M.
 ``at least L`` with L < M is not that ceiling.
+
+``Limited by: ...``
+    A named rule was turned off and the count went up inside the attribution
+    budget. The name is only that proof. QB/RB ban, the pass-catcher cap,
+    the overlap/min-unique rule, max exposure, locks, and salary are the
+    rules this check can name.
+
+``The binding rule could not be determined in time.``
+    The count was low enough to ask which rule binds, and the attribution
+    budget ran out before every active candidate was proved or cleared.
+    No rule is named unless its own re-measure already showed a higher count.
 """
 
 from __future__ import annotations
@@ -67,6 +78,17 @@ from .slate_week import slate_games_from_pool
 DEFAULT_CAP = 150
 # Short on purpose. A full-slate enumeration takes seconds; Generate should not.
 GENERATE_BUDGET_SECONDS = 0.4
+# Separate from the count. Only runs when the count is already low.
+ATTRIBUTION_BUDGET_SECONDS = 0.25
+
+_DEFAULT_ATTRIBUTION = object()
+
+RULE_QB_RB = "QB/RB ban"
+RULE_PASS_CATCHER = "pass-catcher cap"
+RULE_OVERLAP = "overlap/min-unique rule"
+RULE_EXPOSURE = "max exposure"
+RULE_LOCKS = "locks"
+RULE_SALARY = "salary"
 
 _FINGERPRINT_COLUMNS = (
     "ID",
@@ -184,6 +206,9 @@ class CapacityReport:
     lower_exhausted: bool = False
     upper_exhausted: bool = False
     elapsed_seconds: float = 0.0
+    attribution_seconds: float = 0.0
+    binding_rules: tuple = ()
+    binding_undetermined: bool = False
     from_cache: bool = False
     passes: tuple = ()
 
@@ -205,20 +230,23 @@ def format_capacity(report: CapacityReport, requested: int) -> str:
     requested = int(requested)
     if report.exact is not None:
         number = int(report.exact)
-        return (
+        sentence = (
             f"Your pool and rules allow up to {number} unique {_word(number)} "
             f"(requested {requested})."
         )
+        return sentence + _binding_clause(report)
     if report.capped:
         return (
             f"Your pool and rules allow {int(report.cap)}+ unique lineups "
             f"(requested {requested})."
+            + _binding_clause(report)
         )
     ceiling_proved = report.upper_exhausted and report.upper is not None
     if report.timed_out and (report.lower is None or int(report.lower) <= 0) and not ceiling_proved:
         return (
             "The unique-lineup count hit the time limit before a lineup was proved "
             f"(requested {requested})."
+            + _binding_clause(report)
         )
     parts = []
     if report.lower is not None and int(report.lower) > 0:
@@ -238,7 +266,7 @@ def format_capacity(report: CapacityReport, requested: int) -> str:
             " The count stopped at the time limit, so a bound that is still open "
             "is not a maximum."
         )
-    return sentence
+    return sentence + _binding_clause(report)
 
 
 def format_warning(report: CapacityReport, requested: int) -> Optional[str]:
@@ -259,6 +287,7 @@ def format_warning(report: CapacityReport, requested: int) -> Optional[str]:
     return (
         f"You requested {requested} lineups, but this pool and these rules "
         f"can produce at most {ceiling} unique {_word(ceiling)}."
+        + _binding_clause(report)
     )
 
 
@@ -270,6 +299,8 @@ def measure(
     budget_seconds: Optional[float] = GENERATE_BUDGET_SECONDS,
     cache: Optional[dict] = None,
     plan: Optional[SolvePlan] = None,
+    attribute: bool = True,
+    attribution_budget_seconds: object = _DEFAULT_ATTRIBUTION,
 ) -> CapacityReport:
     """Count unique lineups the configured optimizer can reach.
 
@@ -282,7 +313,11 @@ def measure(
     """
     plan = plan or SolvePlan()
     cap = max(1, min(DEFAULT_CAP, int(cap)))
-    key = _cache_key(optimizer, plan, cap, budget_seconds)
+    if attribution_budget_seconds is _DEFAULT_ATTRIBUTION:
+        attribution_budget = None if budget_seconds is None else ATTRIBUTION_BUDGET_SECONDS
+    else:
+        attribution_budget = attribution_budget_seconds
+    key = _cache_key(optimizer, plan, cap, budget_seconds, attribution_budget, attribute)
     if cache is not None and key in cache:
         return replace(cache[key], from_cache=True)
     started = time.perf_counter()
@@ -308,6 +343,22 @@ def measure(
         begin_capacity_budget(None)
         PuLPSolver.LP_SOLVER.timeLimit = saved_limit
     report = replace(report, elapsed_seconds=time.perf_counter() - started, cap=cap)
+    if attribute and _needs_attribution(report, requested):
+        attr_started = time.perf_counter()
+        report = _attribute_binding_rules(
+            optimizer,
+            report,
+            plan=plan,
+            cap=cap,
+            cache=cache,
+            attribution_budget=attribution_budget,
+        )
+        attr_elapsed = time.perf_counter() - attr_started
+        report = replace(
+            report,
+            attribution_seconds=attr_elapsed,
+            elapsed_seconds=report.elapsed_seconds + attr_elapsed,
+        )
     if cache is not None:
         cache[key] = report
     return report
@@ -618,7 +669,209 @@ def _game_count(frame) -> int:
     return len(slate_games_from_pool(frame))
 
 
-def _cache_key(optimizer, plan: SolvePlan, cap: int, budget_seconds: Optional[float]) -> str:
+def _binding_clause(report: CapacityReport) -> str:
+    """The proved rule names, then an undetermined sentence when the clock won."""
+    parts = []
+    if report.binding_rules:
+        parts.append("Limited by: " + ", ".join(report.binding_rules) + ".")
+    if report.binding_undetermined:
+        if report.binding_rules:
+            parts.append("Other binding rules could not be determined in time.")
+        else:
+            parts.append("The binding rule could not be determined in time.")
+    if not parts:
+        return ""
+    return " " + " ".join(parts)
+
+
+def _proved_ceiling(report: CapacityReport) -> Optional[int]:
+    if report.exact is not None:
+        return int(report.exact)
+    if report.upper_exhausted and report.upper is not None:
+        return int(report.upper)
+    return None
+
+
+def _needs_attribution(report: CapacityReport, requested: int) -> bool:
+    """Low means a proved ceiling under M, or an exact count below the cap."""
+    ceiling = _proved_ceiling(report)
+    if ceiling is not None and int(requested) > ceiling:
+        return True
+    if report.exact is not None and int(report.exact) < int(report.cap) and not report.capped:
+        return True
+    return False
+
+
+def _achieved_count(report: CapacityReport) -> Optional[int]:
+    """Lineups the current rules were shown to allow, when that search finished."""
+    if report.timed_out and report.exact is None and not report.capped:
+        return None
+    return _shown_count(report)
+
+
+def _shown_count(report: CapacityReport) -> Optional[int]:
+    """Lineups a search produced, including a partial set cut off by the clock."""
+    if report.exact is not None:
+        return int(report.exact)
+    if report.capped:
+        return int(report.cap)
+    if report.lower is not None:
+        return int(report.lower)
+    if report.upper_exhausted and report.upper is not None:
+        return int(report.upper)
+    return None
+
+
+def _overlap_can_bind(optimizer) -> bool:
+    repeating = getattr(optimizer, "max_repeating_players", None)
+    if repeating is None:
+        return False
+    roster = len(getattr(optimizer, "roster_slots", ()) or ())
+    if not roster:
+        return False
+    tightened = overlap_cap_for_slate(
+        int(repeating),
+        _game_count(getattr(optimizer, "_player_df", None)),
+        bool(getattr(optimizer, "slate_aware_gpp", False)),
+    )
+    return tightened is not None and int(tightened) < roster - 1
+
+
+def _exposure_can_bind(optimizer) -> bool:
+    exposure = getattr(optimizer, "max_exposure", None)
+    if exposure is not None and float(exposure) < 1.0 - 1e-9:
+        return True
+    kicker = getattr(optimizer, "kicker_max_exposure", None)
+    return kicker is not None and float(kicker) < 1.0 - 1e-9
+
+
+def _salary_can_bind(optimizer) -> bool:
+    maximum = getattr(optimizer, "max_salary_cap", None)
+    minimum = getattr(optimizer, "min_salary_cap", None)
+    skill = getattr(optimizer, "min_skill_salary", None)
+    if maximum is not None and int(maximum) < DK_SALARY_CAP:
+        return True
+    if minimum is not None and int(minimum) > 0:
+        return True
+    return skill is not None
+
+
+def _relax_qb_rb(optimizer) -> None:
+    optimizer.ban_same_team_qb_rb = False
+
+
+def _relax_pass_catcher(optimizer) -> None:
+    optimizer.pass_catcher_team_cap = False
+
+
+def _relax_overlap(optimizer) -> None:
+    optimizer.set_max_repeating_players(None)
+
+
+def _relax_exposure(optimizer) -> None:
+    optimizer.max_exposure = None
+    if hasattr(optimizer, "kicker_max_exposure"):
+        optimizer.kicker_max_exposure = None
+
+
+def _relax_locks(optimizer) -> None:
+    optimizer.set_locked_players(())
+
+
+def _relax_salary(optimizer) -> None:
+    optimizer.set_min_salary_cap(None)
+    optimizer.set_max_salary_cap(None)
+    if hasattr(optimizer, "min_skill_salary"):
+        optimizer.min_skill_salary = None
+
+
+def _limit_candidates(optimizer):
+    """Active rules this check knows how to relax, in notice order."""
+    found = []
+    if getattr(optimizer, "ban_same_team_qb_rb", False):
+        found.append((RULE_QB_RB, _relax_qb_rb))
+    if getattr(optimizer, "pass_catcher_team_cap", False):
+        found.append((RULE_PASS_CATCHER, _relax_pass_catcher))
+    if _overlap_can_bind(optimizer):
+        found.append((RULE_OVERLAP, _relax_overlap))
+    if _exposure_can_bind(optimizer):
+        found.append((RULE_EXPOSURE, _relax_exposure))
+    if getattr(optimizer, "locked_player_ids", None):
+        found.append((RULE_LOCKS, _relax_locks))
+    if _salary_can_bind(optimizer):
+        found.append((RULE_SALARY, _relax_salary))
+    return found
+
+
+def _attribute_binding_rules(
+    optimizer,
+    report: CapacityReport,
+    *,
+    plan: SolvePlan,
+    cap: int,
+    cache: Optional[dict],
+    attribution_budget: Optional[float],
+) -> CapacityReport:
+    """Name a rule only when turning it off raises the proved count."""
+    candidates = _limit_candidates(optimizer)
+    if not candidates:
+        return report
+    baseline = _achieved_count(report)
+    if baseline is None:
+        return replace(report, binding_undetermined=True)
+    if attribution_budget is not None and float(attribution_budget) <= 0:
+        return replace(report, binding_undetermined=True)
+    deadline = None if attribution_budget is None else time.perf_counter() + float(attribution_budget)
+    saved, exposures = _snapshot(optimizer)
+    proved = []
+    undetermined = False
+    try:
+        for name, relax in candidates:
+            if deadline is not None and time.perf_counter() >= deadline:
+                undetermined = True
+                break
+            remaining = None if deadline is None else deadline - time.perf_counter()
+            if remaining is not None and remaining <= 0:
+                undetermined = True
+                break
+            relax(optimizer)
+            try:
+                relaxed = measure(
+                    optimizer,
+                    requested=baseline + 1,
+                    cap=cap,
+                    budget_seconds=remaining,
+                    cache=cache,
+                    plan=plan,
+                    attribute=False,
+                    attribution_budget_seconds=0,
+                )
+            finally:
+                _restore(optimizer, saved, exposures)
+            raised = _shown_count(relaxed)
+            if relaxed.timed_out and (raised is None or raised <= baseline):
+                # The clock ran out before this rule showed a higher count.
+                undetermined = True
+                continue
+            if raised is not None and raised > baseline:
+                proved.append(name)
+    finally:
+        _restore(optimizer, saved, exposures)
+    return replace(
+        report,
+        binding_rules=tuple(proved),
+        binding_undetermined=undetermined,
+    )
+
+
+def _cache_key(
+    optimizer,
+    plan: SolvePlan,
+    cap: int,
+    budget_seconds: Optional[float],
+    attribution_budget: Optional[float],
+    attribute: bool,
+) -> str:
     payload = {
         "pool": pool_fingerprint(getattr(optimizer, "_player_df", None)),
         "locked": sorted(str(player_id) for player_id in (optimizer.locked_player_ids or ())),
@@ -633,6 +886,10 @@ def _cache_key(optimizer, plan: SolvePlan, cap: int, budget_seconds: Optional[fl
         },
         "cap": int(cap),
         "budget": None if budget_seconds is None else round(float(budget_seconds), 3),
+        "attribute": bool(attribute),
+        "attribution_budget": (
+            None if attribution_budget is None else round(float(attribution_budget), 3)
+        ),
     }
     encoded = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(encoded.encode()).hexdigest()

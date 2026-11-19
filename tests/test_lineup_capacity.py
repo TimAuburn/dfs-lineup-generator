@@ -257,10 +257,12 @@ def test_overlap_of_seven_is_bounds_not_an_exact_maximum():
     assert report.upper == 4
     text = format_capacity(report, 5)
     assert text == (
-        "Your pool and rules allow at least 1 and at most 4 unique lineups (requested 5)."
+        "Your pool and rules allow at least 1 and at most 4 unique lineups (requested 5). "
+        "Limited by: overlap/min-unique rule."
     )
-    assert "up to" not in text
+    assert "up to" not in text.split("Limited by:")[0]
     assert format_warning(report, 5) is not None
+    assert "overlap/min-unique rule" in format_warning(report, 5)
     assert format_warning(report, 4) is None
     assert format_warning(report, 1) is None
 
@@ -275,9 +277,13 @@ def test_cash_pass_catcher_cap_allows_exactly_two():
         chosen.append(frozenset(str(name).strip() for name in wideouts.tolist()))
     assert chosen_sets(chosen) == set(_hand_catcher_lineups())
     assert report.exact == 2
-    assert format_capacity(report, 5) == (
-        "Your pool and rules allow up to 2 unique lineups (requested 5)."
+    assert report.binding_rules == ("pass-catcher cap",)
+    notice = format_capacity(report, 5)
+    assert notice == (
+        "Your pool and rules allow up to 2 unique lineups (requested 5). "
+        "Limited by: pass-catcher cap."
     )
+    assert "QB/RB ban" not in notice
     assert format_warning(report, 5) is not None
     assert format_warning(report, 2) is None
 
@@ -296,12 +302,32 @@ def test_cash_qb_rb_ban_allows_exactly_one():
         backs.append(frozenset(str(name).strip() for name in names.tolist()))
     assert set(backs) == set(_hand_ban_lineups())
     assert report.exact == 1
-    assert format_capacity(report, 3) == (
-        "Your pool and rules allow up to 1 unique lineup (requested 3)."
+    assert report.binding_rules == ("QB/RB ban",)
+    notice = format_capacity(report, 3)
+    assert notice == (
+        "Your pool and rules allow up to 1 unique lineup (requested 3). "
+        "Limited by: QB/RB ban."
     )
+    assert "pass-catcher cap" not in notice
     warning = format_warning(report, 3)
     assert warning is not None
     assert "at most 1 unique lineup" in warning
+
+
+def test_binding_rule_is_undetermined_when_the_attribution_budget_is_gone():
+    optimizer = _cash(_ban_pool())
+    report = measure(
+        optimizer,
+        requested=3,
+        budget_seconds=None,
+        attribution_budget_seconds=0,
+    )
+    assert report.exact == 1
+    assert report.binding_rules == ()
+    assert report.binding_undetermined is True
+    text = format_capacity(report, 3)
+    assert "The binding rule could not be determined in time." in text
+    assert "Limited by:" not in text
 
 
 def test_cap_above_150_is_clamped_to_150():
