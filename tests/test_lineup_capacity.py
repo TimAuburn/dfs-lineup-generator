@@ -304,6 +304,13 @@ def test_cash_qb_rb_ban_allows_exactly_one():
     assert "at most 1 unique lineup" in warning
 
 
+def test_cap_above_150_is_clamped_to_150():
+    """The enumeration cap cannot be raised. 150 is the hard maximum."""
+    optimizer = _overlap_optimizer(8)
+    report = measure(optimizer, requested=1, cap=400, budget_seconds=0)
+    assert report.cap == 150
+
+
 def test_cap_hit_is_labeled_with_a_plus_and_is_not_a_ceiling():
     optimizer = _overlap_optimizer(8)
     report = measure(optimizer, requested=1, cap=2, budget_seconds=None)

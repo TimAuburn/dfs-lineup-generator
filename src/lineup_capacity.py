@@ -25,10 +25,12 @@ What a label proves
 ``at least L and at most U``
     Both of the above, and L < U, so the maximum is still unknown.
 
-``150+`` (or another cap)
-    The search built ``cap`` lineups and stopped because the cap was reached,
+``150+``
+    The search built 150 lineups and stopped because the cap was reached,
     without proving that another lineup is impossible. That proves at least
-    ``cap``. It does not prove that ``cap`` is the maximum.
+    150. It does not prove that 150 is the maximum. The cap cannot be raised
+    above 150. A smaller cap passed to ``measure`` is labeled the same way
+    (``N+``).
 
 A requested count M is too high only when a proved ceiling is below M.
 ``at least L`` with L < M is not that ceiling.
@@ -272,8 +274,9 @@ def measure(
     """Count unique lineups the configured optimizer can reach.
 
     ``requested`` is M, used by the formatters. It does not change the count.
-    ``cap`` stops the search; hitting it without a failed next lineup is
-    labeled ``cap+``. ``budget_seconds`` ``None`` waits for the solver.
+    ``cap`` stops the search. It is at most 150: a larger value is clamped,
+    and a smaller one is kept. Hitting that cap without a failed next lineup
+    is labeled ``N+``. ``budget_seconds`` ``None`` waits for the solver.
     The optimizer's fields are restored before this returns, including when
     the count raises.
     """
