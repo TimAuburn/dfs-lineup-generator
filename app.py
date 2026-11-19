@@ -49,6 +49,14 @@ from src.env_config import (
 )
 from src.exporter import lineups_to_dk_upload_csv, upload_columns_for
 from src.generation_progress import format_lineup_progress, lineup_progress_percent
+from src.lineup_capacity import (
+    GENERATE_BUDGET_SECONDS,
+    SolvePlan,
+    format_capacity,
+    format_warning,
+    measure,
+    pool_fingerprint,
+)
 from src.upload_check import (
     csv_for_download,
     failure_table,
@@ -202,6 +210,8 @@ def _init_state() -> None:
         "disabled_games_by_slate": {},
         "salary_detect_key": None,
         "salary_detection": None,
+        "capacity_cache": {},
+        "capacity_notice": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -2565,6 +2575,24 @@ upload_slot = st.empty()
 _exports_painted = False
 
 
+def _render_capacity_notice(notice, *, preset_value, rows, frame) -> None:
+    """Show the unique-lineup sentence only for the pool and rules that produced it."""
+    if not notice:
+        return
+    if notice.get("preset") != preset_value:
+        return
+    if notice.get("rows") != rows:
+        return
+    if notice.get("pool") != pool_fingerprint(frame):
+        return
+    warning = notice.get("warning")
+    message = notice.get("message")
+    if warning:
+        st.warning(warning)
+    if message:
+        st.info(message)
+
+
 def _paint_exports() -> None:
     """Download buttons and the upload check for the lineups stored right now."""
     global _exports_painted
@@ -2771,6 +2799,48 @@ if generate:
             max_exposure_pct=float(max_exposure_pct) if use_max_exposure else None,
         )
         if game_script_buckets is not None:
+            capacity_plan = SolvePlan(
+                kind="game_script",
+                buckets=tuple(
+                    (str(bucket.game), int(bucket.lineups), int(bucket.salary_cap))
+                    for bucket in game_script_buckets
+                ),
+            )
+        elif enable_tiered_salary:
+            capacity_plan = SolvePlan(
+                kind="tiered",
+                leave_money_ratio=float(leave_money_pct) / 100.0,
+                discount_cap=int(discount_cap),
+                discount_floor=int(discount_floor),
+                standard_cap=DK_SALARY_CAP,
+            )
+        else:
+            capacity_plan = SolvePlan()
+        progress_bar.progress(0, text="Counting unique lineups…")
+        try:
+            capacity_report = measure(
+                optimizer,
+                requested=requested_lineups,
+                budget_seconds=GENERATE_BUDGET_SECONDS,
+                cache=st.session_state.capacity_cache,
+                plan=capacity_plan,
+            )
+        except Exception:
+            # A counting failure must not change the lineups Generate exports.
+            st.session_state.capacity_notice = None
+        else:
+            capacity_message = format_capacity(capacity_report, requested_lineups)
+            capacity_warning = format_warning(capacity_report, requested_lineups)
+            st.session_state.capacity_notice = {
+                "preset": preset.value,
+                "rows": live_setting_rows,
+                "pool": pool_fingerprint(solve_pool),
+                "message": capacity_message,
+                "warning": capacity_warning,
+            }
+            if capacity_warning:
+                st.warning(capacity_warning)
+        if game_script_buckets is not None:
             if not game_script_buckets:
                 raise RuntimeError(
                     "Upload a Classic salary file before assigning lineups to games."
@@ -2851,6 +2921,17 @@ if generate:
         if optimizer is not None:
             optimizer.on_lineup_progress = None
         progress_slot.empty()
+
+_render_capacity_notice(
+    st.session_state.get("capacity_notice"),
+    preset_value=preset.value,
+    rows=live_setting_rows,
+    frame=projections_for_solve(
+        working_pool,
+        vegas_lines,
+        st.session_state.weather_by_home or {},
+    ),
+)
 
 lineups = st.session_state.lineups
 if lineups:
