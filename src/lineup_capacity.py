@@ -209,6 +209,9 @@ class CapacityReport:
     attribution_seconds: float = 0.0
     binding_rules: tuple = ()
     binding_undetermined: bool = False
+    # True once this count has been checked for binding rules at ``attribution_budget_used``.
+    attribution_checked: bool = False
+    attribution_budget_used: Optional[float] = None
     from_cache: bool = False
     passes: tuple = ()
 
@@ -317,9 +320,56 @@ def measure(
         attribution_budget = None if budget_seconds is None else ATTRIBUTION_BUDGET_SECONDS
     else:
         attribution_budget = attribution_budget_seconds
-    key = _cache_key(optimizer, plan, cap, budget_seconds, attribution_budget, attribute)
-    if cache is not None and key in cache:
-        return replace(cache[key], from_cache=True)
+    # The count does not depend on M. Attribution does: it runs only when M is
+    # above a proved ceiling (or the exact count is below the cap). The count
+    # is cached without M. A later, larger M reuses that count and attributes
+    # then, instead of solving the slate again.
+    key = _cache_key(optimizer, plan, cap, budget_seconds, attribute)
+    cached = None if cache is None else cache.get(key)
+    if cached is not None and not _needs_fresh_attribution(
+        cached, requested, attribution_budget, attribute
+    ):
+        return replace(cached, from_cache=True)
+    if cached is not None:
+        report = cached
+        counted = False
+    else:
+        report, started = _count_lineups(
+            optimizer, plan=plan, cap=cap, budget_seconds=budget_seconds
+        )
+        counted = True
+    did_attribute = False
+    if attribute and _needs_attribution(report, requested) and not _attribution_covers(
+        report, attribution_budget
+    ):
+        base_elapsed = report.elapsed_seconds - report.attribution_seconds
+        attr_started = time.perf_counter()
+        report = _attribute_binding_rules(
+            optimizer,
+            report,
+            plan=plan,
+            cap=cap,
+            cache=cache,
+            attribution_budget=attribution_budget,
+        )
+        attr_elapsed = time.perf_counter() - attr_started
+        report = replace(
+            report,
+            attribution_seconds=attr_elapsed,
+            elapsed_seconds=max(0.0, base_elapsed) + attr_elapsed,
+            attribution_checked=True,
+            attribution_budget_used=None if attribution_budget is None else float(attribution_budget),
+        )
+        did_attribute = True
+    if cache is not None:
+        cache[key] = replace(report, from_cache=False)
+    if not counted and not did_attribute:
+        return replace(report, from_cache=True)
+    return replace(report, from_cache=False, cap=cap if counted else report.cap)
+
+
+def _count_lineups(optimizer, *, plan: SolvePlan, cap: int, budget_seconds: Optional[float]):
+    """Solve the count and restore the optimizer. Returns ``(report, started)``."""
     started = time.perf_counter()
     saved_limit = PuLPSolver.LP_SOLVER.timeLimit
     saved, exposures = _snapshot(optimizer)
@@ -342,26 +392,7 @@ def measure(
         optimizer.on_lineup_progress = callback
         begin_capacity_budget(None)
         PuLPSolver.LP_SOLVER.timeLimit = saved_limit
-    report = replace(report, elapsed_seconds=time.perf_counter() - started, cap=cap)
-    if attribute and _needs_attribution(report, requested):
-        attr_started = time.perf_counter()
-        report = _attribute_binding_rules(
-            optimizer,
-            report,
-            plan=plan,
-            cap=cap,
-            cache=cache,
-            attribution_budget=attribution_budget,
-        )
-        attr_elapsed = time.perf_counter() - attr_started
-        report = replace(
-            report,
-            attribution_seconds=attr_elapsed,
-            elapsed_seconds=report.elapsed_seconds + attr_elapsed,
-        )
-    if cache is not None:
-        cache[key] = report
-    return report
+    return replace(report, elapsed_seconds=time.perf_counter() - started, cap=cap), started
 
 
 def cross_lineup_rules_active(optimizer, plan: Optional[SolvePlan] = None) -> bool:
@@ -692,6 +723,36 @@ def _proved_ceiling(report: CapacityReport) -> Optional[int]:
     return None
 
 
+def _needs_fresh_attribution(
+    report: CapacityReport,
+    requested: int,
+    attribution_budget: Optional[float],
+    attribute: bool,
+) -> bool:
+    """True when this request still needs a binding-rule pass on a stored count."""
+    if not attribute or not _needs_attribution(report, requested):
+        return False
+    return not _attribution_covers(report, attribution_budget)
+
+
+def _attribution_covers(report: CapacityReport, attribution_budget: Optional[float]) -> bool:
+    """True when a stored check already answers this attribution budget.
+
+    A finished check is reused. A check that ran out of time is reused only
+    when the new budget is no larger than the one that ran out.
+    """
+    if not report.attribution_checked:
+        return False
+    if not report.binding_undetermined:
+        return True
+    used = report.attribution_budget_used
+    if attribution_budget is None:
+        return used is None
+    if used is None:
+        return True
+    return float(attribution_budget) <= float(used) + 1e-9
+
+
 def _needs_attribution(report: CapacityReport, requested: int) -> bool:
     """Low means a proved ceiling under M, or an exact count below the cap."""
     ceiling = _proved_ceiling(report)
@@ -869,7 +930,6 @@ def _cache_key(
     plan: SolvePlan,
     cap: int,
     budget_seconds: Optional[float],
-    attribution_budget: Optional[float],
     attribute: bool,
 ) -> str:
     payload = {
@@ -887,9 +947,6 @@ def _cache_key(
         "cap": int(cap),
         "budget": None if budget_seconds is None else round(float(budget_seconds), 3),
         "attribute": bool(attribute),
-        "attribution_budget": (
-            None if attribution_budget is None else round(float(attribution_budget), 3)
-        ),
     }
     encoded = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(encoded.encode()).hexdigest()

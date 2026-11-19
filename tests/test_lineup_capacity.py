@@ -46,6 +46,7 @@ import pandas as pd
 from pydfs_lineup_optimizer.solvers.pulp_solver import PuLPSolver
 
 from src.exporter import lineups_to_dk_upload_csv
+import src.lineup_capacity as lineup_capacity
 from src.lineup_capacity import (
     CapacityReport,
     format_capacity,
@@ -385,6 +386,61 @@ def test_zero_budget_does_not_invent_an_exact_count():
     text = format_capacity(report, 1)
     assert "time limit" in text
     assert "up to" not in text
+
+
+def test_larger_request_reuses_the_count_and_names_the_overlap_rule(monkeypatch):
+    """M=4 caches the ceiling. M=5 must name overlap without counting again.
+
+    The ceiling is 4, so attribution is skipped at M=4 and required at M=5.
+    The cache key does not include M. The second call still has to attribute.
+    """
+    calls = []
+    real_count = lineup_capacity._count_lineups
+
+    def _record(optimizer, **kwargs):
+        calls.append(optimizer.max_repeating_players)
+        return real_count(optimizer, **kwargs)
+
+    monkeypatch.setattr(lineup_capacity, "_count_lineups", _record)
+    optimizer = _overlap_optimizer(7)
+    cache: dict = {}
+    first = measure(optimizer, requested=4, budget_seconds=None, cache=cache)
+    assert first.exact is None
+    assert first.upper == 4
+    assert "Limited by:" not in format_capacity(first, 4)
+    assert calls == [7]
+
+    second = measure(optimizer, requested=5, budget_seconds=None, cache=cache)
+    assert "overlap/min-unique rule" in format_capacity(second, 5)
+    assert "overlap/min-unique rule" in format_warning(second, 5)
+    # The original count is not solved again. The only new solve clears overlap.
+    assert calls == [7, None]
+    assert second.from_cache is False
+
+    third = measure(optimizer, requested=5, budget_seconds=None, cache=cache)
+    assert third.from_cache is True
+    assert "overlap/min-unique rule" in format_capacity(third, 5)
+    assert calls == [7, None]
+
+
+def test_same_request_is_a_cache_hit_without_another_count(monkeypatch):
+    calls = []
+    real_count = lineup_capacity._count_lineups
+
+    def _record(optimizer, **kwargs):
+        calls.append(optimizer.max_repeating_players)
+        return real_count(optimizer, **kwargs)
+
+    monkeypatch.setattr(lineup_capacity, "_count_lineups", _record)
+    optimizer = _overlap_optimizer(7)
+    cache: dict = {}
+    first = measure(optimizer, requested=4, budget_seconds=None, cache=cache)
+    second = measure(optimizer, requested=4, budget_seconds=None, cache=cache)
+    assert second.from_cache is True
+    assert second.lower == first.lower
+    assert second.upper == first.upper
+    assert calls == [7]
+    assert "Limited by:" not in format_capacity(second, 4)
 
 
 def test_cache_repeats_a_proved_count_and_misses_a_different_pool():
