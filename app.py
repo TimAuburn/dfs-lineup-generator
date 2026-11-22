@@ -135,6 +135,7 @@ from src.player_pool import (
     projections_for_solve,
     set_captain,
     set_included,
+    set_locked,
     stamp_projection_baseline,
 )
 from src.sleeper import (
@@ -184,12 +185,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
-FORMAT_LABELS = {
-    ContestFormat.CLASSIC: "NFL Classic (9 Players)",
-    ContestFormat.SHOWDOWN: "NFL Showdown Captain Mode (6 Players)",
-}
-
 
 def _init_state() -> None:
     defaults = {
@@ -277,16 +272,6 @@ def _automatic_projection_key(frame: pd.DataFrame) -> str:
     return hashlib.sha1("\n".join(parts).encode()).hexdigest()[:12]
 
 
-def _on_format_change() -> None:
-    fmt = ContestFormat(st.session_state.contest_format)
-    presets = presets_for_format(fmt)
-    st.session_state.contest_preset = presets[0].value
-    st.session_state.player_pool = None
-    st.session_state.lineups = []
-    st.session_state.generated_run = None
-    st.session_state.error = None
-
-
 def _salary_upload_key(name: str, content: bytes) -> str:
     """One uploaded file. A new name or new bytes is a new auto-set."""
     digest = hashlib.sha256(content).hexdigest()
@@ -312,12 +297,10 @@ def _format_needs_autodetect(fmt: ContestFormat) -> bool:
 
 
 def _consume_detected_format() -> None:
-    """Apply a stashed salary format before the format widgets exist.
+    """Apply a stashed salary format before the preset widget exists.
 
-    The upload runs after those widgets, and Streamlit rejects a write to
-    ``contest_format`` once the radio is on the page. A later rerun of the
-    same file does not call this: the pending value is already gone, so a
-    manual choice is left alone.
+    The upload runs after the sidebar. A later rerun of the same file does
+    not call this: the pending value is already gone.
     """
     pending = st.session_state.pop("salary_format_pending", None)
     if not pending:
@@ -368,6 +351,17 @@ def _record_salary_upload(name: str, content: bytes) -> None:
     if found.contest_format is not None and _format_needs_autodetect(found.contest_format):
         st.session_state.salary_format_pending = found.contest_format.value
         st.rerun()
+
+
+def _format_status_caption() -> str:
+    """The active format. A salary file is the only way it changes."""
+    detected = (st.session_state.get("salary_detection") or {}).get("format")
+    from_file = bool(detected) or st.session_state.get("player_pool") is not None
+    if not from_file:
+        return "Format: detected when you upload a salary file"
+    fmt = ContestFormat(st.session_state.contest_format)
+    label = "Showdown" if fmt is ContestFormat.SHOWDOWN else "Classic"
+    return f"Format: {label} (from salary file)"
 
 
 def _render_salary_detection() -> None:
@@ -1713,20 +1707,11 @@ if view == "Historical archive":
 confirmed_qb_keys: List[Tuple[str, str]] | None = None
 
 # ---------------------------------------------------------------------------
-# Sidebar — format, preset, and editable overrides
+# Sidebar — preset and editable overrides. Format comes from the salary file.
 # ---------------------------------------------------------------------------
 vegas_editor_needs_rerun = False
 with st.sidebar:
-    st.markdown("### Contest Format")
-    st.radio(
-        "Contest Format",
-        options=[ContestFormat.CLASSIC.value, ContestFormat.SHOWDOWN.value],
-        format_func=lambda v: FORMAT_LABELS[ContestFormat(v)],
-        key="contest_format",
-        on_change=_on_format_change,
-        label_visibility="collapsed",
-    )
-
+    st.caption(_format_status_caption())
     contest_format = ContestFormat(st.session_state.contest_format)
     available_presets = presets_for_format(contest_format)
     if st.session_state.contest_preset not in {p.value for p in available_presets}:
@@ -2382,6 +2367,8 @@ if view == "Player pool":
     with st.container(horizontal=True):
         include_shown = st.button("Include shown", key="pool_include_shown")
         remove_shown = st.button("Remove shown", key="pool_remove_shown")
+        lock_shown = st.button("Lock shown", key="pool_lock_shown")
+        unlock_shown = st.button("Unlock shown", key="pool_unlock_shown")
         include_captain_shown = False
         remove_captain_shown = False
         if is_showdown:
@@ -2405,6 +2392,9 @@ if view == "Player pool":
         )
     if include_shown or remove_shown:
         st.session_state.player_pool = set_included(pool, visible_players, include_shown)
+        st.rerun()
+    if lock_shown or unlock_shown:
+        st.session_state.player_pool = set_locked(pool, visible_players, lock_shown)
         st.rerun()
     if include_captain_shown or remove_captain_shown:
         st.session_state.player_pool = set_captain(

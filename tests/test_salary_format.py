@@ -5,6 +5,7 @@ from __future__ import annotations
 from io import BytesIO, StringIO
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from src.parser import (
@@ -136,6 +137,11 @@ def _player_pool(timeout: float = 180):
 def _upload(app, name: str, content: bytes):
     app.run()
     assert not app.exception, app.exception
+    return _replace_file(app, name, content)
+
+
+def _replace_file(app, name: str, content: bytes):
+    """Attach a file and run once. No rerun of the file already on the page."""
     uploader = next(
         item for item in app.file_uploader if item.label == "DraftKings player pool CSV"
     )
@@ -147,6 +153,21 @@ def _upload(app, name: str, content: bytes):
 
 def _preset(app):
     return next(item for item in app.selectbox if item.label == "Contest Preset")
+
+
+def _captions(app) -> list[str]:
+    return [str(item.value) for item in app.caption]
+
+
+def _assert_no_format_radio(app) -> None:
+    assert all(item.label != "Contest Format" for item in app.radio)
+    assert all("Contest Format" not in str(item.value) for item in app.markdown)
+
+
+def _pool_ids(app) -> set[str]:
+    pool = app.session_state["player_pool"]
+    assert pool is not None
+    return set(pool["ID"].astype(str))
 
 
 def test_uploading_classic_autosets_classic_and_a_classic_preset():
@@ -191,26 +212,34 @@ def test_manual_override_survives_reruns_until_a_new_file_is_uploaded():
     assert not app.exception, app.exception
     assert app.session_state["contest_preset"] == ContestPreset.SHOWDOWN_GPP.value
     assert app.session_state["contest_format"] == ContestFormat.SHOWDOWN.value
-    assert "Detected: Showdown" in [item.value for item in app.caption]
+    assert "Detected: Showdown" in _captions(app)
+    _assert_no_format_radio(app)
 
-    radio = next(item for item in app.radio if item.label == "Contest Format")
-    radio.set_value(ContestFormat.CLASSIC.value)
-    app.run()
-    assert not app.exception, app.exception
+    # A file of the other format is what switches. The preset resets and the
+    # stored lineups are cleared, then a rerun leaves that choice in place.
+    app.session_state["lineups"] = [pd.DataFrame({"ID": ["1"]})]
+    app.session_state["generated_run"] = {"kept": True}
+    app = _replace_file(app, "mock_dk_salaries.csv", MOCK_CLASSIC.read_bytes())
     assert app.session_state["contest_format"] == ContestFormat.CLASSIC.value
+    assert app.session_state["contest_preset"] == ContestPreset.CLASSIC_CASH.value
+    assert app.session_state["lineups"] == []
+    assert app.session_state["generated_run"] is None
+    assert "1001" in _pool_ids(app)
+    assert "91001" not in _pool_ids(app)
+    assert "Detected: Classic" in _captions(app)
+    assert "Format: Classic (from salary file)" in _captions(app)
     app.run()
     assert not app.exception, app.exception
     assert app.session_state["contest_format"] == ContestFormat.CLASSIC.value
     assert app.session_state["contest_preset"] == ContestPreset.CLASSIC_CASH.value
 
-    app = _upload(app, "mock_dk_salaries.csv", MOCK_CLASSIC.read_bytes())
-    assert app.session_state["contest_format"] == ContestFormat.CLASSIC.value
-    assert "Detected: Classic" in [item.value for item in app.caption]
-
     app = _upload(app, "mock_dk_showdown.csv", MOCK_SHOWDOWN.read_bytes())
     assert app.session_state["contest_format"] == ContestFormat.SHOWDOWN.value
     assert app.session_state["contest_preset"] == ContestPreset.SHOWDOWN_CASH.value
-    assert "Detected: Showdown" in [item.value for item in app.caption]
+    assert "91001" in _pool_ids(app)
+    assert "1001" not in _pool_ids(app)
+    assert "Detected: Showdown" in _captions(app)
+    assert "Format: Showdown (from salary file)" in _captions(app)
 
 
 def test_mixed_upload_warns_and_leaves_format_and_preset_unchanged():
@@ -233,6 +262,74 @@ def test_mixed_upload_warns_and_leaves_format_and_preset_unchanged():
     options = list(_preset(app).options)
     assert PRESET_LABELS[ContestPreset.CLASSIC_CASH] not in options
     assert PRESET_LABELS[ContestPreset.SHOWDOWN_GPP] in options
+
+
+def test_format_radio_is_gone_and_format_follows_the_uploaded_file():
+    """No format radio. Classic, then Showdown, then Classic again, then a rejection."""
+    app = _player_pool()
+    app.run()
+    assert not app.exception, app.exception
+    _assert_no_format_radio(app)
+    assert app.session_state["contest_format"] == ContestFormat.CLASSIC.value
+    assert "Format: detected when you upload a salary file" in _captions(app)
+    assert "Format: Classic (from salary file)" not in _captions(app)
+
+    app = _upload(app, "mock_dk_salaries.csv", MOCK_CLASSIC.read_bytes())
+    _assert_no_format_radio(app)
+    assert app.session_state["contest_format"] == ContestFormat.CLASSIC.value
+    assert app.session_state["contest_preset"] == ContestPreset.CLASSIC_SMALL_GPP.value
+    assert "1001" in _pool_ids(app)
+    assert "Format: Classic (from salary file)" in _captions(app)
+    classic_options = list(_preset(app).options)
+    assert PRESET_LABELS[ContestPreset.SHOWDOWN_CASH] not in classic_options
+    assert PRESET_LABELS[ContestPreset.CLASSIC_CASH] in classic_options
+
+    app.session_state["lineups"] = [pd.DataFrame({"ID": ["1"]})]
+    app.session_state["generated_run"] = {"kept": True}
+    app = _replace_file(app, "mock_dk_showdown.csv", MOCK_SHOWDOWN.read_bytes())
+    _assert_no_format_radio(app)
+    assert app.session_state["contest_format"] == ContestFormat.SHOWDOWN.value
+    assert app.session_state["contest_preset"] == ContestPreset.SHOWDOWN_CASH.value
+    assert app.session_state["lineups"] == []
+    assert app.session_state["generated_run"] is None
+    assert "91001" in _pool_ids(app)
+    assert "1001" not in _pool_ids(app)
+    assert "Format: Showdown (from salary file)" in _captions(app)
+    showdown_options = list(_preset(app).options)
+    assert PRESET_LABELS[ContestPreset.CLASSIC_CASH] not in showdown_options
+    assert PRESET_LABELS[ContestPreset.SHOWDOWN_GPP] in showdown_options
+
+    app = _upload(app, "mock_dk_salaries.csv", MOCK_CLASSIC.read_bytes())
+    assert app.session_state["contest_format"] == ContestFormat.CLASSIC.value
+    assert app.session_state["contest_preset"] == ContestPreset.CLASSIC_CASH.value
+    assert "1001" in _pool_ids(app)
+    assert "91001" not in _pool_ids(app)
+    assert "Format: Classic (from salary file)" in _captions(app)
+
+    kept_preset = app.session_state["contest_preset"]
+    app.session_state["lineups"] = [pd.DataFrame({"ID": ["9"]})]
+    app.session_state["generated_run"] = {"kept": True}
+    mixed = _csv(
+        _row("QB", "Patrick Mahomes", "1001", "QB", 7200),
+        _row("QB", "Josh Allen", "91003", "CPT", 17400),
+        _row("QB", "Josh Allen", "91004", "FLEX", 11600),
+    )
+    app = _replace_file(app, "mixed.csv", mixed)
+    _assert_no_format_radio(app)
+    assert app.session_state["contest_format"] == ContestFormat.CLASSIC.value
+    assert app.session_state["contest_preset"] == kept_preset
+    assert app.session_state["lineups"]
+    assert app.session_state["generated_run"] == {"kept": True}
+    assert "1001" in _pool_ids(app)
+    warnings = [item.value for item in app.warning]
+    assert any("mixes" in value and "left unchanged" in value for value in warnings)
+    assert "Format: Classic (from salary file)" in _captions(app)
+    app.run()
+    assert not app.exception, app.exception
+    assert app.session_state["contest_format"] == ContestFormat.CLASSIC.value
+    assert app.session_state["contest_preset"] == kept_preset
+    assert "1001" in _pool_ids(app)
+    assert "Format: Classic (from salary file)" in _captions(app)
 
 
 def test_same_format_upload_keeps_a_preset_that_already_fits():
