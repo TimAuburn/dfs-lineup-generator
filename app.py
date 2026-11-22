@@ -135,6 +135,7 @@ from src.player_pool import (
     projections_for_solve,
     set_captain,
     set_included,
+    set_locked,
     stamp_projection_baseline,
 )
 from src.sleeper import (
@@ -2382,6 +2383,8 @@ if view == "Player pool":
     with st.container(horizontal=True):
         include_shown = st.button("Include shown", key="pool_include_shown")
         remove_shown = st.button("Remove shown", key="pool_remove_shown")
+        lock_shown = st.button("Lock shown", key="pool_lock_shown")
+        unlock_shown = st.button("Unlock shown", key="pool_unlock_shown")
         include_captain_shown = False
         remove_captain_shown = False
         if is_showdown:
@@ -2405,6 +2408,9 @@ if view == "Player pool":
         )
     if include_shown or remove_shown:
         st.session_state.player_pool = set_included(pool, visible_players, include_shown)
+        st.rerun()
+    if lock_shown or unlock_shown:
+        st.session_state.player_pool = set_locked(pool, visible_players, lock_shown)
         st.rerun()
     if include_captain_shown or remove_captain_shown:
         st.session_state.player_pool = set_captain(

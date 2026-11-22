@@ -341,6 +341,19 @@ def set_included(pool: pd.DataFrame, shown: pd.DataFrame, included: bool) -> pd.
     return _set_player_flag(pool, shown, "Include", included, default=True)
 
 
+def set_locked(pool: pd.DataFrame, shown: pd.DataFrame, locked: bool) -> pd.DataFrame:
+    """Set Lock on every salary row for the players in ``shown``.
+
+    Locking also checks Include. ``generation_pool`` drops an excluded player
+    before ``locked_player_ids`` runs, so a lock on an unchecked row never
+    reaches the solver. Unlocking leaves Include as it is.
+    """
+    updated = _set_player_flag(pool, shown, "Lock", locked, default=False)
+    if locked:
+        updated = set_included(updated, shown, True)
+    return updated
+
+
 def set_captain(pool: pd.DataFrame, shown: pd.DataFrame, captain: bool) -> pd.DataFrame:
     """Set Captain on every salary row for the players in ``shown``."""
     return _set_player_flag(pool, shown, "Captain", captain, default=True)

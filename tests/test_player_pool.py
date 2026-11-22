@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 from src.optimizer import get_nfl_optimizer
+from src.presets import ContestFormat, ContestPreset, apply_preset
 from src.player_pool import (
     apply_pool_edits,
     clear_projection_overrides,
@@ -22,8 +23,8 @@ from src.player_pool import (
     set_captain,
     stamp_projection_baseline,
     set_included,
+    set_locked,
 )
-from src.presets import ContestFormat
 
 
 def _showdown_pool() -> pd.DataFrame:
@@ -189,6 +190,8 @@ def test_showdown_editor_renders_one_row_and_a_captain_column():
     button_labels = [item.label for item in at.button]
     assert "Include shown" in button_labels
     assert "Remove shown" in button_labels
+    assert button_labels.index("Lock shown") == button_labels.index("Remove shown") + 1
+    assert button_labels.index("Unlock shown") == button_labels.index("Lock shown") + 1
     assert "Include captain shown" in button_labels
     assert "Remove captain shown" in button_labels
     assert "Clear filters" in button_labels
@@ -957,3 +960,234 @@ def test_scoring_version_upgrade_clears_old_baselines_and_lineups():
     assert state["lineups"] == []
     assert state["generated_run"] is None
     assert state["sleeper_summary"] is None
+
+
+def _flag_rows(pool: pd.DataFrame, name: str) -> pd.DataFrame:
+    return pool.loc[pool["Name"].astype(str).eq(name)]
+
+
+def _punt_pool() -> pd.DataFrame:
+    """Detroit cash slate plus a $4,000 receiver the salary floor would drop.
+
+    Punt Receiver starts excluded. Gibbs is excluded and locked, and Worthy is
+    included and locked. A name filter for the punt leaves both of those hidden.
+    """
+    pool = _clean_det_pool()
+    game = "MIN@DET 11/08/2026 01:00PM ET"
+    extra = pd.DataFrame(
+        [
+            {
+                "ID": "99",
+                "Name": "Punt Receiver",
+                "Position": "WR",
+                "TeamAbbrev": "DET",
+                "Salary": 4000,
+                "AvgPointsPerGame": 0.5,
+                "Projection": 0.5,
+                "Game Info": game,
+            }
+        ]
+    )
+    pool = pd.concat([pool, extra], ignore_index=True)
+    pool["Include"] = True
+    pool["Lock"] = False
+    pool.loc[pool["Name"].eq("Punt Receiver"), "Include"] = False
+    pool.loc[pool["Name"].eq("Jahmyr Gibbs"), ["Include", "Lock"]] = [False, True]
+    pool.loc[pool["Name"].eq("Xavier Worthy"), "Lock"] = True
+    return pool
+
+
+def _solve_cash(pool: pd.DataFrame, n: int):
+    eligible = generation_pool(pool, showdown=False)
+    optimizer = get_nfl_optimizer(ContestFormat.CLASSIC)
+    optimizer.load_from_dataframe(eligible)
+    apply_preset(optimizer, ContestPreset.CLASSIC_CASH, jitter_seed=42)
+    optimizer.set_lineup_count(n)
+    optimizer.set_locked_players(locked_player_ids(eligible, showdown=False))
+    return optimizer.generate_lineups()
+
+
+def _lineup_names(lineup: pd.DataFrame) -> set[str]:
+    return {str(name).strip() for name in lineup["Name"]}
+
+
+def test_lock_shown_includes_only_the_filtered_rows():
+    pool = _punt_pool()
+    editor = collapse_for_editor(pool, showdown=False)
+    shown = editor.loc[editor["Name"].eq("Punt Receiver")]
+    assert list(shown["Include"]) == [False]
+    assert list(shown["Lock"]) == [False]
+
+    locked = set_locked(pool, shown, True)
+    punt = _flag_rows(locked, "Punt Receiver")
+    assert list(punt["Include"]) == [True]
+    assert list(punt["Lock"]) == [True]
+    gibbs = _flag_rows(locked, "Jahmyr Gibbs")
+    assert list(gibbs["Include"]) == [False]
+    assert list(gibbs["Lock"]) == [True]
+    worthy = _flag_rows(locked, "Xavier Worthy")
+    assert list(worthy["Include"]) == [True]
+    assert list(worthy["Lock"]) == [True]
+    assert list(locked["Projection"]) == list(pool["Projection"])
+
+    untouched = set_locked(pool, shown.iloc[0:0], True)
+    assert list(untouched["Include"]) == list(pool["Include"])
+    assert list(untouched["Lock"]) == list(pool["Lock"])
+
+
+def test_unlock_shown_clears_only_the_filtered_locks_and_keeps_include():
+    pool = _punt_pool()
+    editor = collapse_for_editor(pool, showdown=False)
+    shown = editor.loc[editor["Name"].eq("Punt Receiver")]
+    locked = set_locked(pool, shown, True)
+    unlocked = set_locked(locked, shown, False)
+
+    punt = _flag_rows(unlocked, "Punt Receiver")
+    assert list(punt["Lock"]) == [False]
+    assert list(punt["Include"]) == [True]
+    gibbs = _flag_rows(unlocked, "Jahmyr Gibbs")
+    assert list(gibbs["Include"]) == [False]
+    assert list(gibbs["Lock"]) == [True]
+    worthy = _flag_rows(unlocked, "Xavier Worthy")
+    assert list(worthy["Lock"]) == [True]
+    assert list(worthy["Include"]) == [True]
+
+
+def test_showdown_lock_shown_writes_captain_and_flex_and_skips_hidden_players():
+    pool = _showdown_pool()
+    pool["Include"] = [False, False, True, True]
+    pool["Lock"] = [False, False, True, True]
+    pool["Captain"] = [True, True, False, False]
+    editor = collapse_for_editor(pool, showdown=True)
+    shown = editor.loc[editor["Name"].eq("Josh Allen")]
+    locked = set_locked(pool, shown, True)
+
+    allen = _flag_rows(locked, "Josh Allen")
+    diggs = _flag_rows(locked, "Stefon Diggs")
+    assert list(allen["Include"]) == [True, True]
+    assert list(allen["Lock"]) == [True, True]
+    assert list(allen["Captain"]) == [True, True]
+    assert list(diggs["Include"]) == [True, True]
+    assert list(diggs["Lock"]) == [True, True]
+    assert list(diggs["Captain"]) == [False, False]
+    eligible = generation_pool(locked, showdown=True)
+    assert locked_player_ids(eligible, showdown=True) == ["2", "4"]
+
+    unlocked = set_locked(locked, shown, False)
+    allen = _flag_rows(unlocked, "Josh Allen")
+    diggs = _flag_rows(unlocked, "Stefon Diggs")
+    assert list(allen["Lock"]) == [False, False]
+    assert list(allen["Include"]) == [True, True]
+    assert list(diggs["Lock"]) == [True, True]
+    assert locked_player_ids(generation_pool(unlocked, showdown=True), showdown=True) == ["4"]
+
+
+def test_lock_shown_puts_that_player_in_every_lineup_and_the_floor_drops_an_unlock():
+    """A $4,000 receiver is under the cash floor unless Lock shown checks Include and Lock."""
+    pool = _punt_pool()
+    editor = collapse_for_editor(pool, showdown=False)
+    shown = editor.loc[editor["Name"].eq("Punt Receiver")]
+    locked = set_locked(pool, shown, True)
+    lineups = _solve_cash(locked, 3)
+    assert len(lineups) >= 2
+    for lineup in lineups:
+        names = _lineup_names(lineup)
+        assert "Punt Receiver" in names
+        assert "Xavier Worthy" in names
+        assert "Jahmyr Gibbs" not in names
+
+    unlocked = set_locked(locked, shown, False)
+    free = _solve_cash(unlocked, 1)
+    assert "Punt Receiver" not in _lineup_names(free[0])
+    assert "Xavier Worthy" in _lineup_names(free[0])
+
+
+def _pool_flags(pool: pd.DataFrame) -> dict[str, tuple[bool, bool]]:
+    found = {}
+    for name in ("Punt Receiver", "Jahmyr Gibbs", "Xavier Worthy"):
+        rows = _flag_rows(pool, name)
+        found[name] = (bool(rows["Include"].iloc[0]), bool(rows["Lock"].iloc[0]))
+    return found
+
+
+def test_lock_and_unlock_shown_survive_rerun_preset_change_and_generate():
+    """The buttons use the filtered editor rows. Reset still leaves locks alone."""
+    app_test = pytest.importorskip("streamlit.testing.v1")
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    at = app_test.AppTest.from_file(str(app_path))
+    _open_pool(at, _punt_pool(), _det_lines(50.0, -10.0), name_query="Punt Receiver")
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+
+    editor = _player_editor(at)
+    assert list(editor.value["Name"]) == ["Punt Receiver"]
+    labels = [item.label for item in at.button]
+    assert labels.index("Lock shown") == labels.index("Remove shown") + 1
+    assert labels.index("Unlock shown") == labels.index("Lock shown") + 1
+
+    next(item for item in at.button if item.label == "Lock shown").click()
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    assert _pool_flags(at.session_state["player_pool"]) == {
+        "Punt Receiver": (True, True),
+        "Jahmyr Gibbs": (False, True),
+        "Xavier Worthy": (True, True),
+    }
+    editor = _player_editor(at)
+    assert bool(editor.value["Lock"].iloc[0]) is True
+    assert bool(editor.value["Include"].iloc[0]) is True
+
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    assert _pool_flags(at.session_state["player_pool"])["Punt Receiver"] == (True, True)
+
+    at.session_state["contest_preset"] = "classic_small_gpp"
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    assert _pool_flags(at.session_state["player_pool"]) == {
+        "Punt Receiver": (True, True),
+        "Jahmyr Gibbs": (False, True),
+        "Xavier Worthy": (True, True),
+    }
+
+    at.session_state["contest_preset"] = "classic_cash"
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    next(item for item in at.button if item.label == "Reset to automatic").click()
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    assert _pool_flags(at.session_state["player_pool"])["Punt Receiver"] == (True, True)
+
+    next(item for item in at.button if item.label == "Unlock shown").click()
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    assert _pool_flags(at.session_state["player_pool"]) == {
+        "Punt Receiver": (True, False),
+        "Jahmyr Gibbs": (False, True),
+        "Xavier Worthy": (True, True),
+    }
+    editor = _player_editor(at)
+    assert list(editor.value["Name"]) == ["Punt Receiver"]
+    assert bool(editor.value["Lock"].iloc[0]) is False
+    assert bool(editor.value["Include"].iloc[0]) is True
+
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    assert _pool_flags(at.session_state["player_pool"])["Punt Receiver"] == (True, False)
+
+    next(item for item in at.button if item.label == "Lock shown").click()
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    at.session_state["app_view"] = "Optimizer"
+    at.run(timeout=90)
+    assert not at.exception, at.exception
+    next(item for item in at.button if item.label == "Generate Lineups").click()
+    at.run(timeout=120)
+    assert not at.exception, at.exception
+    lineups = list(at.session_state["lineups"] or [])
+    assert lineups
+    for lineup in lineups:
+        names = _lineup_names(lineup)
+        assert "Punt Receiver" in names
+        assert "Xavier Worthy" in names
+        assert "Jahmyr Gibbs" not in names
