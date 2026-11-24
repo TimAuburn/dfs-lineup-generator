@@ -14,7 +14,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -96,7 +97,12 @@ def run_harvest(
 
 
 def download_standings(contest_id: str, cookie: str) -> bytes:
-    """Download one contest export. The cookie is sent and never logged."""
+    """Download one contest export. The cookie is sent and never logged.
+
+    DraftKings redirects the export to a presigned S3 URL. urllib would
+    forward Cookie on that hop, which leaks the session and is rejected
+    once the header block exceeds 8 KB.
+    """
     request = Request(
         EXPORT_URL.format(contest_id=str(contest_id).strip()),
         headers={
@@ -105,8 +111,40 @@ def download_standings(contest_id: str, cookie: str) -> bytes:
             "Cookie": _cookie_value(cookie),
         },
     )
-    with urlopen(request, timeout=60) as response:
+    opener = build_opener(_DraftKingsRedirectHandler)
+    with opener.open(request, timeout=60) as response:
         return response.read()
+
+
+def _is_draftkings_https(url: str) -> bool:
+    """True when the resolved URL is HTTPS on draftkings.com."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    return (parsed.scheme or "").lower() == "https" and (
+        host == "draftkings.com" or host.endswith(".draftkings.com")
+    )
+
+
+def _strip_cookie(request: Request) -> None:
+    """Remove Cookie from both header maps, whatever the key's case is."""
+    for header_map in (request.headers, request.unredirected_hdrs):
+        for name in [name for name in header_map if name.lower() == "cookie"]:
+            del header_map[name]
+
+
+class _DraftKingsRedirectHandler(HTTPRedirectHandler):
+    """Keep Cookie on DraftKings HTTPS redirects and drop it on every other hop.
+
+    ``HTTPRedirectHandler.redirect_request`` copies ``req.headers`` onto the
+    next ``Request`` and does not copy ``unredirected_hdrs``. Each hop repeats
+    that copy, so a Cookie left in ``headers`` follows the whole chain.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None and not _is_draftkings_https(redirected.full_url):
+            _strip_cookie(redirected)
+        return redirected
 
 
 def _monitored_contests(db_path: Path) -> list[tuple[str, str]]:

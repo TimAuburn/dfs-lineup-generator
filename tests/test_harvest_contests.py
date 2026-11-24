@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import importlib.util
+import io
+import urllib.request
+from email.message import Message
 from pathlib import Path
+from urllib.request import Request
 
 import pandas as pd
+import pytest
 
 from src.database import connect, get_recent_slates, save_contest, search_player_performance
 
@@ -172,3 +177,241 @@ def test_missing_cookie_exits_with_a_log_line(tmp_path):
     code = harvest.run_harvest(tmp_path / "dfs.db", log_path, "")
     assert code == 1
     assert "DK_COOKIE is missing." in log_path.read_text(encoding="utf-8")
+
+
+# Larger than the 8,192-byte request-header limit S3 enforces, and larger
+# than the 9 KB bar for this fix. The value is fake and must never be logged.
+_LARGE_COOKIE = "session=" + ("a" * 10_000)
+_PAYLOAD = b"Rank,EntryId,EntryName\n1,100,Alpha\n"
+_CONTEST_ID = "99"
+
+
+class _ScriptedBody(io.BytesIO):
+    def __init__(self, code: int, headers: Message, body: bytes):
+        super().__init__(body)
+        self.code = code
+        self.msg = "OK" if 200 <= code < 300 else "Found"
+        self._headers = headers
+
+    def info(self):
+        return self._headers
+
+
+def _cookie_items(request: Request) -> list[tuple[str, str]]:
+    found = []
+    for header_map in (request.headers, request.unredirected_hdrs):
+        for name, value in header_map.items():
+            if name.lower() == "cookie":
+                found.append((name, value))
+    return found
+
+
+def _assert_cookie_absent(request: Request, cookie: str) -> None:
+    assert _cookie_items(request) == []
+    for header_map in (request.headers, request.unredirected_hdrs):
+        for value in header_map.values():
+            assert cookie not in value
+
+
+def _redirect(location: str):
+    def factory():
+        headers = Message()
+        headers["Location"] = location
+        return _ScriptedBody(302, headers, b"")
+
+    return factory
+
+
+def _payload(body: bytes = _PAYLOAD):
+    def factory():
+        return _ScriptedBody(200, Message(), body)
+
+    return factory
+
+
+def _follow(monkeypatch, cookie: str, routes: dict):
+    seen: list[Request] = []
+
+    def open_request(self, req):
+        seen.append(req)
+        factory = routes.get(req.full_url)
+        if factory is None:
+            raise AssertionError(f"unexpected redirect target {req.full_url}")
+        return factory()
+
+    monkeypatch.setattr(urllib.request.HTTPSHandler, "https_open", open_request)
+    monkeypatch.setattr(urllib.request.HTTPHandler, "http_open", open_request)
+    monkeypatch.setattr(urllib.request, "getproxies", lambda: {})
+    body = harvest.download_standings(_CONTEST_ID, cookie)
+    return body, seen
+
+
+def _export_url() -> str:
+    return harvest.EXPORT_URL.format(contest_id=_CONTEST_ID)
+
+
+def test_s3_redirect_strips_a_large_cookie_and_returns_the_file(monkeypatch, capsys):
+    assert len(_LARGE_COOKIE.encode("ascii")) > 9 * 1024
+    export_url = _export_url()
+    s3_url = (
+        "https://s3.amazonaws.com/dk-exports/99.csv"
+        "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc"
+    )
+    body, seen = _follow(
+        monkeypatch,
+        _LARGE_COOKIE,
+        {export_url: _redirect(s3_url), s3_url: _payload()},
+    )
+    assert body == _PAYLOAD
+    assert [req.full_url for req in seen] == [export_url, s3_url]
+    assert _cookie_items(seen[0]) == [("Cookie", _LARGE_COOKIE)]
+    _assert_cookie_absent(seen[1], _LARGE_COOKIE)
+    captured = capsys.readouterr()
+    assert _LARGE_COOKIE not in captured.out
+    assert _LARGE_COOKIE not in captured.err
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "https://api.draftkings.com/standings.csv",
+        "https://draftkings.com/standings.csv",
+        "https://WWW.DraftKings.COM/standings.csv",
+        "https://stats.draftkings.com:443/standings.csv",
+    ],
+)
+def test_draftkings_https_redirect_keeps_the_cookie(monkeypatch, location):
+    export_url = _export_url()
+    body, seen = _follow(
+        monkeypatch,
+        _LARGE_COOKIE,
+        {export_url: _redirect(location), location: _payload()},
+    )
+    assert body == _PAYLOAD
+    assert _cookie_items(seen[0]) == [("Cookie", _LARGE_COOKIE)]
+    assert _cookie_items(seen[1]) == [("Cookie", _LARGE_COOKIE)]
+
+
+def test_http_downgrade_strips_the_cookie(monkeypatch):
+    export_url = _export_url()
+    downgraded = "http://www.draftkings.com/standings.csv"
+    body, seen = _follow(
+        monkeypatch,
+        _LARGE_COOKIE,
+        {export_url: _redirect("HTTP://www.draftkings.com/standings.csv"), downgraded: _payload()},
+    )
+    assert body == _PAYLOAD
+    assert seen[1].full_url == downgraded
+    assert _cookie_items(seen[0]) == [("Cookie", _LARGE_COOKIE)]
+    _assert_cookie_absent(seen[1], _LARGE_COOKIE)
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "https://evil-draftkings.com/standings.csv",
+        "https://notdraftkings.com/standings.csv",
+        "https://draftkings.com.attacker.test/standings.csv",
+    ],
+)
+def test_lookalike_host_strips_the_cookie(monkeypatch, location):
+    export_url = _export_url()
+    body, seen = _follow(
+        monkeypatch,
+        _LARGE_COOKIE,
+        {export_url: _redirect(location), location: _payload()},
+    )
+    assert body == _PAYLOAD
+    assert seen[1].full_url == location
+    _assert_cookie_absent(seen[1], _LARGE_COOKIE)
+
+
+def test_same_domain_hop_keeps_cookie_until_s3(monkeypatch):
+    export_url = _export_url()
+    api_url = "https://api.draftkings.com/contest/exportfullstandingscsv/99"
+    s3_url = "https://s3.amazonaws.com/dk-exports/99.csv"
+    body, seen = _follow(
+        monkeypatch,
+        _LARGE_COOKIE,
+        {
+            export_url: _redirect(api_url),
+            api_url: _redirect(s3_url),
+            s3_url: _payload(),
+        },
+    )
+    assert body == _PAYLOAD
+    assert [req.full_url for req in seen] == [export_url, api_url, s3_url]
+    assert _cookie_items(seen[0]) == [("Cookie", _LARGE_COOKIE)]
+    assert _cookie_items(seen[1]) == [("Cookie", _LARGE_COOKIE)]
+    _assert_cookie_absent(seen[2], _LARGE_COOKIE)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "https://",
+        "https:///standings.csv",
+        "ftp://files.draftkings.com/standings.csv",
+    ],
+)
+def test_redirect_request_strips_a_missing_host_or_non_https_scheme(target):
+    handler = harvest._DraftKingsRedirectHandler()
+    source = Request(
+        _export_url(),
+        headers={"Cookie": _LARGE_COOKIE, "Accept": "text/csv"},
+    )
+    redirected = handler.redirect_request(source, None, 302, "Found", {}, target)
+    assert redirected is not None
+    _assert_cookie_absent(redirected, _LARGE_COOKIE)
+    assert redirected.headers["Accept"] == "text/csv"
+
+
+def test_external_redirect_strips_mixed_case_cookie_from_both_maps(monkeypatch):
+    """Plant both header maps. urllib would only forward ``headers``."""
+    planted = Request("https://s3.amazonaws.com/bucket/standings.csv")
+    planted.headers["Cookie"] = "session=headers"
+    planted.headers["COOKIE"] = "session=HEADERS"
+    planted.unredirected_hdrs["cookie"] = "session=unredirected"
+    planted.unredirected_hdrs["CoOkIe"] = "session=UNREDIRECTED"
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return planted
+
+    monkeypatch.setattr(urllib.request.HTTPRedirectHandler, "redirect_request", redirect_request)
+    handler = harvest._DraftKingsRedirectHandler()
+    source = Request(_export_url(), headers={"Cookie": "session=original"})
+    redirected = handler.redirect_request(
+        source,
+        None,
+        302,
+        "Found",
+        {},
+        planted.full_url,
+    )
+    assert redirected is planted
+    assert _cookie_items(redirected) == []
+
+
+def test_draftkings_redirect_keeps_mixed_case_cookie_on_both_maps(monkeypatch):
+    planted = Request("https://api.draftkings.com/standings.csv")
+    planted.headers["COOKIE"] = "session=headers"
+    planted.unredirected_hdrs["CoOkIe"] = "session=unredirected"
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return planted
+
+    monkeypatch.setattr(urllib.request.HTTPRedirectHandler, "redirect_request", redirect_request)
+    handler = harvest._DraftKingsRedirectHandler()
+    source = Request(_export_url(), headers={"Cookie": "session=original"})
+    redirected = handler.redirect_request(
+        source,
+        None,
+        302,
+        "Found",
+        {},
+        planted.full_url,
+    )
+    assert _cookie_items(redirected) == [
+        ("COOKIE", "session=headers"),
+        ("CoOkIe", "session=unredirected"),
+    ]
