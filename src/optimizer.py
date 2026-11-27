@@ -80,7 +80,12 @@ from .showdown_rules import (
     shortfall_message,
     slate_salary_cap,
     team_minimum_fit_cause,
+    team_split_block_message,
     team_split_cause,
+    team_split_supply_cause,
+    AllowedTeamSplitsRule,
+    canonical_team_splits,
+    stored_team_split,
 )
 from .presets import ContestFormat
 
@@ -2533,8 +2538,9 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         self.confirmed_quarterbacks: Optional[set[Tuple[str, str]]] = None
         # 1 blocks both teams' quarterbacks in one lineup. None leaves the count open.
         self.max_quarterbacks: Optional[int] = None
-        # (high, low) player counts that add up to the six-man roster. None is any split.
-        self.team_split: Optional[Tuple[int, int]] = None
+        # None, one (high, low) pair, or several pairs. One saved pair stays a
+        # pair. Several pairs are an OR: each lineup matches any one of them.
+        self.team_split: Optional[Tuple] = None
         # Team that receives ``high``. None lets either team take that side.
         self.team_split_team: Optional[str] = None
         # Cash tries to roster both starting QBs and both starting RBs.
@@ -2566,7 +2572,7 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         below_salary_threshold: Optional[int] = None,
         max_rbs_per_team: Optional[int] = None,
         max_quarterbacks: Optional[int] = None,
-        team_split: Optional[Tuple[int, int]] = None,
+        team_split: object = None,
         team_split_team: Optional[str] = None,
         require_starting_core: bool = False,
         ban_k_dst_captain: bool = False,
@@ -2593,19 +2599,8 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             raise ValueError("max_rbs_per_team must be at least 0")
         if max_quarterbacks is not None and int(max_quarterbacks) < 1:
             raise ValueError("max_quarterbacks must be at least 1")
-        parsed_split: Optional[Tuple[int, int]] = None
-        if team_split is not None:
-            high, low = int(team_split[0]), int(team_split[1])
-            roster = len(SHOWDOWN_ROSTER_SLOTS)
-            if high < low or low < 0 or high + low != roster:
-                raise ValueError(
-                    f"team split must be two counts that add up to {roster}, larger first"
-                )
-            if high > 5:
-                raise ValueError(
-                    "DraftKings Showdown allows at most 5 players from one team"
-                )
-            parsed_split = (high, low)
+        # None, one pair, or several pairs. A saved (4, 2) stays (4, 2).
+        parsed_split = stored_team_split(team_split)
         if min_players_per_team_enabled and not (
             MIN_PLAYERS_PER_TEAM_MIN <= int(min_players_per_team) <= MIN_PLAYERS_PER_TEAM_MAX
         ):
@@ -3055,11 +3050,15 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         return labels
 
     def _apply_team_split(self, optimizer, players: List[Player]) -> None:
-        """Force a 5-1, 4-2, or 3-3 construction on a two-team slate."""
-        split = self.team_split
-        if split is None:
+        """Force a 5-1, 4-2, or 3-3 construction on a two-team slate.
+
+        One split uses the same constraint as before. Several splits are an
+        OR: the lineup matches any selected split, and the objective still
+        picks the higher projection. Lineups are not spread across the splits.
+        """
+        splits = canonical_team_splits(self.team_split)
+        if not splits:
             return
-        high, low = split
         labels = self._showdown_teams(players)
         if len(labels) != 2:
             found = ", ".join(sorted(labels)) or "none"
@@ -3068,20 +3067,29 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
                 f"This pool has: {found}."
             )
         ordered = [labels[key] for key in sorted(labels)]
-        if high == low or self.team_split_team:
-            if self.team_split_team and high != low:
-                if self.team_split_team not in labels:
-                    raise RuntimeError(
-                        f"{self.team_split_team} is not on this Showdown slate."
-                    )
-                heavy = labels[self.team_split_team]
-                other = next(team for team in ordered if team != heavy)
-            else:
-                heavy, other = ordered
-            optimizer.set_players_from_one_team({heavy: high, other: low})
+        uneven = any(high != low for high, low in splits)
+        heavy_label = None
+        if self.team_split_team and uneven:
+            if self.team_split_team not in labels:
+                raise RuntimeError(
+                    f"{self.team_split_team} is not on this Showdown slate."
+                )
+            heavy_label = labels[self.team_split_team]
+        if len(splits) == 1:
+            high, low = splits[0]
+            if high == low or heavy_label:
+                if heavy_label and high != low:
+                    heavy = heavy_label
+                    other = next(team for team in ordered if team != heavy)
+                else:
+                    heavy, other = ordered
+                optimizer.set_players_from_one_team({heavy: high, other: low})
+                return
+            optimizer._showdown_either_split = (ordered[0], high, low)
+            optimizer.add_new_rule(_EitherTeamSplitRule)
             return
-        optimizer._showdown_either_split = (ordered[0], high, low)
-        optimizer.add_new_rule(_EitherTeamSplitRule)
+        optimizer._showdown_allowed_splits = (ordered[0], splits, heavy_label)
+        optimizer.add_new_rule(AllowedTeamSplitsRule)
 
     def _apply_dst_limit(self, optimizer, players: List[Player]) -> None:
         """Keep CPT and FLEX to at most ``max_dst`` defenses combined."""
@@ -3177,6 +3185,23 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             max_unused=int(self.max_unused_salary),
         )
 
+    def _team_split_block_cause(self, players: List[Player]) -> Optional[str]:
+        """Name the split when dropping it is what makes a lineup feasible."""
+        if not canonical_team_splits(self.team_split):
+            return None
+        saved_split = self.team_split
+        saved_team = self.team_split_team
+        try:
+            self.team_split = None
+            self.team_split_team = None
+            opens = self._can_reach(players, 1, [])
+        finally:
+            self.team_split = saved_split
+            self.team_split_team = saved_team
+        if not opens:
+            return None
+        return team_split_block_message(saved_split, saved_team)
+
     def _showdown_pre_solve_cause(self) -> Optional[str]:
         """A rule that cannot be built, named before the solver runs."""
         if self.ban_k_dst_captain:
@@ -3198,6 +3223,13 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             supply = roster_supply_cause(self._player_df, int(self.min_players_per_team))
             if supply:
                 return supply
+        split_supply = team_split_supply_cause(
+            self._player_df,
+            self.team_split,
+            self.team_split_team,
+        )
+        if split_supply:
+            return split_supply
         bounds = self.salary_resolution()
         if bounds.conflict:
             return bounds.conflict
@@ -3460,6 +3492,12 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
                 self._note_tier_rule(rule_cause)
                 raise RuntimeError(
                     self._remember_rule_shortfall(count, 0, rule_cause, diagnostic)
+                ) from exc
+            split_cause = self._team_split_block_cause(players)
+            if split_cause:
+                self._note_tier_rule(split_cause)
+                raise RuntimeError(
+                    self._remember_rule_shortfall(count, 0, split_cause, diagnostic)
                 ) from exc
             if self._limits_configured():
                 self._finalize_min_report([], count)
