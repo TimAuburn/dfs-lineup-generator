@@ -71,6 +71,7 @@ from .showdown_rules import (
     RULE_NO_K_DST_CAPTAIN,
     RULE_SALARY_FLOOR,
     captain_lock_causes,
+    cash_captain_ineligible_causes,
     minimum_spend,
     resolve_salary_bounds,
     MIN_PLAYERS_PER_TEAM_MAX,
@@ -991,6 +992,14 @@ class BaseNFLOptimizer:
             history.append(set(identities))
             for key in identities:
                 used[key] = used.get(key, 0) + 1
+        if enforce_exposure:
+            # A CPT lock already fills every lineup. The global cap must not
+            # ban that same person, or the lock and the cap contradict.
+            captain_locks = getattr(self, "_captain_lock_keys", ())
+            for player in players:
+                key = player_person_key(player)
+                if key in captain_locks and key not in allowance:
+                    allowance[key] = int(portfolio_size)
         if enforce_exposure or enforce_kicker:
             self._tighten_solver_exposure(
                 players,
@@ -1041,8 +1050,11 @@ class BaseNFLOptimizer:
             if kicker_rate is None
             else appearances_allowed(float(kicker_rate), portfolio_size)
         )
+        captain_locks = getattr(self, "_captain_lock_keys", ())
         for player in players:
             key = player_person_key(player)
+            if key in captain_locks:
+                continue
             remaining_caps: List[int] = []
             if default_allowed is not None:
                 remaining_caps.append(int(default_allowed) - int(used.get(key, 0)))
@@ -1326,6 +1338,12 @@ class BaseNFLOptimizer:
         return names
 
     def explain_lineup_shortfall(self, lineups: Sequence[pd.DataFrame], requested: int):
+        # A 100% captain lock is allowed to fill every lineup. The generic
+        # lock-versus-cap note would call that a conflict with max exposure.
+        captain_locks = getattr(self, "_captain_lock_keys", ())
+        locked = [
+            key for key in self._locked_identities() if key not in captain_locks
+        ]
         return explain_shortfall(
             lineups,
             requested=int(requested),
@@ -1336,7 +1354,7 @@ class BaseNFLOptimizer:
             min_exposure=self.min_exposure,
             eligible=self._eligible_identities(),
             roster_size=len(self.roster_slots),
-            locked=self._locked_identities(),
+            locked=locked,
             solver_constraints=self._solver_constraint_notes,
             display_names=self._display_names(),
         )
@@ -2519,6 +2537,9 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         # Showdown cash narrows CPT to QB/RB/WR at a base-salary floor.
         self.captain_positions: Optional[frozenset] = None
         self.captain_min_salary: Optional[int] = None
+        # People locked at CPT because Lock is on and Captain % is 100.
+        # The lock is the only force. Captain exposure is not applied again.
+        self._captain_lock_keys: set = set()
         # FLEX rows under this salary are punts. None leaves them eligible.
         self.flex_min_salary: Optional[int] = None
         # None leaves the defense count uncapped. Cash bans defenses instead.
@@ -2768,8 +2789,14 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         A positive share is both the minimum and the maximum, so that player
         is captain in that fraction of the batch. CPT and FLEX are separate
         player objects, so the flex row keeps the global exposure.
+
+        Lock with Captain % at 100 is not applied here. That lock is the CPT
+        row, which already puts the player at captain in every lineup. Setting
+        the share again would stack a second 100% minimum on the lock, and
+        that pair fights a max-exposure cap and the overlap rule.
         """
         # Captain % is a cross-lineup share. A singles count leaves it off.
+        self._captain_lock_keys = set()
         if getattr(self, "_capacity_singles", False):
             return
         frame = self._player_df
@@ -2802,16 +2829,30 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
                 f"Captain percentages add up to {total * 100:.0f}%. "
                 "They need to add up to 100% or less."
             )
+        # Exactly 100% plus a locked CPT row is the captain lock. The share is
+        # not applied again. A share strictly between 0 and 100 still cannot
+        # be combined with Lock, which keeps the flex row.
+        cpt_locked = {
+            person_key(row.get("Name"), row.get("TeamAbbrev"), row.get("Position"))
+            for _, row in frame.iterrows()
+            if str(row.get("ID")) in self.locked_player_ids
+            and str(row.get("RosterSlot", row.get("Roster Position", ""))).split("/")[0].strip().upper() == "CPT"
+        }
+        full_locks = {
+            key
+            for key, rate in applied.items()
+            if key in locked and key in cpt_locked and abs(rate - 1.0) <= 1e-9
+        }
         conflicts = [
             names.get(key) or key[0]
             for key, rate in applied.items()
-            if rate > 0 and key in locked
+            if key in locked and 0 < rate < 1.0 - 1e-9
         ]
         if conflicts:
             label = conflicts[0] if len(conflicts) == 1 else ", ".join(conflicts)
             raise RuntimeError(
-                f"{label} is locked and also has a captain percentage. "
-                "Lock forces the flex spot, so clear Lock or leave Captain % blank."
+                f"{label} is locked and Captain % is between 0 and 100. "
+                "Use 100% to lock at captain, or clear Captain % to lock at FLEX."
             )
         for player in players:
             if "CPT" not in player.positions:
@@ -2819,6 +2860,11 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             key = player_person_key(player)
             rate = applied.get(key)
             if rate is None:
+                continue
+            if key in full_locks:
+                # Permit every lineup. Do not also set min_exposure.
+                player.max_exposure = 1.0
+                self._captain_lock_keys.add(key)
                 continue
             if rate <= 0:
                 player.max_exposure = 0
@@ -3185,6 +3231,16 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             locks = captain_lock_causes(self._player_df, self.locked_player_ids)
             if locks:
                 return " ".join(locks)
+        if self.captain_positions is not None or self.captain_min_salary is not None:
+            # Cash removes an ineligible CPT row after Captain % is applied,
+            # which used to drop a 100% request with no message.
+            blocked = cash_captain_ineligible_causes(
+                self._player_df,
+                allowed_positions=self._captain_positions_allowed(),
+                min_salary=self.captain_min_salary,
+            )
+            if blocked:
+                return " ".join(blocked)
         if self.min_players_per_team_enabled:
             split = team_split_cause(
                 True,
