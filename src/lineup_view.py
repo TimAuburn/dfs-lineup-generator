@@ -11,6 +11,7 @@ from __future__ import annotations
 import pandas as pd
 
 from .names import person_key
+from .showdown_order import order_showdown_roster
 
 # Streamlit's default dataframe metrics at a 16px root:
 # row and header are 2.1875rem (35px), and the table border is 1px.
@@ -93,7 +94,9 @@ def lineup_detail_frame(lineup: pd.DataFrame, pool: pd.DataFrame | None) -> pd.D
 
     Salary remaining is a lineup total, so it is not repeated on every player.
     Delta is included when the pool already has that adjustment.
+    Showdown FLEX rows follow the shared salary order. Classic rows do not.
     """
+    lineup = order_showdown_roster(lineup)
     columns = [name for name in ("Slot", "Name", "Team", "Salary", "Projection") if name in lineup.columns]
     view = lineup.loc[:, columns].copy()
     if (
