@@ -21,6 +21,14 @@ RULE_NO_K_DST_CAPTAIN = "No kicker or DST captain"
 RULE_CASH_CAPTAIN = "Showdown Cash captain"
 RULE_MIN_PER_TEAM = "Minimum players per team"
 RULE_SALARY_FLOOR = "Salary floor"
+RULE_TEAM_SPLIT = "Team split"
+
+# Showdown control. Any, or nothing selected, adds no split constraint.
+# The other three are the only constructions DraftKings allows on six spots.
+TEAM_SPLIT_ANY = "Any"
+TEAM_SPLIT_OPTIONS = (TEAM_SPLIT_ANY, "3-3", "4-2", "5-1")
+_TEAM_SPLIT_ORDER = ((3, 3), (4, 2), (5, 1))
+_TEAM_SPLIT_LABELS = {f"{high}-{low}": (high, low) for high, low in _TEAM_SPLIT_ORDER}
 
 # DraftKings Showdown is six spots. pydfs captain mode sets
 # max_from_one_team to 5, so a lineup always includes both teams. That cap
@@ -393,21 +401,264 @@ def multiple_players_per_team(enabled: bool, count: int) -> dict[str, int | bool
     }
 
 
+def _split_number(value: object) -> Optional[int]:
+    if isinstance(value, bool) or isinstance(value, str):
+        return None
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _is_split_pair(value: object) -> bool:
+    if isinstance(value, (str, bytes, dict)) or not isinstance(value, (list, tuple)):
+        return False
+    if len(value) != 2:
+        return False
+    return _split_number(value[0]) is not None and _split_number(value[1]) is not None
+
+
+def _parse_split_pair(value: object) -> tuple[int, int]:
+    """One ``(high, low)`` pair. A saved label such as ``"4-2"`` is accepted."""
+    if isinstance(value, str):
+        label = value.strip()
+        parsed = _TEAM_SPLIT_LABELS.get(label)
+        if parsed is None:
+            raise ValueError(
+                "team split must be 3-3, 4-2, or 5-1"
+            )
+        return parsed
+    if not _is_split_pair(value):
+        raise ValueError("team split must be 3-3, 4-2, or 5-1")
+    high = _split_number(value[0])
+    low = _split_number(value[1])
+    assert high is not None and low is not None
+    roster = SHOWDOWN_ROSTER_SIZE
+    if high < low or low < 0 or high + low != roster:
+        raise ValueError(
+            f"team split must be two counts that add up to {roster}, larger first"
+        )
+    if high > 5:
+        raise ValueError(
+            "DraftKings Showdown allows at most 5 players from one team"
+        )
+    return (high, low)
+
+
+def canonical_team_splits(value: object) -> tuple[tuple[int, int], ...]:
+    """Allowed splits, in 3-3, 4-2, 5-1 order.
+
+    ``None``, ``Any``, an empty selection, and a selection that includes Any
+    add no constraint. A single ``(4, 2)`` pair is the shape older overrides
+    saved. A sequence of pairs or labels is the multi-select shape.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text == TEAM_SPLIT_ANY:
+            return ()
+        return (_parse_split_pair(text),)
+    if _is_split_pair(value):
+        return (_parse_split_pair(value),)
+    if isinstance(value, (list, tuple)):
+        if any(isinstance(item, str) and item.strip() == TEAM_SPLIT_ANY for item in value):
+            return ()
+        found: list[tuple[int, int]] = []
+        for item in value:
+            if item is None or (isinstance(item, str) and not str(item).strip()):
+                continue
+            pair = _parse_split_pair(item)
+            if pair not in found:
+                found.append(pair)
+        order = {pair: index for index, pair in enumerate(_TEAM_SPLIT_ORDER)}
+        found.sort(key=lambda pair: order.get(pair, pair[0]))
+        return tuple(found)
+    raise ValueError("team split must be 3-3, 4-2, or 5-1")
+
+
+def stored_team_split(value: object) -> Optional[tuple]:
+    """Value stored on the optimizer and in an override dict.
+
+    One split stays a single pair, so a saved ``(4, 2)`` still reads back as
+    ``(4, 2)``. Several splits stay a tuple of pairs.
+    """
+    splits = canonical_team_splits(value)
+    if not splits:
+        return None
+    if len(splits) == 1:
+        return splits[0]
+    return splits
+
+
+def prepare_team_split_widget(stored: object) -> list[str]:
+    """Multi-select session value.
+
+    The control used to store one string, such as ``"4-2"`` or ``"Any"``.
+    A string becomes a one-item list. An empty list stays empty. Anything
+    unrecognized becomes Any.
+    """
+    if isinstance(stored, (list, tuple)):
+        chosen: list[str] = []
+        for item in stored:
+            text = str(item).strip()
+            if text in TEAM_SPLIT_OPTIONS and text not in chosen:
+                chosen.append(text)
+        return [option for option in TEAM_SPLIT_OPTIONS if option in chosen]
+    if isinstance(stored, str):
+        text = stored.strip()
+        if text in TEAM_SPLIT_OPTIONS:
+            return [text]
+    if stored is None:
+        return [TEAM_SPLIT_ANY]
+    return [TEAM_SPLIT_ANY]
+
+
+def reconcile_team_split_selection(current: object, previous: object) -> list[str]:
+    """Any does not stay selected next to a split.
+
+    The option that was just added wins. Selecting Any clears the splits.
+    Selecting a split while Any is on clears Any. Nothing selected stays
+    empty, which is the same as no constraint.
+    """
+    if current is None:
+        selected: list[str] = []
+    else:
+        selected = prepare_team_split_widget(current)
+    if TEAM_SPLIT_ANY not in selected or selected == [TEAM_SPLIT_ANY]:
+        return selected
+    previous_labels = [] if previous is None else prepare_team_split_widget(previous)
+    if TEAM_SPLIT_ANY not in previous_labels:
+        return [TEAM_SPLIT_ANY]
+    return [option for option in selected if option != TEAM_SPLIT_ANY]
+
+
+def team_split_needs_side(team_split: object) -> bool:
+    """4-2 and 5-1 have a heavy side. 3-3 alone does not."""
+    return any(high != low for high, low in canonical_team_splits(team_split))
+
+
+def team_split_setting_label(team_split: object, team: Optional[str] = None) -> Optional[str]:
+    """Settings-summary text. ``None`` when the split is open.
+
+    One uneven split keeps the older wording, ``4-2, BUF``. Several splits
+    read ``4-2 or 5-1, BUF heavy``.
+    """
+    splits = canonical_team_splits(team_split)
+    if not splits:
+        return None
+    body = " or ".join(f"{high}-{low}" for high, low in splits)
+    if all(high == low for high, low in splits):
+        return body
+    side = str(team).strip().upper() if team else ""
+    if len(splits) == 1:
+        return f"{body}, {side or 'either team'}"
+    return f"{body}, {side + ' heavy' if side else 'either team'}"
+
+
+def _join_and(parts: Sequence[str]) -> str:
+    items = [str(part) for part in parts]
+    if len(items) <= 1:
+        return items[0] if items else ""
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
 def team_split_cause(
     enabled: bool,
     minimum: int,
-    team_split: Optional[tuple[int, int]],
+    team_split: object = None,
 ) -> Optional[str]:
-    """The team-split control and this minimum cannot both be true."""
-    if not enabled or team_split is None:
+    """Name the minimum when every selected split puts fewer than that on one team.
+
+    A split that still fits can be used, so selecting 3-3 and 4-2 with a
+    minimum of 3 is not this error. One saved pair keeps the original sentence.
+    """
+    if not enabled:
         return None
-    high, low = int(team_split[0]), int(team_split[1])
-    if low >= int(minimum):
+    splits = canonical_team_splits(team_split)
+    if not splits:
         return None
+    floor = int(minimum)
+    if any(low >= floor for _high, low in splits):
+        return None
+    if len(splits) == 1:
+        high, low = splits[0]
+        return (
+            f"{RULE_MIN_PER_TEAM}. The minimum is {floor} from each team, "
+            f"and the team split {high}-{low} puts {low} on one team. "
+            "Neither setting was changed."
+        )
+    labels = " or ".join(f"{high}-{low}" for high, low in splits)
+    lows = _join_and([str(low) for _high, low in splits])
     return (
-        f"{RULE_MIN_PER_TEAM}. The minimum is {int(minimum)} from each team, "
-        f"and the team split {high}-{low} puts {low} on one team. "
+        f"{RULE_MIN_PER_TEAM}. The minimum is {floor} from each team, "
+        f"and the team splits {labels} put {lows} on one team. "
         "Neither setting was changed."
+    )
+
+
+def _split_fits_pool(
+    counts: Mapping[str, int],
+    high: int,
+    low: int,
+    heavy: str,
+) -> bool:
+    teams = list(counts)
+    if len(teams) != 2:
+        return False
+    if high == low:
+        return all(counts[team] >= high for team in teams)
+    if heavy:
+        if heavy not in counts:
+            return False
+        other = next(team for team in teams if team != heavy)
+        return counts[heavy] >= high and counts[other] >= low
+    first, second = teams
+    return (counts[first] >= high and counts[second] >= low) or (
+        counts[second] >= high and counts[first] >= low
+    )
+
+
+def team_split_supply_cause(
+    pool: Optional[pd.DataFrame],
+    team_split: object,
+    heavy: Optional[str] = None,
+) -> Optional[str]:
+    """Name a split the two teams do not have the players to build.
+
+    CPT and FLEX of one person count once. A heavy team that is not on the
+    slate is left to the optimizer's own message.
+    """
+    splits = canonical_team_splits(team_split)
+    if not splits:
+        return None
+    counts = distinct_players_by_team(pool)
+    if len(counts) != 2:
+        return None
+    heavy_key = str(heavy).strip().upper() if heavy else ""
+    if heavy_key and heavy_key not in counts and any(high != low for high, low in splits):
+        return None
+    if any(_split_fits_pool(counts, high, low, heavy_key) for high, low in splits):
+        return None
+    label = team_split_setting_label(splits, heavy_key or None)
+    inventory = _join_and(
+        [f"{team} has {count}" for team, count in sorted(counts.items())]
+    )
+    return (
+        f"{RULE_TEAM_SPLIT}. {label} cannot be built from this pool. "
+        f"{inventory} different players. The team split was not changed."
+    )
+
+
+def team_split_block_message(team_split: object, team: Optional[str] = None) -> str:
+    """The selected splits are infeasible once the other lineup rules are on."""
+    label = team_split_setting_label(team_split, team) or "The team split"
+    return (
+        f"{RULE_TEAM_SPLIT}. {label} cannot be built with the other lineup rules. "
+        "The team split was not changed."
     )
 
 
@@ -692,6 +943,76 @@ class MinPlayersPerTeamRule(OptimizerRule):
                 minimum,
                 name=f"showdown_min_team_{team}",
             )
+
+
+def _anchor_split_count(anchor: str, high: int, low: int, heavy: Optional[str]) -> int:
+    """Players from the anchor team when this split is the one that is used."""
+    if high == low or heavy is None or heavy == anchor:
+        return high
+    return low
+
+
+class AllowedTeamSplitsRule(OptimizerRule):
+    """A lineup matches any one of the selected Showdown splits.
+
+    ``_showdown_allowed_splits`` on the pydfs optimizer is
+    ``(anchor_team, splits, heavy_team)``. ``splits`` is ``(high, low)``
+    pairs. ``heavy_team`` takes the larger side of an uneven split, or is
+    None so either team can. One binary marks which split is used. An
+    uneven split with no named team also has a side binary, the same choice
+    the single-split rule makes. Exactly one split binary is 1, so lineups
+    are not divided evenly across the selected splits.
+    """
+
+    def apply(self, solver):
+        spec = getattr(self.optimizer, "_showdown_allowed_splits", None)
+        if not spec:
+            return
+        anchor, splits, heavy = spec
+        variables = [
+            variable
+            for player, variable in self.players_dict.items()
+            if player.team == anchor
+        ]
+        if not variables:
+            return
+        indicators = []
+        count_vars = list(variables)
+        count_coef = [1.0] * len(variables)
+        for high, low in splits:
+            indicator = solver.add_variable(f"showdown_team_split_{int(high)}_{int(low)}")
+            indicators.append(indicator)
+            if heavy is None and int(high) != int(low):
+                side = solver.add_variable(
+                    f"showdown_team_split_side_{int(high)}_{int(low)}"
+                )
+                solver.add_constraint(
+                    [side, indicator],
+                    [1.0, -1.0],
+                    SolverSign.LTE,
+                    0,
+                    name=f"showdown_team_split_side_on_{int(high)}_{int(low)}",
+                )
+                count_vars.extend([indicator, side])
+                count_coef.extend([-float(low), -float(int(high) - int(low))])
+            else:
+                target = _anchor_split_count(str(anchor), int(high), int(low), heavy)
+                count_vars.append(indicator)
+                count_coef.append(-float(target))
+        solver.add_constraint(
+            indicators,
+            [1.0] * len(indicators),
+            SolverSign.EQ,
+            1,
+            name="showdown_team_split_one",
+        )
+        solver.add_constraint(
+            count_vars,
+            count_coef,
+            SolverSign.EQ,
+            0,
+            name="showdown_team_split_count",
+        )
 
 
 def assess_showdown_lineup(

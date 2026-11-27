@@ -75,11 +75,17 @@ from src.showdown_rules import (
     CONTROL_MAX_PLAYERS_PER_TEAM,
     CONTROL_MIN_PLAYERS_PER_TEAM,
     REQUIRE_MULTIPLE_PLAYERS_LABEL,
+    TEAM_SPLIT_OPTIONS,
     multiple_players_per_team,
+    prepare_team_split_widget,
+    reconcile_team_split_selection,
     resolve_salary_bounds,
     slate_salary_cap,
+    stored_team_split,
     team_minimum_fit_cause,
     team_split_cause,
+    team_split_needs_side,
+    team_split_setting_label,
 )
 from src.lineup_rules import ConstructionSettings as _ConstructionSettings
 from src.optimizer import (
@@ -407,7 +413,7 @@ def _extra_setting_rows(
     use_min_exposure: bool,
     min_exposure_pct: int,
     at_most_one_qb: bool = False,
-    team_split: Tuple[int, int] | None = None,
+    team_split: object = None,
     team_split_team: str | None = None,
 ) -> List[Tuple[str, str, str]]:
     """UI-only settings that are not part of a contest preset."""
@@ -418,11 +424,9 @@ def _extra_setting_rows(
         rows.append(("Min exposure", "Off", f"{int(min_exposure_pct)}%"))
     if at_most_one_qb:
         rows.append(("Quarterbacks", "No limit", "At most 1"))
-    if team_split is not None:
-        label = f"{int(team_split[0])}-{int(team_split[1])}"
-        if team_split[0] != team_split[1]:
-            label = f"{label}, {team_split_team or 'either team'}"
-        rows.append(("Team split", "Any", label))
+    split_label = team_split_setting_label(team_split, team_split_team)
+    if split_label is not None:
+        rows.append(("Team split", "Any", split_label))
     return rows
 
 
@@ -896,7 +900,7 @@ def _showdown_rule_controls(
     window_min: int,
     window_max: int,
     allow_kicker_captain: bool,
-    team_split: Tuple[int, int] | None,
+    team_split: object,
 ) -> Tuple[Dict[str, Any], List[str]]:
     """Toggles for the three Showdown lineup rules. Values stay on the preset."""
     st.markdown("**Showdown lineup rules**")
@@ -1257,7 +1261,7 @@ def _collect_strategy_overrides(
             help="Checked lineups include at most one kicker, so both teams' kickers cannot be paired.",
         )
         at_most_one_qb = False
-        team_split: Tuple[int, int] | None = None
+        team_split = None
         team_split_team: str | None = None
         if preset is ContestPreset.SHOWDOWN_GPP:
             at_most_one_qb = st.toggle(
@@ -1269,25 +1273,38 @@ def _collect_strategy_overrides(
                     "quarterbacks cannot be paired. The captain counts as that quarterback."
                 ),
             )
-            split_labels = ("Any", "3-3", "4-2", "5-1")
+            # The control used to be single-select and stored one string.
+            # Multi-select reads a list, so a saved string is converted before
+            # the widget is created. Any is exclusive with the splits. That
+            # correction is also applied before the widget: the key cannot be
+            # written after the control exists.
+            split_key = _preset_key(preset, "team_split")
+            previous_key = _preset_key(preset, "team_split_previous")
+            if split_key in st.session_state:
+                incoming = st.session_state[split_key]
+                reconciled = reconcile_team_split_selection(
+                    incoming,
+                    st.session_state.get(previous_key),
+                )
+                if reconciled != incoming:
+                    st.session_state[split_key] = list(reconciled)
             split_choice = st.segmented_control(
                 "Players from each team",
-                options=split_labels,
-                default="Any",
-                required=True,
+                options=TEAM_SPLIT_OPTIONS,
+                default=["Any"],
+                selection_mode="multi",
                 width="stretch",
                 wrap=True,
-                key=_preset_key(preset, "team_split"),
+                key=split_key,
                 help=(
-                    "Counts include the captain. 4-2 is four players from one team "
-                    "and two from the other. DraftKings allows at most 5 from one team."
+                    "Counts include the captain. Select any mix of 3-3, 4-2, and 5-1. "
+                    "Each lineup uses one of those splits. Any, or nothing selected, "
+                    "does not add a split. DraftKings allows at most 5 from one team."
                 ),
             )
-            split_label = str(split_choice or "Any")
-            if split_label != "Any":
-                high_s, low_s = split_label.split("-")
-                team_split = (int(high_s), int(low_s))
-            if team_split is not None and team_split[0] != team_split[1]:
+            st.session_state[previous_key] = list(split_choice or [])
+            team_split = stored_team_split(split_choice)
+            if team_split_needs_side(team_split):
                 slate_teams = _showdown_team_abbrevs()
                 heavy_choice = st.selectbox(
                     "More players from",
