@@ -73,10 +73,13 @@ from .showdown_rules import (
     captain_lock_causes,
     minimum_spend,
     resolve_salary_bounds,
+    MIN_PLAYERS_PER_TEAM_MAX,
+    MIN_PLAYERS_PER_TEAM_MIN,
     MinPlayersPerTeamRule,
     roster_supply_cause,
     shortfall_message,
     slate_salary_cap,
+    team_minimum_fit_cause,
     team_split_cause,
 )
 from .presets import ContestFormat
@@ -2603,8 +2606,13 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
                     "DraftKings Showdown allows at most 5 players from one team"
                 )
             parsed_split = (high, low)
-        if min_players_per_team_enabled and not 1 <= int(min_players_per_team) <= 3:
-            raise ValueError("min players per team must be from 1 to 3")
+        if min_players_per_team_enabled and not (
+            MIN_PLAYERS_PER_TEAM_MIN <= int(min_players_per_team) <= MIN_PLAYERS_PER_TEAM_MAX
+        ):
+            raise ValueError(
+                "min players per team must be from "
+                f"{MIN_PLAYERS_PER_TEAM_MIN} to {MIN_PLAYERS_PER_TEAM_MAX}"
+            )
         if int(max_unused_salary) < 0:
             raise ValueError("max unused salary must be at least 0")
         self.min_salary_cap = min_salary_cap
@@ -3183,6 +3191,10 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
             )
             if split:
                 return split
+            # 4 or 5 from each team cannot fit six spots. Say so before CBC runs.
+            fit = team_minimum_fit_cause(True, int(self.min_players_per_team))
+            if fit:
+                return fit
             supply = roster_supply_cause(self._player_df, int(self.min_players_per_team))
             if supply:
                 return supply
@@ -3194,8 +3206,9 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
     def _apply_min_players_per_team(self, optimizer, players: List[Player]) -> None:
         """At least N players from each team. CPT and FLEX rows both count.
 
-        DraftKings still caps a team at five when this rule is off. This adds
-        a higher floor and does not remove that cap.
+        DraftKings captain mode caps one team at five in the pydfs site
+        settings. That cap does not look at this switch, so a 6-0 lineup
+        stays illegal when the switch is off. This rule only raises the floor.
         """
         if not self.min_players_per_team_enabled:
             return
@@ -3383,6 +3396,7 @@ class NFLShowdownOptimizer(BaseNFLOptimizer):
         self._apply_kicker_exposure_cap(players)
         self._apply_captain_exposure(players)
         optimizer.player_pool.load_players(players)
+        # Both teams. This does not look at min_players_per_team_enabled.
         min_teams = self.min_teams
         if self.team_split is not None and self.team_split[1] == 0:
             min_teams = None

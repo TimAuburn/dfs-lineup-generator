@@ -19,15 +19,30 @@ import pytest
 
 from src.data_loader import apply_low_total_kicker_cap, kicker_captain_exposure_cap
 from src.exporter import lineups_to_dk_upload_csv
+from src.lineup_capacity import SolvePlan, _cache_key, measure
 from src.optimizer import NFLClassicOptimizer, NFLShowdownOptimizer, optimize_tiered_salaries
 from src.parser import parse_dk_csv
-from src.presets import ContestPreset, apply_preset, format_preset_summary, get_preset_config
+from src.presets import (
+    ContestFormat,
+    ContestPreset,
+    apply_preset,
+    config_with_overrides,
+    format_preset_summary,
+    format_settings_comparison,
+    get_preset_config,
+)
 from src.showdown_rules import (
+    CONTROL_MAX_PLAYERS_PER_TEAM,
+    CONTROL_MIN_PLAYERS_PER_TEAM,
+    REQUIRE_MULTIPLE_PLAYERS_LABEL,
     RULE_MIN_PER_TEAM,
     RULE_NO_K_DST_CAPTAIN,
     RULE_SALARY_FLOOR,
+    multiple_players_per_team,
     salary_floor_met,
+    team_minimum_fit_cause,
     team_minimum_met,
+    team_rule_label,
     unused_salary,
 )
 
@@ -153,10 +168,12 @@ def test_showdown_presets_show_the_three_rules():
     gpp = get_preset_config(ContestPreset.SHOWDOWN_GPP)
     assert cash.ban_k_dst_captain is True
     assert gpp.ban_k_dst_captain is True
-    assert cash.min_players_per_team_enabled is True
-    assert gpp.min_players_per_team_enabled is True
+    assert cash.min_players_per_team_enabled is False
+    assert gpp.min_players_per_team_enabled is False
     assert cash.min_players_per_team == 2
     assert gpp.min_players_per_team == 2
+    assert cash.min_teams == 2
+    assert gpp.min_teams == 2
     assert cash.salary_floor is True
     assert cash.max_unused_salary == 1_500
     assert gpp.salary_floor is False
@@ -166,8 +183,14 @@ def test_showdown_presets_show_the_three_rules():
     gpp_rows = dict(format_preset_summary(gpp))
     assert cash_rows["No kicker or DST captain"].startswith("On")
     assert gpp_rows["No kicker or DST captain"].startswith("On")
-    assert cash_rows["Minimum players per team"] == "2 from each team"
-    assert gpp_rows["Minimum players per team"] == "2 from each team"
+    assert cash_rows["Minimum players per team"] == "Off — at least 1 from each team"
+    assert gpp_rows["Minimum players per team"] == "Off — at least 1 from each team"
+    assert cash_rows["Min teams"] == "2"
+    assert gpp_rows["Min teams"] == "2"
+    for description in (cash.description, gpp.description):
+        assert "at least one player from each team" in description
+        assert "Requiring multiple players from each team is off." not in description
+        assert "at least 2 players" not in description
     assert "1,500" in cash_rows["Salary floor"]
     assert "49,600" in cash_rows["Salary floor"]
     assert gpp_rows["Salary floor"] == "Off"
@@ -180,6 +203,7 @@ def test_showdown_presets_show_the_three_rules():
         assert classic.ban_k_dst_captain is False
         assert classic.min_players_per_team_enabled is False
         assert classic.salary_floor is False
+        assert "Minimum players per team" not in dict(format_preset_summary(classic))
 
 
 def test_unused_salary_of_1500_passes_and_1501_fails():
@@ -334,6 +358,203 @@ def test_minimum_players_per_team_on_off_and_at_1_and_3():
     )
     three_counts = at_three[0]["Team"].value_counts().to_dict()
     assert three_counts == {"HOU": 3, "JAX": 3}
+
+
+def test_multiple_player_control_is_off_by_default_on_both_showdown_presets():
+    assert REQUIRE_MULTIPLE_PLAYERS_LABEL == "Require multiple players from each team"
+    assert CONTROL_MIN_PLAYERS_PER_TEAM == 2
+    assert CONTROL_MAX_PLAYERS_PER_TEAM == 5
+    assert multiple_players_per_team(False, 2) == {
+        "min_players_per_team_enabled": False,
+        "min_players_per_team": 2,
+    }
+    assert team_rule_label(False, 2) == "Off — at least 1 from each team"
+    assert team_minimum_fit_cause(False, 5) is None
+    for preset in (ContestPreset.SHOWDOWN_CASH, ContestPreset.SHOWDOWN_GPP):
+        cfg = get_preset_config(preset)
+        assert cfg.min_players_per_team_enabled is False
+        assert cfg.min_players_per_team == 2
+        assert cfg.min_teams == 2
+        rows = dict(format_preset_summary(cfg))
+        assert rows["Minimum players per team"] == "Off — at least 1 from each team"
+        assert "at least one player from each team" in cfg.description
+        assert "Requiring multiple players from each team is off." not in cfg.description
+        on = config_with_overrides(
+            cfg,
+            lineup_count=1,
+            overrides=multiple_players_per_team(True, 3),
+        )
+        assert on.min_players_per_team_enabled is True
+        assert on.min_players_per_team == 3
+        assert on.min_teams == 2
+        assert dict(format_preset_summary(on))["Minimum players per team"] == "3 from each team"
+        compared = format_settings_comparison(cfg, on)
+        assert compared != format_settings_comparison(
+            cfg,
+            config_with_overrides(cfg, lineup_count=1, overrides={}),
+        )
+
+
+def test_old_session_key_does_not_turn_the_team_minimum_on():
+    """A saved True under the previous widget key stays unused."""
+    app_test = pytest.importorskip("streamlit.testing.v1")
+    app = app_test.AppTest.from_file(
+        str(Path(__file__).resolve().parents[1] / "app.py"),
+        default_timeout=90,
+    )
+    app.session_state["app_view"] = "Optimizer"
+    app.session_state["contest_format"] = ContestFormat.SHOWDOWN.value
+    app.session_state["contest_preset"] = ContestPreset.SHOWDOWN_CASH.value
+    app.session_state["min_players_per_team_enabled_showdown_cash"] = True
+    app.session_state["min_players_per_team_showdown_cash"] = 4
+    app.session_state["min_players_per_team_enabled_showdown_gpp"] = True
+    app.session_state["min_players_per_team_showdown_gpp"] = 3
+    app.run()
+    assert not app.exception, app.exception
+
+    toggle = next(
+        item for item in app.toggle if item.label == REQUIRE_MULTIPLE_PLAYERS_LABEL
+    )
+    assert toggle.value is False
+    count = next(item for item in app.number_input if item.label == "Minimum from each team")
+    assert int(count.value) == 2
+    assert app.session_state["require_multiple_per_team_showdown_cash"] is False
+    assert int(app.session_state["require_multiple_per_team_count_showdown_cash"]) == 2
+    assert app.session_state["min_players_per_team_enabled_showdown_cash"] is True
+
+    row = None
+    for frame in app.dataframe:
+        table = frame.value
+        if "Setting" not in getattr(table, "columns", []):
+            continue
+        match = table.loc[table["Setting"] == "Minimum players per team"]
+        if not match.empty:
+            row = match.iloc[0]
+            break
+    assert row is not None
+    assert row["Preset default"] == "Off — at least 1 from each team"
+    assert row["Actual"] == "Off — at least 1 from each team"
+    assert all(
+        "Requiring multiple players from each team is off." not in str(item.value)
+        for item in app.caption
+    )
+
+
+def test_toggle_on_at_two_and_three_and_off_still_bans_a_six_zero():
+    """The control uses the same fields both Showdown presets solve with."""
+    rows = _skill_pool()
+    for preset in (ContestPreset.SHOWDOWN_CASH, ContestPreset.SHOWDOWN_GPP):
+        cfg = get_preset_config(preset)
+        assert cfg.min_players_per_team_enabled is False
+
+    _, open_lineups = _generate(
+        rows,
+        min_players_per_team_enabled=False,
+        min_teams=2,
+        min_salary_cap=20_000,
+    )
+    open_counts = open_lineups[0]["Team"].value_counts().to_dict()
+    assert open_counts == {"HOU": 5, "JAX": 1}
+    assert 6 not in open_counts.values()
+
+    # The site cap of five from one team does not depend on min_teams or this switch.
+    _, site_cap = _generate(
+        rows,
+        min_players_per_team_enabled=False,
+        min_teams=None,
+        min_salary_cap=20_000,
+    )
+    site_counts = site_cap[0]["Team"].value_counts().to_dict()
+    assert site_counts == {"HOU": 5, "JAX": 1}
+    assert max(site_counts.values()) == 5
+
+    _, at_two = _generate(
+        rows,
+        **multiple_players_per_team(True, 2),
+        min_teams=2,
+        min_salary_cap=20_000,
+    )
+    two_counts = at_two[0]["Team"].value_counts().to_dict()
+    assert min(two_counts.values()) >= 2
+    assert two_counts != {"HOU": 5, "JAX": 1}
+
+    _, at_three = _generate(
+        rows,
+        **multiple_players_per_team(True, 3),
+        min_teams=2,
+        min_salary_cap=20_000,
+    )
+    assert at_three[0]["Team"].value_counts().to_dict() == {"HOU": 3, "JAX": 3}
+
+
+def test_impossible_team_minimum_is_a_message_not_a_solver_error():
+    rows = _skill_pool()
+    cases = (
+        (4, (5, 1), "5-1"),
+        (4, None, "6 spots"),
+        (5, None, "6 spots"),
+    )
+    for minimum, split, needle in cases:
+        optimizer = _solve(
+            rows,
+            min_players_per_team_enabled=True,
+            min_players_per_team=minimum,
+            team_split=split,
+            min_salary_cap=20_000,
+        )
+        with pytest.raises(RuntimeError, match=RULE_MIN_PER_TEAM) as raised:
+            optimizer.generate_lineups()
+        message = str(raised.value)
+        assert needle in message
+        assert "built 0" in message
+        assert "The minimum was not lowered." in message or "Neither setting was changed." in message
+        for raw in ("CBC", "Pulp", "Traceback", "Infeasible"):
+            assert raw not in message
+        assert optimizer.min_players_per_team == minimum
+        if split is None:
+            assert optimizer.team_split is None
+        else:
+            assert optimizer.team_split == split
+
+
+def test_capacity_cache_key_includes_the_team_minimum_toggle():
+    optimizer = NFLShowdownOptimizer()
+    optimizer.min_players_per_team_enabled = False
+    optimizer.min_players_per_team = 2
+    plan = SolvePlan()
+    off = _cache_key(optimizer, plan, 150, 0.4, False)
+    optimizer.min_players_per_team_enabled = True
+    on_two = _cache_key(optimizer, plan, 150, 0.4, False)
+    optimizer.min_players_per_team = 3
+    on_three = _cache_key(optimizer, plan, 150, 0.4, False)
+    assert len({off, on_two, on_three}) == 3
+
+    frame = pd.DataFrame(_skill_pool())
+    solver = NFLShowdownOptimizer()
+    solver.jitter_pct = (0.0, 0.0)
+    solver.jitter_seed = 42
+    solver.load_from_dataframe(frame)
+    solver.configure_showdown_rules(
+        min_salary_cap=20_000,
+        max_salary_cap=None,
+        min_teams=2,
+        game_script_correlation=False,
+        max_k_dst_combined=None,
+        max_kickers=None,
+        min_players_per_team_enabled=False,
+        min_players_per_team=2,
+        salary_floor=False,
+        flex_min_salary=None,
+    )
+    cache: dict = {}
+    first = measure(solver, requested=1, budget_seconds=None, cache=cache, attribute=False)
+    second = measure(solver, requested=1, budget_seconds=None, cache=cache, attribute=False)
+    assert first.from_cache is False
+    assert second.from_cache is True
+    solver.min_players_per_team_enabled = True
+    solver.min_players_per_team = 2
+    toggled = measure(solver, requested=1, budget_seconds=None, cache=cache, attribute=False)
+    assert toggled.from_cache is False
 
 
 def test_team_split_and_the_minimum_are_not_silently_changed():
@@ -594,7 +815,8 @@ def test_tiered_showdown_shortfall_names_the_binding_rule_and_overlap():
     assert f"Requested 6 lineups and built {len(lineups)}." in message
     assert "Binding limit:" in message
     assert RULE_NO_K_DST_CAPTAIN in message
-    assert RULE_MIN_PER_TEAM in message
+    # The extra per-team floor is off, so it is not a binding rule.
+    assert RULE_MIN_PER_TEAM not in message
     assert "Candidate limits at capacity: Max overlap 1:" in message
     assert "share 1 players" in message
     assert "The solver stopped without naming one binding constraint." not in message
@@ -687,11 +909,11 @@ def test_showdown_gpp_shortfall_message_is_identical_across_hash_seeds():
     assert all(run["id_hash"] == runs[0]["id_hash"] for run in runs)
     message = messages[0]
     assert message is not None
-    assert "Binding limit:" in message
-    assert RULE_MIN_PER_TEAM in message
+    # The extra per-team floor is off, so overlap is the limit this batch names.
+    assert RULE_MIN_PER_TEAM not in message
     assert "Candidate limits at capacity: Max overlap 3:" in message
+    assert "The solver stopped without naming one binding constraint." in message
     assert "Solver-reported" not in message
-    assert "The solver stopped without naming one binding constraint." not in message
     assert (
         "The solver stopped and did not identify which constraint blocked the next lineup."
         not in message
@@ -825,8 +1047,9 @@ def test_seed_42_showdown_cash_defaults_follow_the_three_rules():
     showdown.load_from_dataframe(parse_dk_csv(MOCK_SHOWDOWN))
     apply_preset(showdown, ContestPreset.SHOWDOWN_CASH, jitter_seed=42)
     assert showdown.ban_k_dst_captain is True
-    assert showdown.min_players_per_team_enabled is True
+    assert showdown.min_players_per_team_enabled is False
     assert showdown.min_players_per_team == 2
+    assert showdown.min_teams == 2
     assert showdown.salary_floor is True
     assert showdown.max_unused_salary == 1_500
     lineups = showdown.generate_lineups()
@@ -834,8 +1057,10 @@ def test_seed_42_showdown_cash_defaults_follow_the_three_rules():
     captain = lineup.loc[lineup["Slot"] == "CPT"].iloc[0]
     assert captain["Position"] not in {"K", "DST"}
     counts = lineup["Team"].value_counts().to_dict()
-    assert team_minimum_met(counts, ["KC", "BUF"], 2) is True
+    assert team_minimum_met(counts, ["KC", "BUF"], 1) is True
+    assert 6 not in counts.values()
     spent = int(lineup.attrs["salary"])
     assert salary_floor_met(spent, 50_000, 1_500) is True
-    # The previous cash build already cleared these three rules, so the ids stay.
+    # The cash optimum already used both teams, so dropping the extra floor
+    # leaves this roster in place.
     assert [str(player_id) for player_id in lineup["ID"]] == SHOWDOWN_IDS
