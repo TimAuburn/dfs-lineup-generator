@@ -258,8 +258,7 @@ PRESET_CONFIGS: Dict[ContestPreset, PresetConfig] = {
             "Showdown GPP: salary window, both teams, at least one player from each team, "
             "CPT QB needs 2 WR/TE plus an opposing skill player, no K or DST captains, "
             "at most one kicker, no FLEX under $1,200, drop players at 1.0 points or less, "
-            "max 3 repeats. The salary floor is off; turning it on leaves at most $1,500 unused. "
-            "Requiring multiple players from each team is off."
+            "max 3 repeats. The salary floor is off; turning it on leaves at most $1,500 unused."
         ),
     ),
     ContestPreset.SHOWDOWN_CASH: PresetConfig(
@@ -295,8 +294,7 @@ PRESET_CONFIGS: Dict[ContestPreset, PresetConfig] = {
             "at most one running back from each team, FLEX at $3,500+, "
             "at most one player under $4,500, and both starting quarterbacks "
             "and running backs when they fit. The salary floor allows at most "
-            "$1,500 unused; the $49,600 window is the tighter spend floor. "
-            "Requiring multiple players from each team is off."
+            "$1,500 unused; the $49,600 window is the tighter spend floor."
         ),
     ),
 }

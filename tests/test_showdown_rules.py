@@ -23,6 +23,7 @@ from src.lineup_capacity import SolvePlan, _cache_key, measure
 from src.optimizer import NFLClassicOptimizer, NFLShowdownOptimizer, optimize_tiered_salaries
 from src.parser import parse_dk_csv
 from src.presets import (
+    ContestFormat,
     ContestPreset,
     apply_preset,
     config_with_overrides,
@@ -188,7 +189,7 @@ def test_showdown_presets_show_the_three_rules():
     assert gpp_rows["Min teams"] == "2"
     for description in (cash.description, gpp.description):
         assert "at least one player from each team" in description
-        assert "Requiring multiple players from each team is off." in description
+        assert "Requiring multiple players from each team is off." not in description
         assert "at least 2 players" not in description
     assert "1,500" in cash_rows["Salary floor"]
     assert "49,600" in cash_rows["Salary floor"]
@@ -377,7 +378,7 @@ def test_multiple_player_control_is_off_by_default_on_both_showdown_presets():
         rows = dict(format_preset_summary(cfg))
         assert rows["Minimum players per team"] == "Off — at least 1 from each team"
         assert "at least one player from each team" in cfg.description
-        assert "Requiring multiple players from each team is off." in cfg.description
+        assert "Requiring multiple players from each team is off." not in cfg.description
         on = config_with_overrides(
             cfg,
             lineup_count=1,
@@ -392,6 +393,51 @@ def test_multiple_player_control_is_off_by_default_on_both_showdown_presets():
             cfg,
             config_with_overrides(cfg, lineup_count=1, overrides={}),
         )
+
+
+def test_old_session_key_does_not_turn_the_team_minimum_on():
+    """A saved True under the previous widget key stays unused."""
+    app_test = pytest.importorskip("streamlit.testing.v1")
+    app = app_test.AppTest.from_file(
+        str(Path(__file__).resolve().parents[1] / "app.py"),
+        default_timeout=90,
+    )
+    app.session_state["app_view"] = "Optimizer"
+    app.session_state["contest_format"] = ContestFormat.SHOWDOWN.value
+    app.session_state["contest_preset"] = ContestPreset.SHOWDOWN_CASH.value
+    app.session_state["min_players_per_team_enabled_showdown_cash"] = True
+    app.session_state["min_players_per_team_showdown_cash"] = 4
+    app.session_state["min_players_per_team_enabled_showdown_gpp"] = True
+    app.session_state["min_players_per_team_showdown_gpp"] = 3
+    app.run()
+    assert not app.exception, app.exception
+
+    toggle = next(
+        item for item in app.toggle if item.label == REQUIRE_MULTIPLE_PLAYERS_LABEL
+    )
+    assert toggle.value is False
+    count = next(item for item in app.number_input if item.label == "Minimum from each team")
+    assert int(count.value) == 2
+    assert app.session_state["require_multiple_per_team_showdown_cash"] is False
+    assert int(app.session_state["require_multiple_per_team_count_showdown_cash"]) == 2
+    assert app.session_state["min_players_per_team_enabled_showdown_cash"] is True
+
+    row = None
+    for frame in app.dataframe:
+        table = frame.value
+        if "Setting" not in getattr(table, "columns", []):
+            continue
+        match = table.loc[table["Setting"] == "Minimum players per team"]
+        if not match.empty:
+            row = match.iloc[0]
+            break
+    assert row is not None
+    assert row["Preset default"] == "Off — at least 1 from each team"
+    assert row["Actual"] == "Off — at least 1 from each team"
+    assert all(
+        "Requiring multiple players from each team is off." not in str(item.value)
+        for item in app.caption
+    )
 
 
 def test_toggle_on_at_two_and_three_and_off_still_bans_a_six_zero():

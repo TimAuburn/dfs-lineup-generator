@@ -916,13 +916,14 @@ def _showdown_rule_controls(
             "and names the player. The lock is not dropped."
         ),
     )
-    # The key includes the preset, so each Showdown preset keeps its own
-    # choice across reruns and a preset switch does not reuse the other
-    # preset's value. ``value`` seeds the widget only when that key is absent.
+    # Keys are new on purpose. A session that stored True under
+    # min_players_per_team_enabled_{preset} must not turn this back on.
+    # The preset suffix still keeps each Showdown preset's choice separate,
+    # and ``value`` seeds the widget only when that key is absent.
     min_team = st.toggle(
         REQUIRE_MULTIPLE_PLAYERS_LABEL,
         value=bool(preset_cfg.min_players_per_team_enabled),
-        key=_preset_key(preset, "min_players_per_team_enabled"),
+        key=_preset_key(preset, "require_multiple_per_team"),
         help=(
             "On requires the number below from each team. CPT and FLEX each "
             "count as one player. Off follows DraftKings: at least one player "
@@ -936,7 +937,7 @@ def _showdown_rule_controls(
         value=int(preset_cfg.min_players_per_team),
         step=1,
         disabled=not min_team,
-        key=_preset_key(preset, "min_players_per_team"),
+        key=_preset_key(preset, "require_multiple_per_team_count"),
         help=(
             "2, 3, 4, or 5. A Showdown lineup has 6 spots, so 4 or 5 "
             "from each team cannot fit."
