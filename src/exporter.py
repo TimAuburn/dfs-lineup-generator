@@ -8,6 +8,7 @@ from typing import List, Sequence
 import pandas as pd
 
 from .presets import ContestFormat
+from .showdown_order import order_showdown_roster
 
 CLASSIC_UPLOAD_COLUMNS = ["QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "DST"]
 SHOWDOWN_UPLOAD_COLUMNS = ["CPT", "FLEX", "FLEX", "FLEX", "FLEX", "FLEX"]
@@ -32,6 +33,8 @@ def _lineup_frame_to_row(
     if "Slot" not in lineup_df.columns:
         raise ValueError("Lineup DataFrame must include a Slot column")
 
+    # FLEX columns are interchangeable. Showdown rows follow the display order.
+    lineup_df = order_showdown_roster(lineup_df)
     ordered_values: List[str] = []
     used_index: set[int] = set()
     slots = lineup_df["Slot"].astype(str).tolist()

@@ -83,6 +83,7 @@ from .showdown_rules import (
     team_split_cause,
 )
 from .presets import ContestFormat
+from .showdown_order import order_showdown_roster
 
 DK_SALARY_CAP = 50_000
 # Full-cap tier in portfolio salary diversification (leave at most $200).
@@ -1513,6 +1514,7 @@ def showdown_lineup_grid(
     flex_count = len(SHOWDOWN_ROSTER_SLOTS) - 1
     rows = []
     for index, lineup in enumerate(lineups, start=1):
+        lineup = order_showdown_roster(lineup)
         slot = lineup["Slot"].astype(str).str.strip().str.upper()
         captain = lineup.loc[slot.eq("CPT")]
         flex = lineup.loc[~slot.eq("CPT")]

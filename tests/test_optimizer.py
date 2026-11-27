@@ -1631,7 +1631,21 @@ def test_showdown_results_list_every_lineup_and_a_full_roster_table():
     assert "Projection" in detail.value.columns
     assert detail.value["Sleeper Proj"].isna().all()
     assert grid.value.loc[0, "Captain"] == "Saquon Barkley (PHI)"
-    assert grid.value.loc[0, "FLEX 1"] == "Austin Ekeler (WAS)"
+    assert list(grid.value.loc[0, [f"FLEX {number}" for number in range(1, 6)]]) == [
+        "Jayden Daniels (WAS)",
+        "DeVonta Smith (PHI)",
+        "Dallas Goedert (PHI)",
+        "Tanner McKee (PHI)",
+        "Austin Ekeler (WAS)",
+    ]
+    assert list(detail.value["Name"]) == [
+        "Saquon Barkley",
+        "Jayden Daniels",
+        "DeVonta Smith",
+        "Dallas Goedert",
+        "Tanner McKee",
+        "Austin Ekeler",
+    ]
     assert grid.value.loc[0, "Salary"] == 48900
     assert grid.value.loc[0, "Projection"] == pytest.approx(81.83)
 
@@ -1672,8 +1686,8 @@ def test_showdown_lineup_grid_puts_captain_and_flex_on_one_row():
         "Projection",
     ]
     assert grid.loc[0, "Captain"] == "Saquon Barkley (PHI)"
-    assert grid.loc[0, "FLEX 1"] == "Austin Ekeler (WAS)"
-    assert grid.loc[0, "FLEX 2"] == "Dallas Goedert (PHI)"
+    assert grid.loc[0, "FLEX 1"] == "Dallas Goedert (PHI)"
+    assert grid.loc[0, "FLEX 2"] == "Austin Ekeler (WAS)"
     assert grid.loc[0, "FLEX 3"] == ""
     assert grid.loc[0, "Salary"] == 48900
     assert grid.loc[0, "Salary Remaining ($)"] == 1100
