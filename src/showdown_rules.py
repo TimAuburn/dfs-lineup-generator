@@ -18,6 +18,7 @@ from .names import person_key
 from .portfolio import position_tokens
 
 RULE_NO_K_DST_CAPTAIN = "No kicker or DST captain"
+RULE_CASH_CAPTAIN = "Showdown Cash captain"
 RULE_MIN_PER_TEAM = "Minimum players per team"
 RULE_SALARY_FLOOR = "Salary floor"
 
@@ -128,7 +129,12 @@ def _slot(row: pd.Series) -> str:
     return ""
 
 
-def _captain_rate(raw: object) -> Optional[float]:
+def captain_share(raw: object) -> Optional[float]:
+    """Captain % as a 0–1 share. None when the cell is blank.
+
+    Numbers above 1 are percent points, so 100 and 1.0 are both a full share.
+    Zero stays zero. A negative number is treated as blank.
+    """
     if raw is None:
         return None
     try:
@@ -142,9 +148,22 @@ def _captain_rate(raw: object) -> Optional[float]:
         return None
     if value > 1.0:
         value = value / 100.0
-    if value <= 0:
+    if value < 0:
         return None
     return value
+
+
+def _captain_rate(raw: object) -> Optional[float]:
+    """Positive captain share. Blank and zero are None."""
+    value = captain_share(raw)
+    if value is None or value <= 0:
+        return None
+    return value
+
+
+def _is_full_captain_share(raw: object) -> bool:
+    value = captain_share(raw)
+    return value is not None and abs(value - 1.0) <= 1e-9
 
 
 def captain_lock_causes(
@@ -184,6 +203,108 @@ def captain_lock_causes(
             f"{RULE_NO_K_DST_CAPTAIN}. {label} is locked at CPT by a captain share "
             f"of {rate * 100:.0f}%. K and DST can be FLEX and cannot be CPT. "
             "That captain share was not dropped."
+        )
+    return tuple(causes)
+
+
+def _captain_pool_phrase(allowed: Optional[Iterable[str]], min_salary: Optional[int]) -> str:
+    """The cash captain pool in the same words the eligibility error uses."""
+    order = ("QB", "RB", "WR", "TE", "K", "DST")
+    positions = []
+    if allowed is not None:
+        wanted = {str(pos).strip().upper() for pos in allowed if str(pos).strip()}
+        positions = [pos for pos in order if pos in wanted]
+        positions.extend(sorted(wanted - set(positions)))
+    if len(positions) == 1:
+        phrase = positions[0]
+    elif len(positions) == 2:
+        phrase = f"{positions[0]} or {positions[1]}"
+    elif positions:
+        phrase = ", ".join(positions[:-1]) + f", or {positions[-1]}"
+    else:
+        phrase = ""
+    if phrase and min_salary is not None:
+        return f"Cash captains are {phrase} at {_money(int(min_salary))}+."
+    if phrase:
+        return f"Cash captains are {phrase}."
+    if min_salary is not None:
+        return f"Cash captains cost at least {_money(int(min_salary))}."
+    return "Cash captains have to be in the captain pool."
+
+
+def _listed_captain_salary(rows: Sequence[pd.Series]) -> Optional[int]:
+    """Base salary the captain check uses. A CPT row is stored at 1.5x."""
+    flex_salary = None
+    for row in rows:
+        salary = pd.to_numeric(row.get("Salary"), errors="coerce")
+        if pd.isna(salary):
+            continue
+        if _slot(row) == "CPT":
+            return int(round(float(salary) / 1.5))
+        flex_salary = float(salary)
+    if flex_salary is None:
+        return None
+    return int(round(flex_salary))
+
+
+def cash_captain_ineligible_causes(
+    pool: Optional[pd.DataFrame],
+    *,
+    allowed_positions: Optional[Iterable[str]] = None,
+    min_salary: Optional[int] = None,
+) -> tuple[str, ...]:
+    """Captain % of 100 on a player Showdown Cash will not put at CPT.
+
+    The CPT row would otherwise be removed and the request ignored, with or
+    without Lock. A blank, zero, or partial share is not this error. Pass
+    ``allowed_positions`` and ``min_salary`` from the cash captain settings.
+    When both are unset, cash is not restricting CPT and this returns nothing.
+    """
+    if pool is None or getattr(pool, "empty", True):
+        return ()
+    if allowed_positions is None and min_salary is None:
+        return ()
+    if "Name" not in pool.columns:
+        return ()
+    allowed = None
+    if allowed_positions is not None:
+        allowed = frozenset(
+            str(pos).strip().upper() for pos in allowed_positions if str(pos).strip()
+        )
+    floor = None if min_salary is None else int(min_salary)
+    grouped: dict[tuple[str, str], list[pd.Series]] = {}
+    order: list[tuple[str, str]] = []
+    for _, row in pool.iterrows():
+        key = person_key(row.get("Name"), row.get("TeamAbbrev", row.get("Team")), row.get("Position"))
+        if key not in grouped:
+            order.append(key)
+            grouped[key] = []
+        grouped[key].append(row)
+    causes: list[str] = []
+    seen: set[str] = set()
+    rule = _captain_pool_phrase(allowed, floor)
+    for key in order:
+        rows = grouped[key]
+        if not any(_is_full_captain_share(row.get("CaptainExposure")) for row in rows):
+            continue
+        first = rows[0]
+        label = _player_label(first.get("Name"), first.get("TeamAbbrev", first.get("Team")))
+        if label in seen:
+            continue
+        position = football_position(first.get("Position")) or "that position"
+        salary = _listed_captain_salary(rows)
+        outside = False
+        if allowed is not None and position not in allowed:
+            outside = True
+        if floor is not None and (salary is None or salary < floor):
+            outside = True
+        if not outside:
+            continue
+        seen.add(label)
+        salary_text = "an unknown salary" if salary is None else _money(salary)
+        causes.append(
+            f"{RULE_CASH_CAPTAIN}. {label} is {position} at {salary_text} "
+            f"and cannot be CPT. {rule} The captain request was not dropped."
         )
     return tuple(causes)
 

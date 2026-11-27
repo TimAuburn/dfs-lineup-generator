@@ -6,6 +6,7 @@ import pandas as pd
 
 from .data_loader import projection_deltas
 from .names import person_key as _person_key
+from .showdown_rules import captain_share
 
 CHOICE_COLUMNS = (
     "Include",
@@ -235,13 +236,23 @@ def generation_pool(pool: pd.DataFrame, *, showdown: bool) -> pd.DataFrame:
 
 
 def locked_player_ids(pool: pd.DataFrame, *, showdown: bool) -> list[str]:
-    """Ids to force in. Showdown locks the flex row so the player is not forced to captain."""
+    """Ids to force in.
+
+    Showdown locks the flex row, so the player is not forced to captain.
+    Lock with Captain % at 100 locks the CPT row instead. A blank cell, 0,
+    or a share strictly between those two still locks the flex row.
+    """
     if pool is None or pool.empty or "Lock" not in pool.columns or "ID" not in pool.columns:
         return []
     locked: list[str] = []
     seen: set[tuple[str, str]] = set()
     for _, group in pool.groupby(_group_key(pool), sort=False):
-        row = group.loc[_representative_index(group, showdown)]
+        index = _representative_index(group, showdown)
+        if showdown and _lock_at_captain(group):
+            captain_index = _captain_slot_index(group)
+            if captain_index is not None:
+                index = captain_index
+        row = group.loc[index]
         if not _as_bool(row.get("Include"), default=True):
             continue
         if not _as_bool(row.get("Lock"), default=False):
@@ -459,6 +470,30 @@ def _representative_index(group: pd.DataFrame, showdown: bool):
         if len(flex):
             return flex[0]
     return group.index[0]
+
+
+def _captain_slot_index(group: pd.DataFrame):
+    for column in ("RosterSlot", "Roster Position"):
+        if column not in group.columns:
+            continue
+        slots = group[column].astype(str).str.split("/").str[0].str.strip().str.upper()
+        match = group.index[slots.eq("CPT")]
+        if len(match):
+            return match[0]
+    return None
+
+
+def _lock_at_captain(group: pd.DataFrame) -> bool:
+    """Lock plus Captain % of exactly 100. Blank, 0, and a partial share do not."""
+    if "Lock" not in group.columns or "CaptainExposure" not in group.columns:
+        return False
+    if not any(_as_bool(value, default=False) for value in group["Lock"]):
+        return False
+    for value in group["CaptainExposure"]:
+        share = captain_share(value)
+        if share is not None and abs(share - 1.0) <= 1e-9:
+            return True
+    return False
 
 
 def _group_key(frame: pd.DataFrame) -> pd.Series:

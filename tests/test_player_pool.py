@@ -1053,6 +1053,24 @@ def test_unlock_shown_clears_only_the_filtered_locks_and_keeps_include():
     assert list(worthy["Include"]) == [True]
 
 
+def test_showdown_lock_with_captain_percent_100_selects_the_cpt_id():
+    pool = _showdown_pool()
+    pool["Lock"] = False
+    pool["CaptainExposure"] = pd.NA
+    pool.loc[pool["Name"].eq("Josh Allen"), "Lock"] = True
+    assert locked_player_ids(pool, showdown=True) == ["2"]
+    pool.loc[pool["Name"].eq("Josh Allen"), "CaptainExposure"] = 0
+    assert locked_player_ids(pool, showdown=True) == ["2"]
+    pool.loc[pool["Name"].eq("Josh Allen"), "CaptainExposure"] = 0.4
+    assert locked_player_ids(pool, showdown=True) == ["2"]
+    pool.loc[pool["Name"].eq("Josh Allen"), "CaptainExposure"] = 40
+    assert locked_player_ids(pool, showdown=True) == ["2"]
+    pool.loc[pool["Name"].eq("Josh Allen"), "CaptainExposure"] = 1
+    assert locked_player_ids(pool, showdown=True) == ["1"]
+    pool.loc[pool["Name"].eq("Josh Allen"), "CaptainExposure"] = 100
+    assert locked_player_ids(pool, showdown=True) == ["1"]
+
+
 def test_showdown_lock_shown_writes_captain_and_flex_and_skips_hidden_players():
     pool = _showdown_pool()
     pool["Include"] = [False, False, True, True]

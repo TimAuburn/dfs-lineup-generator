@@ -31,10 +31,12 @@ from src.presets import (
     format_settings_comparison,
     get_preset_config,
 )
+from src.player_pool import generation_pool, locked_player_ids
 from src.showdown_rules import (
     CONTROL_MAX_PLAYERS_PER_TEAM,
     CONTROL_MIN_PLAYERS_PER_TEAM,
     REQUIRE_MULTIPLE_PLAYERS_LABEL,
+    RULE_CASH_CAPTAIN,
     RULE_MIN_PER_TEAM,
     RULE_NO_K_DST_CAPTAIN,
     RULE_SALARY_FLOOR,
@@ -1064,3 +1066,287 @@ def test_seed_42_showdown_cash_defaults_follow_the_three_rules():
     # The cash optimum already used both teams, so dropping the extra floor
     # leaves this roster in place.
     assert [str(player_id) for player_id in lineup["ID"]] == SHOWDOWN_IDS
+
+
+FLEX_LOCK_MESSAGE = "Use 100% to lock at captain, or clear Captain % to lock at FLEX."
+
+
+def _captain_request(name: str, *, lock: bool, share) -> pd.DataFrame:
+    frame = parse_dk_csv(MOCK_SHOWDOWN)
+    frame["Include"] = True
+    frame["Lock"] = False
+    frame["Captain"] = True
+    frame["CaptainExposure"] = pd.Series(pd.NA, index=frame.index, dtype="Float64")
+    if lock:
+        frame.loc[frame["Name"].eq(name), "Lock"] = True
+    if share is not None:
+        frame.loc[frame["Name"].eq(name), "CaptainExposure"] = share
+    return frame
+
+
+def _solve_request(frame: pd.DataFrame, preset: ContestPreset, n: int = 3, **overrides):
+    eligible = generation_pool(frame, showdown=True)
+    optimizer = NFLShowdownOptimizer()
+    optimizer.load_from_dataframe(eligible)
+    apply_preset(optimizer, preset, lineup_count=n, jitter_seed=42)
+    for key, value in overrides.items():
+        setattr(optimizer, key, value)
+    optimizer.set_lineup_count(n)
+    optimizer.set_locked_players(locked_player_ids(eligible, showdown=True))
+    return optimizer
+
+
+def _captains(lineups) -> list[tuple[str, str]]:
+    found = []
+    for lineup in lineups:
+        captain = lineup.loc[lineup["Slot"] == "CPT"].iloc[0]
+        found.append((str(captain["Name"]), str(captain["ID"])))
+    return found
+
+
+def test_lock_alone_keeps_the_player_at_flex():
+    """Blank and zero Captain % still lock the flex row."""
+    for share in (None, 0.0):
+        frame = _captain_request("Josh Allen", lock=True, share=share)
+        eligible = generation_pool(frame, showdown=True)
+        assert locked_player_ids(eligible, showdown=True) == ["91004"]
+        for preset in (ContestPreset.SHOWDOWN_CASH, ContestPreset.SHOWDOWN_GPP):
+            optimizer = _solve_request(frame, preset, n=2)
+            lineups = optimizer.generate_lineups()
+            assert len(lineups) == 2
+            for lineup in lineups:
+                captain = lineup.loc[lineup["Slot"] == "CPT"].iloc[0]
+                flex = lineup.loc[lineup["Name"].eq("Josh Allen")]
+                assert str(captain["Name"]) != "Josh Allen"
+                assert list(flex["Slot"]) == ["FLEX"]
+                assert list(flex["ID"].astype(str)) == ["91004"]
+
+
+def test_captain_percent_100_without_lock_is_captain_every_lineup():
+    frame = _captain_request("Josh Allen", lock=False, share=1.0)
+    eligible = generation_pool(frame, showdown=True)
+    assert locked_player_ids(eligible, showdown=True) == []
+    for preset in (ContestPreset.SHOWDOWN_CASH, ContestPreset.SHOWDOWN_GPP):
+        lineups = _solve_request(frame, preset, n=3).generate_lineups()
+        assert len(lineups) == 3
+        assert _captains(lineups) == [("Josh Allen", "91003")] * 3
+
+
+def test_lock_and_captain_percent_100_puts_an_eligible_player_at_captain():
+    """QB, RB, and WR at $8,000+ can be locked at CPT in cash and GPP.
+
+    The team-minimum toggle from the merged Showdown control writes
+    ``min_players_per_team_enabled``. Both positions of that switch are solved.
+    """
+    expected = {
+        "Josh Allen": "91003",
+        "Isiah Pacheco": "92001",
+        "Xavier Worthy": "93001",
+    }
+    for name, captain_id in expected.items():
+        frame = _captain_request(name, lock=True, share=1.0)
+        eligible = generation_pool(frame, showdown=True)
+        assert locked_player_ids(eligible, showdown=True) == [captain_id]
+        for preset in (ContestPreset.SHOWDOWN_CASH, ContestPreset.SHOWDOWN_GPP):
+            for enabled in (False, True):
+                optimizer = _solve_request(
+                    frame,
+                    preset,
+                    n=3,
+                    min_players_per_team_enabled=enabled,
+                    min_players_per_team=2,
+                )
+                lineups = optimizer.generate_lineups()
+                assert len(lineups) == 3, (name, preset, enabled, getattr(optimizer.last_shortfall, "message", None))
+                assert _captains(lineups) == [(name, captain_id)] * 3
+                for lineup in lineups:
+                    counts = lineup["Team"].value_counts().to_dict()
+                    assert team_minimum_met(counts, ["KC", "BUF"], 1)
+                    assert 6 not in counts.values()
+                    if enabled:
+                        assert team_minimum_met(counts, ["KC", "BUF"], 2)
+
+
+def test_lock_between_zero_and_100_captain_percent_keeps_the_error():
+    frame = _captain_request("Josh Allen", lock=True, share=0.4)
+    eligible = generation_pool(frame, showdown=True)
+    assert locked_player_ids(eligible, showdown=True) == ["91004"]
+    optimizer = _solve_request(frame, ContestPreset.SHOWDOWN_GPP, n=2)
+    with pytest.raises(RuntimeError) as raised:
+        optimizer.generate_lineups()
+    message = str(raised.value)
+    assert "Josh Allen" in message
+    assert FLEX_LOCK_MESSAGE in message
+    assert RULE_CASH_CAPTAIN not in message
+
+
+def test_kicker_and_dst_captain_lock_uses_the_ban_not_the_flex_error():
+    for name in ("Harrison Butker", "Chiefs"):
+        for lock in (False, True):
+            frame = _captain_request(name, lock=lock, share=1.0)
+            optimizer = _solve_request(frame, ContestPreset.SHOWDOWN_CASH, n=1)
+            with pytest.raises(RuntimeError) as raised:
+                optimizer.generate_lineups()
+            message = str(raised.value)
+            assert RULE_NO_K_DST_CAPTAIN in message
+            assert name in message
+            assert "not dropped" in message
+            assert "built 0" in message
+            assert FLEX_LOCK_MESSAGE not in message
+            assert RULE_CASH_CAPTAIN not in message
+
+
+def test_cash_ineligible_captain_percent_100_is_named_with_or_without_lock():
+    cases = (
+        ("Travis Kelce", "TE", "$9,200"),
+        ("Clyde Edwards-Helaire", "RB", "$5,200"),
+        ("Keon Coleman", "WR", "$7,200"),
+    )
+    for name, position, salary in cases:
+        for lock in (False, True):
+            frame = _captain_request(name, lock=lock, share=1.0)
+            optimizer = _solve_request(frame, ContestPreset.SHOWDOWN_CASH, n=2)
+            with pytest.raises(RuntimeError) as raised:
+                optimizer.generate_lineups()
+            message = str(raised.value)
+            assert RULE_CASH_CAPTAIN in message
+            assert name in message
+            assert position in message
+            assert salary in message
+            assert "cannot be CPT" in message
+            assert "QB, RB, or WR at $8,000+" in message
+            assert "not dropped" in message
+            assert "built 0" in message
+            assert FLEX_LOCK_MESSAGE not in message
+            assert "CBC" not in message
+
+
+def test_gpp_can_lock_a_tight_end_at_captain_when_cash_cannot():
+    frame = _captain_request("Travis Kelce", lock=True, share=1.0)
+    lineups = _solve_request(frame, ContestPreset.SHOWDOWN_GPP, n=2).generate_lineups()
+    assert len(lineups) == 2
+    assert _captains(lineups) == [("Travis Kelce", "94001")] * 2
+
+
+def test_captain_lock_does_not_fight_max_exposure_or_overlap():
+    """Overlap of 3 and a 100% cap still build every lineup with the CPT lock.
+
+    A 40% cap can run out of other players. It must not blame the captain lock
+    or return an empty batch.
+    """
+    frame = _captain_request("Josh Allen", lock=True, share=1.0)
+    locked = locked_player_ids(generation_pool(frame, showdown=True), showdown=True)
+
+    def _run(exposure):
+        optimizer = _solve_request(frame, ContestPreset.SHOWDOWN_GPP, n=5)
+        optimizer.set_max_repeating_players(3)
+        if exposure is not None:
+            optimizer.set_exposure_limits(max_exposure_pct=exposure)
+        optimizer.set_locked_players(locked)
+        lineups = optimizer.generate_lineups()
+        return optimizer, lineups
+
+    for exposure in (None, 100):
+        optimizer, lineups = _run(exposure)
+        assert optimizer.last_shortfall is None
+        assert len(lineups) == 5
+        assert _captains(lineups) == [("Josh Allen", "91003")] * 5
+
+    optimizer, lineups = _run(40)
+    assert lineups
+    assert _captains(lineups) == [("Josh Allen", "91003")] * len(lineups)
+    message = "" if optimizer.last_shortfall is None else optimizer.last_shortfall.message
+    assert "forces that player into every lineup" not in message
+    counts: dict[str, int] = {}
+    for lineup in lineups:
+        for player_name in set(lineup["Name"].astype(str)):
+            counts[player_name] = counts.get(player_name, 0) + 1
+    others = {name: count for name, count in counts.items() if name != "Josh Allen"}
+    assert others
+    assert max(others.values()) <= 2
+
+
+def test_streamlit_lock_and_captain_percent_100_generates_the_cpt_slot():
+    """Edit Lock and Captain % on the pool, then Generate. Josh Allen is CPT."""
+    app_test = pytest.importorskip("streamlit.testing.v1")
+    from src.dk_scoring import SCORING_VERSION
+    from src.slate_week import slate_games_from_pool, slate_key
+    from src.sleeper import MATCH_CACHE_VERSION
+
+    pool = parse_dk_csv(MOCK_SHOWDOWN)
+    pool["PPR"] = pd.Series(pd.NA, index=pool.index, dtype="Float64")
+    pool["Scoring"] = ""
+    pool["ScoringNote"] = ""
+    key = slate_key(slate_games_from_pool(pool))
+    pool.attrs["scoring_version"] = SCORING_VERSION
+    pool.attrs["match_schema"] = MATCH_CACHE_VERSION
+    pool.attrs["slate_key"] = key
+    pool.attrs["fingerprint"] = f"captain-lock|{key}"
+    summary = {
+        "ok": True,
+        "applied": True,
+        "scoring": SCORING_VERSION,
+        "match_schema": MATCH_CACHE_VERSION,
+        "season": "2025",
+        "week": 1,
+        "season_type": "regular",
+        "fingerprint": pool.attrs["fingerprint"],
+        "slate_key": key,
+        "matched": 0,
+        "rows": len(pool),
+        "inactive_rows": 0,
+        "ppr_fallback_rows": 0,
+    }
+    app = app_test.AppTest.from_file(
+        str(Path(__file__).resolve().parents[1] / "app.py"),
+        default_timeout=120,
+    )
+    app.session_state["app_view"] = "Player pool"
+    app.session_state["contest_format"] = ContestFormat.SHOWDOWN.value
+    app.session_state["contest_preset"] = ContestPreset.SHOWDOWN_CASH.value
+    app.session_state["player_pool"] = pool
+    app.session_state["sleeper_summary"] = summary
+    app.session_state["pool_signature"] = "captain-lock"
+    app.session_state["weather_by_home"] = {}
+    app.session_state["weather_source_json"] = "{}"
+    app.run(timeout=120)
+    assert not app.exception, app.exception
+
+    editor = next(
+        item
+        for item in app.data_editor
+        if item.value is not None and "Captain %" in getattr(item.value, "columns", [])
+    )
+    table = editor.value.reset_index(drop=True)
+    row = int(table.index[table["Name"].eq("Josh Allen")][0])
+    app.session_state[editor.key] = {
+        "edited_rows": {row: {"Lock": True, "Captain %": 100}},
+        "added_rows": [],
+        "deleted_rows": [],
+    }
+    app.run(timeout=120)
+    assert not app.exception, app.exception
+    edited = app.session_state["player_pool"]
+    allen = edited.loc[edited["Name"].eq("Josh Allen")]
+    assert list(allen["Lock"]) == [True, True]
+    assert list(allen["CaptainExposure"]) == pytest.approx([1.0, 1.0])
+    assert locked_player_ids(generation_pool(edited, showdown=True), showdown=True) == ["91003"]
+
+    app.session_state["app_view"] = "Optimizer"
+    app.session_state["lineup_count_showdown_cash"] = 2
+    app.run(timeout=120)
+    assert not app.exception, app.exception
+    next(item for item in app.button if item.label == "Generate Lineups").click()
+    app.run(timeout=180)
+    assert not app.exception, app.exception
+    errors = [item.value for item in app.error]
+    assert not any("Optimization failed" in value for value in errors), errors
+    lineups = list(app.session_state["lineups"] or [])
+    assert len(lineups) == 2
+    assert _captains(lineups) == [("Josh Allen", "91003")] * 2
+    grid = next(
+        frame.value
+        for frame in app.dataframe
+        if frame.value is not None and "Captain" in getattr(frame.value, "columns", [])
+    )
+    assert list(grid["Captain"]) == ["Josh Allen (BUF)", "Josh Allen (BUF)"]
