@@ -128,7 +128,8 @@ class PresetConfig:
     # K and DST stay eligible at FLEX and are never CPT while the ban is on.
     ban_k_dst_captain: bool = False
     # At least this many players from each team. CPT and FLEX each count as one.
-    # Off leaves DraftKings' own at-most-five (one from each team) in place.
+    # Off leaves DraftKings' cap of five from one team in place, so a 5-1
+    # lineup is legal and a 6-0 lineup is not.
     min_players_per_team_enabled: bool = False
     min_players_per_team: int = DEFAULT_MIN_PLAYERS_PER_TEAM
     # Maximum salary left unused. Spend must reach the slate cap minus this.
@@ -248,16 +249,17 @@ PRESET_CONFIGS: Dict[ContestPreset, PresetConfig] = {
         max_repeating_players=3,
         allow_kicker_captain=False,
         ban_k_dst_captain=True,
-        min_players_per_team_enabled=True,
+        min_players_per_team_enabled=False,
         min_players_per_team=2,
         salary_floor=False,
         max_unused_salary=DEFAULT_MAX_UNUSED_SALARY,
         flex_min_salary=1_200,
         description=(
-            "Showdown GPP: salary window, both teams, at least 2 players from each team, "
+            "Showdown GPP: salary window, both teams, at least one player from each team, "
             "CPT QB needs 2 WR/TE plus an opposing skill player, no K or DST captains, "
             "at most one kicker, no FLEX under $1,200, drop players at 1.0 points or less, "
-            "max 3 repeats. The salary floor is off; turning it on leaves at most $1,500 unused."
+            "max 3 repeats. The salary floor is off; turning it on leaves at most $1,500 unused. "
+            "Requiring multiple players from each team is off."
         ),
     ),
     ContestPreset.SHOWDOWN_CASH: PresetConfig(
@@ -276,7 +278,7 @@ PRESET_CONFIGS: Dict[ContestPreset, PresetConfig] = {
         max_repeating_players=None,
         allow_kicker_captain=False,
         ban_k_dst_captain=True,
-        min_players_per_team_enabled=True,
+        min_players_per_team_enabled=False,
         min_players_per_team=2,
         salary_floor=True,
         max_unused_salary=DEFAULT_MAX_UNUSED_SALARY,
@@ -289,11 +291,12 @@ PRESET_CONFIGS: Dict[ContestPreset, PresetConfig] = {
         require_starting_core=True,
         description=(
             "Showdown Cash: spend $49,600–$50,000, no defense, at most one kicker, "
-            "at least 2 players from each team, no K or DST captain, "
+            "at least one player from each team, no K or DST captain, "
             "at most one running back from each team, FLEX at $3,500+, "
             "at most one player under $4,500, and both starting quarterbacks "
             "and running backs when they fit. The salary floor allows at most "
-            "$1,500 unused; the $49,600 window is the tighter spend floor."
+            "$1,500 unused; the $49,600 window is the tighter spend floor. "
+            "Requiring multiple players from each team is off."
         ),
     ),
 }

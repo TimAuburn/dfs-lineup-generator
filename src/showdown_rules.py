@@ -21,11 +21,18 @@ RULE_NO_K_DST_CAPTAIN = "No kicker or DST captain"
 RULE_MIN_PER_TEAM = "Minimum players per team"
 RULE_SALARY_FLOOR = "Salary floor"
 
-# DraftKings Showdown is six spots. One from each team is the site rule
-# (at most five from one team). This rule's adjustable minimum is 1, 2, or 3.
+# DraftKings Showdown is six spots. pydfs captain mode sets
+# max_from_one_team to 5, so a lineup always includes both teams. That cap
+# does not look at this switch. The switch raises the floor. The control
+# offers 2 through 5. Four or five from each team cannot fit six spots and
+# is refused before the solver runs.
 MIN_PLAYERS_PER_TEAM_MIN = 1
-MIN_PLAYERS_PER_TEAM_MAX = 3
+MIN_PLAYERS_PER_TEAM_MAX = 5
 DEFAULT_MIN_PLAYERS_PER_TEAM = 2
+CONTROL_MIN_PLAYERS_PER_TEAM = 2
+CONTROL_MAX_PLAYERS_PER_TEAM = 5
+REQUIRE_MULTIPLE_PLAYERS_LABEL = "Require multiple players from each team"
+SHOWDOWN_ROSTER_SIZE = 6
 DEFAULT_MAX_UNUSED_SALARY = 1_500
 DEFAULT_SHOWDOWN_CAP = 50_000
 
@@ -229,6 +236,40 @@ def team_minimum_cause(
         "from each team. CPT and FLEX each count as one player. "
         "The minimum was not lowered."
     )
+
+
+def team_minimum_fit_cause(
+    enabled: bool,
+    minimum: int,
+    roster_size: int = SHOWDOWN_ROSTER_SIZE,
+) -> Optional[str]:
+    """At least N from each team cannot fit a Showdown roster."""
+    if not enabled:
+        return None
+    floor = int(minimum)
+    spots = int(roster_size)
+    needed = floor * 2
+    if needed <= spots:
+        return None
+    return (
+        f"{RULE_MIN_PER_TEAM}. The minimum is {floor} from each team, "
+        f"and a Showdown lineup has {spots} spots. "
+        f"{floor} from each team needs {needed} players. "
+        "The minimum was not lowered."
+    )
+
+
+def multiple_players_per_team(enabled: bool, count: int) -> dict[str, int | bool]:
+    """Optimizer fields for the Showdown control.
+
+    Off leaves DraftKings' one-from-each-team rule in place. The count is
+    stored either way so a later generation can turn the rule on without
+    reading a second setting.
+    """
+    return {
+        "min_players_per_team_enabled": bool(enabled),
+        "min_players_per_team": int(count),
+    }
 
 
 def team_split_cause(
@@ -460,7 +501,7 @@ def captain_rule_label(enabled: bool) -> str:
 
 def team_rule_label(enabled: bool, count: int) -> str:
     if not enabled:
-        return "Off"
+        return "Off — at least 1 from each team"
     return f"{int(count)} from each team"
 
 

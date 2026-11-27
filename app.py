@@ -72,8 +72,13 @@ from src.lineup_rules import (
     normalize_spreads,
 )
 from src.showdown_rules import (
+    CONTROL_MAX_PLAYERS_PER_TEAM,
+    CONTROL_MIN_PLAYERS_PER_TEAM,
+    REQUIRE_MULTIPLE_PLAYERS_LABEL,
+    multiple_players_per_team,
     resolve_salary_bounds,
     slate_salary_cap,
+    team_minimum_fit_cause,
     team_split_cause,
 )
 from src.lineup_rules import ConstructionSettings as _ConstructionSettings
@@ -898,7 +903,8 @@ def _showdown_rule_controls(
     st.caption(
         "These rules choose who can share a lineup and how much salary it spends. "
         "They do not change a projection. K and DST can still be FLEX. "
-        "With the team minimum off, DraftKings still allows at most five from one team."
+        "With multiple players from each team off, DraftKings still requires "
+        "at least one player from each team."
     )
     ban_captain = st.checkbox(
         "No kicker or DST captain",
@@ -910,24 +916,31 @@ def _showdown_rule_controls(
             "and names the player. The lock is not dropped."
         ),
     )
-    min_team = st.checkbox(
-        "Minimum players per team",
+    # The key includes the preset, so each Showdown preset keeps its own
+    # choice across reruns and a preset switch does not reuse the other
+    # preset's value. ``value`` seeds the widget only when that key is absent.
+    min_team = st.toggle(
+        REQUIRE_MULTIPLE_PLAYERS_LABEL,
         value=bool(preset_cfg.min_players_per_team_enabled),
         key=_preset_key(preset, "min_players_per_team_enabled"),
         help=(
-            "CPT and FLEX each count as one player. "
-            "Off leaves DraftKings' own limit of five players from one team."
+            "On requires the number below from each team. CPT and FLEX each "
+            "count as one player. Off follows DraftKings: at least one player "
+            "from each team, so a 5-1 lineup is legal and a 6-0 lineup is not."
         ),
     )
     min_team_count = st.number_input(
         "Minimum from each team",
-        min_value=1,
-        max_value=3,
+        min_value=CONTROL_MIN_PLAYERS_PER_TEAM,
+        max_value=CONTROL_MAX_PLAYERS_PER_TEAM,
         value=int(preset_cfg.min_players_per_team),
         step=1,
         disabled=not min_team,
         key=_preset_key(preset, "min_players_per_team"),
-        help="At least this many from each team. 2 is two, three, or four from one side.",
+        help=(
+            "2, 3, 4, or 5. A Showdown lineup has 6 spots, so 4 or 5 "
+            "from each team cannot fit."
+        ),
     )
     salary_floor = st.checkbox(
         "Salary floor",
@@ -965,13 +978,23 @@ def _showdown_rule_controls(
         st.caption(
             "No kicker or DST captain is on, so Allow kicker captain does not put a kicker at CPT."
         )
-    split_cause = team_split_cause(bool(min_team), int(min_team_count), team_split)
+    team_choice = multiple_players_per_team(bool(min_team), int(min_team_count))
+    split_cause = team_split_cause(
+        bool(team_choice["min_players_per_team_enabled"]),
+        int(team_choice["min_players_per_team"]),
+        team_split,
+    )
+    fit_cause = team_minimum_fit_cause(
+        bool(team_choice["min_players_per_team_enabled"]),
+        int(team_choice["min_players_per_team"]),
+    )
     if split_cause:
         st.error(split_cause)
+    elif fit_cause:
+        st.error(fit_cause)
     overrides = {
         "ban_k_dst_captain": bool(ban_captain),
-        "min_players_per_team_enabled": bool(min_team),
-        "min_players_per_team": int(min_team_count),
+        **team_choice,
         "salary_floor": bool(salary_floor),
         "max_unused_salary": int(max_unused),
     }

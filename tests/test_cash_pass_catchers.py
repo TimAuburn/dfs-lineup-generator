@@ -43,7 +43,10 @@ MAIN_CASH_CSV = "9b1614d798c5819fcf0be8f831d38f1ee25a323aa01c12932446b471049272f
 MAIN_SHOWDOWN_CASH_CSV = "6980178f01545bef57fc4fdcaa43bc1b7c92459e014f779ba102aae40a437533"
 MAIN_SMALL_GPP_CSV = "fa796590470cf9dc48fb533fd6d311e49711384a9c51be93ae2d7616481a6c6d"
 MAIN_LARGE_GPP_CSV = "a39e4aea971f8aeb6b44d09f78baeeef06d4cfec480fdc5000deffca8efe1236"
-MAIN_SHOWDOWN_GPP_CSV = "ca656ed4b568b473166bc0fc7da3e49d02e11679e9649bf38da3ea623b2b3d2d"
+# Showdown GPP moved when the extra per-team floor defaulted off. The previous
+# hash was ca656ed4b568b473166bc0fc7da3e49d02e11679e9649bf38da3ea623b2b3d2d.
+# Cash stayed put: that seed-42 lineup was already 4-2.
+MAIN_SHOWDOWN_GPP_CSV = "f9ede315707544ed6eb97d22954b54c86259e2bda6a932c638d10d6067ecb9ff"
 
 
 def _game(away: str, home: str) -> str:
